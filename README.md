@@ -1,140 +1,265 @@
-# Go1 Soccer (Dribblebot) Starter Kit
+# MPC-MARL Quadruped Soccer
 
-# Table of contents
-1. [Overview](#overview)
-2. [System Requirements](#requirements)
-3. [Training a Model](#simulation)
-    1. [Installation](#installation)
-    2. [Environment and Model Configuration](#configuration)
-    3. [Training, Logging and Evaluation](#training)
-4. [Deploying a Model (Coming Soon)](#realworld)
+This repository develops a hierarchical multi-agent reinforcement-learning
+system for quadruped robot soccer in NVIDIA Isaac Gym. AS2 quadrupeds learn
+walking, dribbling, and shooting as separate low-level skills. A shared
+high-level policy selects those skills for every robot, trains against an older
+frozen copy of itself through self-play, and can receive privileged guidance
+from world-model MPC during training.
 
-## Overview <a name="overview"></a>
+The main pipeline supports:
 
-This repository provides an implementation of the paper:
+- independent PPO training and validation of walking, dribbling, and shooting;
+- shared-parameter multi-agent high-level training for any team size;
+- two-team self-play with periodically updated frozen opponents;
+- joint world-model data collection over both teams' states and actions;
+- hybrid CEM MPC over discrete skills and continuous skill commands;
+- privileged MPC teacher rewards for high-level policy training.
 
+This project is derived from
+[DribbleBot](https://github.com/Improbable-AI/dribblebot) and
+[Walk These Ways](https://github.com/Improbable-AI/walk-these-ways). See
+[Acknowledgements and license](#acknowledgements-and-license).
 
-<td style="padding:20px;width:75%;vertical-align:middle">
-      <a href="https://gmargo11.github.io/dribblebot/" target="_blank">
-      <b> DribbleBot: Dynamic Legged Manipulation in the Wild </b>
-      </a>
-      <br>
-      <a href="https://yandongji.github.io/" target="_blank">Yandong Ji*</a>, <a href="https://gmargo11.github.io/" target="_blank">Gabriel B. Margolis*</a> and <a href="https://people.csail.mit.edu/pulkitag" target="_blank">Pulkit Agrawal</a>
-      <br>
-      <em>International Conference on Robotics and Automation (ICRA)</em>, 2023
-      <br>
-      <a href="https://arxiv.org/pdf/2304.01159.pdf">paper</a> /
-      <a href="">bibtex</a> /
-      <a href="https://gmargo11.github.io/dribblebot/" target="_blank">project page</a>
-    <br>
-</td>
+## Requirements
 
-<br>
+- Linux with an NVIDIA GPU
+- NVIDIA Isaac Gym Preview 4
+- Python 3.8
+- PyTorch 1.10 with CUDA 11.3
 
-This training code, environment and documentation build on [Walk these Ways: Tuning Robot Control for Generalization with Multiplicity of Behavior](https://github.com/Improbable-AI/walk-these-ways) by Gabriel Margolis and Pulkit Agrawal, Improbable AI Lab, MIT (Paper: https://arxiv.org/pdf/2212.03238.pdf) and the Isaac Gym simulator from 
-NVIDIA (Paper: https://arxiv.org/abs/2108.10470). All redistributed code retains its
-original [license](LICENSES/legged_gym/LICENSE).
+The default simulator workloads require a CUDA-capable GPU. Reduce
+`--num-envs` when GPU memory is limited.
 
-Our initial release provides the following features:
-* Train reinforcement learning policies for the Go1 robot using PPO, IsaacGym, Domain Randomization to dribble a soccer ball in simulation following a random ball velocity command in global frame.
-* Evaluate a pre-trained soccer policy in simulation.
+## Installation
 
-## System Requirements <a name="requirements"></a>
-
-**Simulated Training and Evaluation**: Isaac Gym requires an NVIDIA GPU. To train in the default configuration, we recommend a GPU with at least 10GB of VRAM. The code can run on a smaller GPU if you decrease the number of parallel environments (`Cfg.env.num_envs`). However, training will be slower with fewer environments.
-
-## Training a Model <a name="simulation"></a>
-
-### Installation using Conda<a name="installation"></a>
-
-#### Create a new conda environment with Python (3.8 suggested)
-```bash
-conda create -n dribblebot python==3.8
-conda activate dribblebot
-```
-#### Install pytorch 1.10 with cuda-11.3:
+Create the environment and install PyTorch:
 
 ```bash
-pip3 install torch==1.10.0+cu113 torchvision==0.11.1+cu113 torchaudio==0.10.0+cu113 -f https://download.pytorch.org/whl/cu113/torch_stable.html
+conda create -n legged_env python=3.8
+conda activate legged_env
+
+pip install torch==1.10.0+cu113 \
+  torchvision==0.11.1+cu113 \
+  torchaudio==0.10.0+cu113 \
+  -f https://download.pytorch.org/whl/cu113/torch_stable.html
 ```
 
-#### Install Isaac Gym
-
-1. Download and install Isaac Gym Preview 4 from https://developer.nvidia.com/isaac-gym
-2. unzip the file via:
-    ```bash
-    tar -xf IsaacGym_Preview_4_Package.tar.gz
-    ```
-
-3. now install the python package
-    ```bash
-    cd isaacgym/python && pip install -e .
-    ```
-4. Verify the installation by try running an example
-
-    ```bash
-    python examples/1080_balls_of_solitude.py
-    ```
-5. For troubleshooting check docs `isaacgym/docs/index.html`
-
-#### Install the `dribblebot` package
-
-In this repository, run `pip install -e .`
-
-### Evaluate the pre-trained policy
-
-If everything is installed correctly, you should be able to run the evaluation script with:
+Download Isaac Gym Preview 4, then install it from its extracted directory:
 
 ```bash
-python scripts/play_dribbling_pretrained.py
+cd isaacgym/python
+pip install -e .
+python examples/1080_balls_of_solitude.py
 ```
 
-You should see a robot manipulate a yellow soccer following random global velocity commands.
-
-### Environment and Model Configuration <a name="configuration"></a>
-
-
-**CODE STRUCTURE** The main environment for simulating a legged robot is
-in [legged_robot.py](dribblebot/envs/base/legged_robot.py). The default configuration parameters including reward
-weightings are defined in [legged_robot_config.py::Cfg](dribblebot/envs/base/legged_robot_config.py).
-
-There are three scripts in the [scripts](scripts/) directory:
+Install this repository:
 
 ```bash
-scripts
-├── __init__.py
-├── play_dribbling_custom.py
-├── play_dribbling_pretrained.py
-└── train_dribbling.py
+cd MPC-MARL-quadruped
+pip install -e .
 ```
 
-### Training, Logging and evaluation <a name="training"></a>
-
-To train the Go1 controller from [Dribblebot](https://gmargo11.github.io/dribblebot/), run: 
+The launcher scripts default to
+`/home/zhz/anaconda3/envs/legged_env/bin/python`. Override that without editing
+the scripts when necessary:
 
 ```bash
-python scripts/train_dribbling.py
+export DRIBBLEBOT_PYTHON="$(command -v python)"
 ```
 
-After initializing the simulator, the script will print out a list of metrics every ten training iterations.
+Weights & Biases is used by the trainers unless a script exposes and receives
+an offline/disabled logging option. Authenticate before starting an online
+run:
 
-Training with the default configuration requires about 12GB of GPU memory. If you have less memory available, you can 
-still train by reducing the number of parallel environments used in simulation (the default is `Cfg.env.num_envs = 1000`).
+```bash
+wandb login
+```
 
-To visualize training progress, first set up weights and bias (wandb):
+## 1. Train low-level skills
 
-#### Set Up Weights and Bias (wandb):
+The AS2 low-level policies are trained independently. Each command accepts
+`--device`, `--num-envs`, and `--iterations` overrides.
 
-Weights and Biases is the service that will provide you a dashboard where you can see the progress log of your training runs, including statistics and videos.
+```bash
+# Walking
+python scripts/train_walking.py \
+  --device cuda:0 \
+  --headless
 
-First, follow the instructions here to create you wandb account: https://docs.wandb.ai/quickstart
+# Ball dribbling
+python scripts/train_dribbling.py \
+  --device cuda:0 \
+  --checkpoint-dir tmp/legged_data/dribble \
+  --headless
 
-Make sure to perform the `wandb.login()` step from your local computer.
+# Shooting
+python scripts/train_shooting.py \
+  --device cuda:0 \
+  --checkpoint-dir tmp/legged_data/shoot \
+  --headless
+```
 
-Finally, use a web browser to go to the wandb IP (defaults to `localhost:3001`) 
+Checkpoints and run data under `tmp/` and `wandb/` are deliberately excluded
+from Git.
 
-To evaluate a pretrained trained policy, run `play_dribbling_pretrained.py`. We provie a pretrained agent checkpoint in the [./runs/dribbling](runs/dribbling) directory.
+## 2. Validate low-level skills
 
-## Deploying a Model (Coming Soon) <a name="realworld"></a>
+Use `validate_robot_abilities.py` to evaluate one skill or all three. Supply
+the directories containing the exported local policy files:
 
-We are working a modular version of the vision processing code so DribbleBot can be easily deployed on Go1. It will be added in a future release.
+```bash
+python scripts/validate_robot_abilities.py \
+  --ability all \
+  --skill-policy-source local \
+  --walk-policy-dir /path/to/walk/checkpoint-directory \
+  --dribble-policy-dir /path/to/dribble/checkpoint-directory \
+  --shoot-policy-dir /path/to/shoot/checkpoint-directory \
+  --headless
+```
+
+Add `--fail-on-threshold` for a non-zero exit status when a validation target
+is missed. Results are written under `outputs/ability_validation/`. The
+[validate_skill.bash](validate_skill.bash) launcher is a local example; update
+its checkpoint paths before using it.
+
+## 3. Train the high-level multi-agent policy
+
+High-level training runs two equal AS2 teams. `--num-robots` is the number of
+robots **per team**, and every learning-team robot uses the same actor
+parameters. The opponent is a frozen older snapshot updated at
+`--self-play-update-interval` PPO iterations.
+
+```bash
+python scripts/train_high_level.py \
+  --num-robots 2 \
+  --self-play-update-interval 500 \
+  --skill-policy-source local \
+  --walk-policy-dir /path/to/walk/checkpoint-directory \
+  --dribble-policy-dir /path/to/dribble/checkpoint-directory \
+  --shoot-policy-dir /path/to/shoot/checkpoint-directory \
+  --checkpoint-dir tmp/legged_data/high_level \
+  --device cuda:0 \
+  --headless
+```
+
+[train_high_level.bash](train_high_level.bash) provides the same workflow with
+the local paths used during development.
+
+## 4. Validate the high-level policy
+
+Evaluate one match with a local high-level checkpoint and the same three
+low-level skill policies:
+
+```bash
+python scripts/play_high_level.py \
+  --num-robots 2 \
+  --high-level-policy-source local \
+  --high-level-policy-dir /path/to/high-level/checkpoint-directory \
+  --skill-policy-source local \
+  --walk-policy-dir /path/to/walk/checkpoint-directory \
+  --dribble-policy-dir /path/to/dribble/checkpoint-directory \
+  --shoot-policy-dir /path/to/shoot/checkpoint-directory \
+  --headless
+```
+
+Videos, plots, and CSV metrics are saved under `outputs/` by default. See
+[validate_high_level.bash](validate_high_level.bash) for a local launcher
+example.
+
+## 5. Collect joint world-model data
+
+The collector uses two equal teams of real AS2 robot actors—there are no
+static obstacle actors in this dataset. It records the global joint state,
+joint action, reward, termination, and event labels. Both teams draw actions
+from the same random-valid distribution.
+
+```bash
+python scripts/collect_world_model_data.py \
+  --config configs/world_model_as2.yaml \
+  --output data/world_model_as2 \
+  --num-robots 2 \
+  --num-episodes 20000 \
+  --skill-policy-source local \
+  --walk-policy-dir /path/to/walk/checkpoint-directory \
+  --dribble-policy-dir /path/to/dribble/checkpoint-directory \
+  --shoot-policy-dir /path/to/shoot/checkpoint-directory \
+  --device cuda:0
+```
+
+Here `--num-robots 2` means two robots per team and therefore four robot slots
+in the saved world-model schema. [collect.bash](collect.bash) is the equivalent
+development launcher.
+
+## 6. Train and evaluate the world model
+
+Training settings live in
+[configs/world_model_as2.yaml](configs/world_model_as2.yaml). In particular,
+change `training.max_epochs` there to control the maximum epoch count.
+
+```bash
+python scripts/train_world_model.py \
+  --config configs/world_model_as2.yaml \
+  --dataset data/world_model_as2 \
+  --output checkpoints/world_model_as2 \
+  --num-robots 2
+```
+
+The same defaults are available through [train_world_model.bash](train_world_model.bash).
+
+Evaluate the trained ensemble on a held-out split:
+
+```bash
+python scripts/evaluate_world_model.py \
+  --checkpoint checkpoints/world_model_as2/best.pt \
+  --dataset data/world_model_as2 \
+  --split test \
+  --output outputs/world_model_as2_evaluation \
+  --device cuda:0
+```
+
+## 7. Train with privileged MPC teacher guidance
+
+After training the joint world model, MPC can guide self-play PPO. The student
+policy still receives decentralized observations. MPC alone sees the joint
+state, plans learning-team actions against the frozen opponent-policy forecast,
+and supplies a dense action-agreement reward.
+
+```bash
+python scripts/train_high_level_with_mpc_teacher.py \
+  --world-model-checkpoint checkpoints/world_model_as2/best.pt \
+  --mpc-config configs/mpc_joint_teams.yaml \
+  --mpc-profile teacher_training \
+  --teacher-reward-coefficient 1.0 \
+  --num-robots 2 \
+  --skill-policy-source local \
+  --walk-policy-dir /path/to/walk/checkpoint-directory \
+  --dribble-policy-dir /path/to/dribble/checkpoint-directory \
+  --shoot-policy-dir /path/to/shoot/checkpoint-directory \
+  --checkpoint-dir tmp/legged_data/high_level_mpc_teacher \
+  --device cuda:0 \
+  --headless
+```
+
+The convenience launcher is
+[train_high_level_with_mpc_teacher.bash](train_high_level_with_mpc_teacher.bash).
+
+## Repository layout
+
+```text
+configs/                    World-model and MPC configurations
+dribblebot/envs/as2/        AS2 simulator environments
+dribblebot/envs/wrappers/   Skill, self-play, and teacher wrappers
+dribblebot/world_model/     Joint dynamics model and dataset components
+dribblebot/mpc/             Hybrid CEM MPC and teacher tooling
+dribblebot_learn/           PPO implementation
+scripts/                    Training, validation, collection, and analysis tools
+tests/                      Unit and contract tests
+```
+
+## Acknowledgements and license
+
+This work builds on the original DribbleBot implementation by Yandong Ji,
+Gabriel B. Margolis, and Pulkit Agrawal, as well as Walk These Ways and NVIDIA
+Isaac Gym. Redistributed upstream components retain their original licenses.
+See [LICENSE](LICENSE) and [LICENSES/](LICENSES/) for details.

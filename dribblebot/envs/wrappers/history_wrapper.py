@@ -22,6 +22,12 @@ class HistoryWrapper(gym.Wrapper):
         obs, rew, done, info = self.env.step(action)
         privileged_obs = info["privileged_obs"]
 
+        # The underlying vectorized environment resets done environments inside
+        # env.step(), so this wrapper's reset_idx() is not called for them.
+        # Clear terminal history before appending the first reset observation.
+        done_mask = done.bool()
+        if torch.any(done_mask):
+            self.obs_history[done_mask] = 0.0
         self.obs_history = torch.cat((self.obs_history[:, self.env.num_obs:], obs), dim=-1)
         # print("obs: ", obs)
         return {'obs': obs, 'privileged_obs': privileged_obs, 'obs_history': self.obs_history}, rew, done, info
@@ -32,7 +38,7 @@ class HistoryWrapper(gym.Wrapper):
         self.obs_history = torch.cat((self.obs_history[:, self.env.num_obs:], obs), dim=-1)
         return {'obs': obs, 'privileged_obs': privileged_obs, 'obs_history': self.obs_history}
 
-    def reset_idx(self, env_ids):  # it might be a problem that this isn't getting called!!
+    def reset_idx(self, env_ids):
         ret = super().reset_idx(env_ids)
         self.obs_history[env_ids, :] = 0
         return ret

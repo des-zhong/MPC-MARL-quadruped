@@ -2,6 +2,7 @@ import time
 from collections import deque
 import copy
 import os
+import shutil
 
 import torch
 # from ml_logger import logger
@@ -10,7 +11,7 @@ from wandb_osh.hooks import TriggerWandbSyncHook
 
 from params_proto import PrefixProto
 
-from .actor_critic import ActorCritic
+from .actor_critic import AC_Args, ActorCritic
 from .rollout_storage import RolloutStorage
 
 
@@ -53,6 +54,7 @@ class RunnerArgs(PrefixProto, cli=False):
     save_interval = 400  # check for potential saves every this many iterations
     save_video_interval = 100
     log_freq = 10
+    checkpoint_dir = './tmp/legged_data'
 
     # load and resume
     resume = False
@@ -61,6 +63,10 @@ class RunnerArgs(PrefixProto, cli=False):
     resume_path = None  # updated from load_run and chkpt
     resume_curriculum = True
     resume_checkpoint = 'ac_weights_last.pt'
+    # Disabled for ordinary locomotion tasks. Competitive wrappers implement
+    # ``update_opponent_policy`` and receive a frozen actor snapshot at this
+    # interval during self-play training.
+    self_play_update_interval = 0
 
 
 class Runner:
@@ -76,11 +82,40 @@ class Runner:
                                       self.env.num_obs_history,
                                       self.env.num_actions,
                                       ).to(self.device)
+        checkpoint_path = None
         # Load weights from checkpoint 
         if RunnerArgs.resume:
-            body = wandb.restore(RunnerArgs.resume_checkpoint, run_path=RunnerArgs.resume_path)            
-            actor_critic.load_state_dict(torch.load(body.name))
-            print(f"Successfully loaded weights from checkpoint ({RunnerArgs.resume_checkpoint}) and run path ({RunnerArgs.resume_path})")
+            if RunnerArgs.resume_path:
+                restored = wandb.restore(
+                    RunnerArgs.resume_checkpoint,
+                    run_path=RunnerArgs.resume_path,
+                )
+                checkpoint_path = restored.name
+                source = f"W&B run {RunnerArgs.resume_path}"
+            else:
+                checkpoint_path = os.path.abspath(
+                    os.path.expanduser(RunnerArgs.resume_checkpoint)
+                )
+                if not os.path.isfile(checkpoint_path):
+                    raise FileNotFoundError(
+                        f"Local resume checkpoint does not exist: {checkpoint_path}"
+                    )
+                source = "local filesystem"
+            try:
+                state_dict = torch.load(
+                    checkpoint_path,
+                    map_location=self.device,
+                    weights_only=True,
+                )
+            except TypeError:
+                # Compatibility with older PyTorch versions that predate the
+                # safer weights_only loader argument.
+                state_dict = torch.load(checkpoint_path, map_location=self.device)
+            actor_critic.load_state_dict(state_dict)
+            print(
+                f"Successfully loaded weights from {checkpoint_path} "
+                f"({source})."
+            )
 
         self.alg = PPO(actor_critic, device=self.device)
         self.num_steps_per_env = RunnerArgs.num_steps_per_env
@@ -96,13 +131,37 @@ class Runner:
 
         self.env.reset()
 
+        if hasattr(self.env, "update_opponent_policy"):
+            self.env.update_opponent_policy(self.alg.actor_critic, iteration=0)
+            if checkpoint_path and not RunnerArgs.resume_path:
+                opponent_path = os.path.join(
+                    os.path.dirname(checkpoint_path),
+                    "opponent_ac_weights_latest.pt",
+                )
+                if os.path.isfile(opponent_path) and hasattr(
+                    self.env, "load_opponent_policy_state_dict"
+                ):
+                    try:
+                        opponent_state = torch.load(
+                            opponent_path, map_location=self.device, weights_only=True
+                        )
+                    except TypeError:
+                        opponent_state = torch.load(opponent_path, map_location=self.device)
+                    self.env.load_opponent_policy_state_dict(
+                        opponent_state, self.alg.actor_critic, iteration=-1
+                    )
+                    print(f"Loaded frozen opponent weights from {opponent_path}.")
+
     def learn(self, num_learning_iterations, init_at_random_ep_len=False, eval_freq=100, curriculum_dump_freq=500, eval_expert=False):
         trigger_sync = TriggerWandbSyncHook()
         wandb.watch(self.alg.actor_critic, log="all", log_freq=RunnerArgs.log_freq)
 
         if init_at_random_ep_len:
-            self.env.episode_length_buf[:] = torch.randint_like(self.env.episode_length_buf,
-                                                             high=int(self.env.max_episode_length))
+            if hasattr(self.env, "randomize_episode_lengths"):
+                self.env.randomize_episode_lengths()
+            else:
+                self.env.episode_length_buf[:] = torch.randint_like(self.env.episode_length_buf,
+                                                                 high=int(self.env.max_episode_length))
 
         # split train and test envs
         num_train_envs = self.env.num_train_envs
@@ -121,6 +180,12 @@ class Runner:
         tot_iter = self.current_learning_iteration + num_learning_iterations
         for it in range(self.current_learning_iteration, tot_iter):
             start = time.time()
+            high_level_executed_counts = torch.zeros(3, dtype=torch.float64)
+            high_level_requested_counts = torch.zeros(3, dtype=torch.float64)
+            high_level_invalid_count = 0.0
+            high_level_selection_count = 0
+            high_level_distance_sums = torch.zeros(2, dtype=torch.float64)
+            high_level_distance_count = 0
             # Rollout
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
@@ -155,13 +220,61 @@ class Runner:
                     if 'curriculum/distribution' in infos:
                         distribution = infos['curriculum/distribution']
 
+                    if 'high_level_skill_ids' in infos:
+                        executed = torch.as_tensor(infos['high_level_skill_ids']).long()
+                        requested = torch.as_tensor(
+                            infos.get('high_level_requested_skill_ids', executed)
+                        ).long()
+                        invalid = torch.as_tensor(
+                            infos.get('high_level_invalid_skill_mask', torch.zeros_like(executed))
+                        ).bool()
+                        executed = executed[:num_train_envs]
+                        requested = requested[:num_train_envs]
+                        invalid = invalid[:num_train_envs]
+                        high_level_executed_counts += torch.bincount(
+                            executed.reshape(-1).cpu(),
+                            minlength=3,
+                        )[:3]
+                        high_level_requested_counts += torch.bincount(
+                            requested.reshape(-1).cpu(),
+                            minlength=3,
+                        )[:3]
+                        high_level_invalid_count += float(invalid.sum().item())
+                        high_level_selection_count += int(executed.numel())
+
+                    if 'high_level_robot_ball_distances' in infos:
+                        distances = torch.as_tensor(
+                            infos['high_level_robot_ball_distances']
+                        )[:num_train_envs]
+                        if distances.ndim == 2 and distances.shape[1] >= 1:
+                            logged_robots = min(2, distances.shape[1])
+                            high_level_distance_sums[:logged_robots] += (
+                                distances[:, :logged_robots].double().sum(dim=0).cpu()
+                            )
+                            high_level_distance_count += int(distances.shape[0])
+
                 self.alg.compute_returns(obs_history[:num_train_envs], privileged_obs[:num_train_envs])
 
             mean_value_loss, mean_surrogate_loss, mean_adaptation_module_loss, mean_decoder_loss, mean_decoder_loss_student, mean_adaptation_module_test_loss, mean_decoder_test_loss, mean_decoder_test_loss_student, mean_adaptation_losses_dict = self.alg.update()
+            if (
+                RunnerArgs.self_play_update_interval > 0
+                and hasattr(self.env, "update_opponent_policy")
+                and (it + 1) % RunnerArgs.self_play_update_interval == 0
+            ):
+                self.env.update_opponent_policy(self.alg.actor_critic, iteration=it + 1)
             stop = time.time()
             learn_time = stop - start
 
-            wandb.log({
+            clip_actions = float(self.env.cfg.normalization.clip_actions)
+            action_clip_fraction = (
+                self.env.actions.abs() >= clip_actions - 1e-6
+            ).float().mean().item()
+            policy_std = self.alg.actor_critic.std.detach().clamp(
+                min=AC_Args.min_action_std,
+                max=AC_Args.max_action_std,
+            )
+
+            training_metrics = {
                 "time_iter": learn_time,
                 # "time_iter": logger.split('epoch'),
                 "adaptation_loss": mean_adaptation_module_loss,
@@ -171,8 +284,35 @@ class Runner:
                 "mean_decoder_loss_student": mean_decoder_loss_student,
                 "mean_decoder_test_loss": mean_decoder_test_loss,
                 "mean_decoder_test_loss_student": mean_decoder_test_loss_student,
-                "mean_adaptation_module_test_loss": mean_adaptation_module_test_loss
-            }, step=it)
+                "mean_adaptation_module_test_loss": mean_adaptation_module_test_loss,
+                "ppo/learning_rate": self.alg.learning_rate,
+                "ppo/kl_mean": self.alg.last_kl_mean,
+                "policy/skill_entropy": self.alg.last_skill_entropy,
+                "policy/action_std_mean": policy_std.mean().item(),
+                "policy/action_std_max": policy_std.max().item(),
+                "policy/action_mean_abs": self.alg.last_action_mean_abs,
+                "policy/action_abs_max": self.alg.last_action_abs_max,
+                "policy/action_clip_fraction": action_clip_fraction,
+            }
+            if high_level_selection_count > 0:
+                skill_names = ("walk", "dribble", "shoot")
+                for skill_id, skill_name in enumerate(skill_names):
+                    training_metrics[
+                        f"high_level/executed_{skill_name}_fraction"
+                    ] = float(high_level_executed_counts[skill_id] / high_level_selection_count)
+                    training_metrics[
+                        f"high_level/requested_{skill_name}_fraction"
+                    ] = float(high_level_requested_counts[skill_id] / high_level_selection_count)
+                training_metrics["high_level/invalid_request_fraction"] = (
+                    high_level_invalid_count / high_level_selection_count
+                )
+            if high_level_distance_count > 0:
+                logged_robots = min(2, int(getattr(self.env, "num_robots", 1)))
+                for robot_idx in range(logged_robots):
+                    training_metrics[f"high_level/robot{robot_idx}_ball_distance"] = float(
+                        high_level_distance_sums[robot_idx] / high_level_distance_count
+                    )
+            wandb.log(training_metrics, step=it)
 
 
             
@@ -188,56 +328,89 @@ class Runner:
             trigger_sync()
 
             if it % RunnerArgs.save_interval == 0:
-                    print(f"Saving model at iteration {it}")
+                print(f"Saving model at iteration {it}")
 
-                    path = './tmp/legged_data'
-                    os.makedirs(path, exist_ok=True)
+                path = os.path.abspath(os.path.expanduser(RunnerArgs.checkpoint_dir))
+                os.makedirs(path, exist_ok=True)
+                print(f"Checkpoint directory: {path}")
 
-                    ac_weight_path = f'{path}/ac_weights_{it}.pt'
-                    torch.save(self.alg.actor_critic.state_dict(), ac_weight_path)
-                    wandb.save(ac_weight_path)
+                state_dict = self.alg.actor_critic.state_dict()
+                checkpoint_paths = [
+                    os.path.join(path, f"ac_weights_{it}.pt"),
+                    os.path.join(path, "ac_weights_latest.pt"),
+                ]
+                for checkpoint_path in checkpoint_paths:
+                    torch.save(state_dict, checkpoint_path)
 
-                    ac_weight_path = f'{path}/ac_weights_latest.pt'
-                    torch.save(self.alg.actor_critic.state_dict(), ac_weight_path)
-                    wandb.save(ac_weight_path)
+                if hasattr(self.env, "opponent_policy_state_dict"):
+                    opponent_state_dict = self.env.opponent_policy_state_dict()
+                    if opponent_state_dict is not None:
+                        opponent_paths = [
+                            os.path.join(path, f"opponent_ac_weights_{it}.pt"),
+                            os.path.join(path, "opponent_ac_weights_latest.pt"),
+                        ]
+                        for opponent_path in opponent_paths:
+                            torch.save(opponent_state_dict, opponent_path)
+                    else:
+                        opponent_paths = []
+                else:
+                    opponent_paths = []
 
-                    adaptation_module_path = f'{path}/adaptation_module_{it}.jit'
-                    adaptation_module = copy.deepcopy(self.alg.actor_critic.adaptation_module).to('cpu')
-                    traced_script_adaptation_module = torch.jit.script(adaptation_module)
-                    traced_script_adaptation_module.save(adaptation_module_path)
+                adaptation_module = copy.deepcopy(
+                    self.alg.actor_critic.adaptation_module
+                ).to('cpu')
+                traced_adaptation_module = torch.jit.script(adaptation_module)
+                adaptation_paths = [
+                    os.path.join(path, f"adaptation_module_{it}.jit"),
+                    os.path.join(path, "adaptation_module_latest.jit"),
+                ]
+                for adaptation_path in adaptation_paths:
+                    traced_adaptation_module.save(adaptation_path)
 
-                    adaptation_module_path = f'{path}/adaptation_module_latest.jit'
-                    traced_script_adaptation_module.save(adaptation_module_path)
+                body_model = copy.deepcopy(
+                    self.alg.actor_critic.actor_body
+                ).to('cpu')
+                traced_body_module = torch.jit.script(body_model)
+                body_paths = [
+                    os.path.join(path, f"body_{it}.jit"),
+                    os.path.join(path, "body_latest.jit"),
+                ]
+                for body_path in body_paths:
+                    traced_body_module.save(body_path)
 
-                    body_path = f'{path}/body_{it}.jit'
-                    body_model = copy.deepcopy(self.alg.actor_critic.actor_body).to('cpu')
-                    traced_script_body_module = torch.jit.script(body_model)
-                    traced_script_body_module.save(body_path)
+                config_paths = []
+                wandb_run_dir = getattr(getattr(wandb, "run", None), "dir", None)
+                if wandb_run_dir is not None:
+                    wandb_config_path = os.path.join(wandb_run_dir, "config.yaml")
+                    if os.path.isfile(wandb_config_path):
+                        local_config_path = os.path.join(path, "config.yaml")
+                        if os.path.abspath(wandb_config_path) != os.path.abspath(local_config_path):
+                            shutil.copy2(wandb_config_path, local_config_path)
+                        config_paths.append(local_config_path)
 
-                    body_path = f'{path}/body_latest.jit'
-                    traced_script_body_module.save(body_path)
-
-                    # logger.upload_file(file_path=adaptation_module_path, target_path=f"checkpoints/", once=False)
-                    # logger.upload_file(file_path=body_path, target_path=f"checkpoints/", once=False)
-
-                    ac_weights_path = f"{path}/ac_weights_{it}.pt"
-                    torch.save(self.alg.actor_critic.state_dict(), ac_weights_path)
-                    ac_weights_path = f"{path}/ac_weights_latest.pt"
-                    torch.save(self.alg.actor_critic.state_dict(), ac_weights_path)
-                    
-                    wandb.save(f"./tmp/legged_data/adaptation_module_{it}.jit")
-                    wandb.save(f"./tmp/legged_data/body_{it}.jit")
-                    wandb.save(f"./tmp/legged_data/ac_weights_{it}.pt")
-                    wandb.save(f"./tmp/legged_data/adaptation_module_latest.jit")
-                    wandb.save(f"./tmp/legged_data/body_latest.jit")
-                    wandb.save(f"./tmp/legged_data/ac_weights_latest.pt")
+                working_directory = os.path.abspath(os.getcwd())
+                wandb_base_path = (
+                    working_directory
+                    if os.path.commonpath((working_directory, path)) == working_directory
+                    else path
+                )
+                artifact_paths = (
+                    adaptation_paths
+                    + body_paths
+                    + checkpoint_paths
+                    + opponent_paths
+                    + config_paths
+                )
+                for artifact_path in artifact_paths:
+                    wandb.save(artifact_path, base_path=wandb_base_path)
                     
 
             self.current_learning_iteration += num_learning_iterations
 
-        path = './tmp/legged_data'
-
-        os.makedirs(path, exist_ok=True)
+        os.makedirs(
+            os.path.abspath(os.path.expanduser(RunnerArgs.checkpoint_dir)),
+            exist_ok=True,
+        )
 
     def log_video(self, it):
         if it - self.last_recording_it >= RunnerArgs.save_video_interval:

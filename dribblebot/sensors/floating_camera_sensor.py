@@ -9,6 +9,9 @@ class FloatingCameraSensor(Sensor):
         camera_props = gymapi.CameraProperties()
         camera_props.width = self.env.cfg.env.recording_width_px
         camera_props.height = self.env.cfg.env.recording_height_px
+        horizontal_fov = getattr(self.env.cfg.env, "recording_horizontal_fov", None)
+        if horizontal_fov is not None:
+            camera_props.horizontal_fov = float(horizontal_fov)
         self.rendering_camera = self.env.gym.create_camera_sensor(self.env.envs[0], camera_props)
         self.env.gym.set_camera_location(self.rendering_camera, self.env.envs[0], gymapi.Vec3(1.5, 1, 3.0),
                                         gymapi.Vec3(0, 0, 0))

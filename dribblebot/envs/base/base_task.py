@@ -51,6 +51,7 @@ class BaseTask(gym.Env):
 
         # allocate buffers
         self.obs_buf = torch.zeros(self.num_envs, self.num_obs, device=self.device, dtype=torch.float)
+
         self.rew_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
         self.rew_buf_pos = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
         self.rew_buf_neg = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)

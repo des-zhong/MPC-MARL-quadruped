@@ -1,0 +1,12 @@
+python scripts/validate_robot_abilities.py \
+  --ability dribble \
+  --skill-policy-source local \
+  --walk-policy-dir wandb/as2_walk-3a6g1def/files/tmp/legged_data \
+  --dribble-policy-dir wandb/run-20260809_220330-ofbwcsz3/files/tmp/legged_data/dribble \
+  --shoot-policy-dir wandb/as2_shoot-a95j09x7/files/tmp/legged_data/shoot \
+  --dribble-x 1.0 \
+  --dribble-y 0.6 \
+  --dribble-yaw -0.6 \
+  --shoot-x 1.5 \
+  --shoot-y 0.3 \
+  --headless

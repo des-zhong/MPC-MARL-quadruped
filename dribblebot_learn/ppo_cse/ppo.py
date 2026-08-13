@@ -6,8 +6,59 @@ import numpy as np
 from params_proto import PrefixProto
 
 from dribblebot_learn.ppo_cse import ActorCritic
+from dribblebot_learn.ppo_cse.actor_critic import AC_Args
 from dribblebot_learn.ppo_cse import RolloutStorage
 from dribblebot_learn.ppo_cse import caches
+
+
+def gaussian_kl_mean(old_mu, old_sigma, new_mu, new_sigma):
+    """Numerically stable KL(old policy || new policy)."""
+
+    old_sigma = old_sigma.clamp_min(1e-6)
+    new_sigma = new_sigma.clamp_min(1e-6)
+    per_dimension = (
+        torch.log(new_sigma) - torch.log(old_sigma)
+        + (old_sigma.square() + (old_mu - new_mu).square())
+        / (2.0 * new_sigma.square())
+        - 0.5
+    )
+    return per_dimension.sum(dim=-1).mean().clamp_min(0.0)
+
+
+def categorical_skill_entropy(
+    action_mean,
+    action_stride=6,
+    num_skill_logits=3,
+    action_std=None,
+):
+    """Approximate entropy of argmax skills from Gaussian action coordinates.
+
+    Skill choice is made by taking an argmax after Gaussian sampling.  Raw
+    means are therefore not calibrated logits: the same mean gap is exploratory
+    at a large standard deviation and effectively deterministic at a small
+    one.  Scaling by the sampling standard deviation makes this regularizer
+    detect the collapse that actually reaches the environment.
+    """
+
+    if action_stride <= 0 or num_skill_logits <= 1 or num_skill_logits > action_stride:
+        raise ValueError("Invalid skill-action layout")
+    if action_mean.shape[-1] % action_stride != 0:
+        raise ValueError(
+            f"Action width {action_mean.shape[-1]} is not divisible by stride {action_stride}"
+        )
+    logits = action_mean.reshape(*action_mean.shape[:-1], -1, action_stride)[
+        ..., :num_skill_logits
+    ]
+    if action_std is not None:
+        if action_std.shape != action_mean.shape:
+            action_std = torch.broadcast_to(action_std, action_mean.shape)
+        skill_std = action_std.reshape(
+            *action_std.shape[:-1], -1, action_stride
+        )[..., :num_skill_logits]
+        logits = logits / skill_std.clamp_min(1e-6)
+    probabilities = torch.softmax(logits, dim=-1)
+    log_probabilities = torch.log_softmax(logits, dim=-1)
+    return -(probabilities * log_probabilities).sum(dim=-1).mean()
 
 
 class PPO_Args(PrefixProto):
@@ -26,6 +77,16 @@ class PPO_Args(PrefixProto):
     lam = 0.95
     desired_kl = 0.01
     max_grad_norm = 1.
+    min_learning_rate = 1e-5
+    max_learning_rate = 1e-3
+    # Optional safeguards for hybrid policies whose first action coordinates
+    # encode an argmax-selected discrete skill. They are disabled for existing
+    # low-level continuous-control jobs and enabled by train_high_level.py.
+    skill_entropy_coef = 0.0
+    skill_action_stride = 6
+    num_skill_logits = 3
+    stop_on_excessive_kl = False
+    max_kl_factor = 4.0
 
     selective_adaptation_module_loss = False
 
@@ -55,6 +116,10 @@ class PPO:
         self.transition = RolloutStorage.Transition()
 
         self.learning_rate = PPO_Args.learning_rate
+        self.last_kl_mean = 0.0
+        self.last_action_mean_abs = 0.0
+        self.last_action_abs_max = 0.0
+        self.last_skill_entropy = 0.0
 
     def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, privileged_obs_shape, obs_history_shape,
                      action_shape):
@@ -74,6 +139,8 @@ class PPO:
         self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.actor_critic.action_mean.detach()
         self.transition.action_sigma = self.actor_critic.action_std.detach()
+        self.last_action_mean_abs = self.transition.action_mean.abs().mean().item()
+        self.last_action_abs_max = self.transition.actions.abs().max().item()
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
         self.transition.critic_observations = obs
@@ -87,8 +154,9 @@ class PPO:
         self.transition.env_bins = infos["env_bins"]
         # Bootstrapping on time outs
         if 'time_outs' in infos:
+            time_outs = torch.as_tensor(infos['time_outs'], device=self.device)
             self.transition.rewards += PPO_Args.gamma * torch.squeeze(
-                self.transition.values * infos['time_outs'].unsqueeze(1).to(self.device), 1)
+                self.transition.values * time_outs.unsqueeze(1), 1)
 
         # Record the transition
         self.storage.add_transitions(self.transition)
@@ -110,6 +178,8 @@ class PPO:
         mean_decoder_test_loss_student = 0
         
         mean_adaptation_losses = {}
+        performed_updates = 0
+        adaptation_updates = 0
         label_start_end = {}
         si = 0
         for idx, (label, length) in enumerate(zip(PPO_Args.adaptation_labels, PPO_Args.adaptation_dims)):
@@ -129,21 +199,35 @@ class PPO:
             entropy_batch = self.actor_critic.entropy
 
             # KL
-            if PPO_Args.desired_kl != None and PPO_Args.schedule == 'adaptive':
+            if PPO_Args.desired_kl is not None:
                 with torch.inference_mode():
-                    kl = torch.sum(
-                        torch.log(sigma_batch / old_sigma_batch + 1.e-5) + (
-                                torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch)) / (
-                                2.0 * torch.square(sigma_batch)) - 0.5, axis=-1)
-                    kl_mean = torch.mean(kl)
+                    kl_mean = gaussian_kl_mean(
+                        old_mu_batch,
+                        old_sigma_batch,
+                        mu_batch,
+                        sigma_batch,
+                    )
+                    self.last_kl_mean = kl_mean.item()
 
-                    if kl_mean > PPO_Args.desired_kl * 2.0:
-                        self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                    elif kl_mean < PPO_Args.desired_kl / 2.0 and kl_mean > 0.0:
-                        self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                    if PPO_Args.schedule == 'adaptive':
+                        if kl_mean > PPO_Args.desired_kl * 2.0:
+                            self.learning_rate = max(PPO_Args.min_learning_rate, self.learning_rate / 1.5)
+                        elif kl_mean < PPO_Args.desired_kl / 2.0 and kl_mean > 0.0:
+                            self.learning_rate = min(PPO_Args.max_learning_rate, self.learning_rate * 1.5)
 
-                    for param_group in self.optimizer.param_groups:
-                        param_group['lr'] = self.learning_rate
+                        for param_group in self.optimizer.param_groups:
+                            param_group['lr'] = self.learning_rate
+
+                if (
+                    PPO_Args.stop_on_excessive_kl
+                    and PPO_Args.desired_kl is not None
+                    and kl_mean > PPO_Args.desired_kl * PPO_Args.max_kl_factor
+                ):
+                    # This minibatch is already too far from the rollout
+                    # policy. Applying another gradient step defeats adaptive
+                    # learning-rate control and can irreversibly collapse an
+                    # argmax-selected skill.
+                    continue
 
             # Surrogate loss
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
@@ -163,13 +247,33 @@ class PPO:
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + PPO_Args.value_loss_coef * value_loss - PPO_Args.entropy_coef * entropy_batch.mean()
+            skill_entropy = torch.zeros((), device=mu_batch.device)
+            if PPO_Args.skill_entropy_coef > 0.0:
+                skill_entropy = categorical_skill_entropy(
+                    mu_batch,
+                    PPO_Args.skill_action_stride,
+                    PPO_Args.num_skill_logits,
+                    sigma_batch,
+                )
+                self.last_skill_entropy = skill_entropy.detach().item()
+            loss = (
+                surrogate_loss
+                + PPO_Args.value_loss_coef * value_loss
+                - PPO_Args.entropy_coef * entropy_batch.mean()
+                - PPO_Args.skill_entropy_coef * skill_entropy
+            )
 
             # Gradient step
             self.optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), PPO_Args.max_grad_norm)
             self.optimizer.step()
+            performed_updates += 1
+            with torch.no_grad():
+                self.actor_critic.std.clamp_(
+                    min=AC_Args.min_action_std,
+                    max=AC_Args.max_action_std,
+                )
 
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
@@ -200,21 +304,23 @@ class PPO:
                     self.adaptation_module_optimizer.zero_grad()
                     adaptation_loss.backward()
                     self.adaptation_module_optimizer.step()
+                    adaptation_updates += 1
 
                     mean_adaptation_module_loss += adaptation_loss.item()
                     mean_adaptation_module_test_loss += 0  # adaptation_test_loss.item()
 
-        num_updates = PPO_Args.num_learning_epochs * PPO_Args.num_mini_batches
+        num_updates = max(performed_updates, 1)
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
-        mean_adaptation_module_loss /= (num_updates * PPO_Args.num_adaptation_module_substeps)
-        mean_decoder_loss /= (num_updates * PPO_Args.num_adaptation_module_substeps)
-        mean_decoder_loss_student /= (num_updates * PPO_Args.num_adaptation_module_substeps)
-        mean_adaptation_module_test_loss /= (num_updates * PPO_Args.num_adaptation_module_substeps)
-        mean_decoder_test_loss /= (num_updates * PPO_Args.num_adaptation_module_substeps)
-        mean_decoder_test_loss_student /= (num_updates * PPO_Args.num_adaptation_module_substeps)
+        auxiliary_updates = max(adaptation_updates, 1)
+        mean_adaptation_module_loss /= auxiliary_updates
+        mean_decoder_loss /= auxiliary_updates
+        mean_decoder_loss_student /= auxiliary_updates
+        mean_adaptation_module_test_loss /= auxiliary_updates
+        mean_decoder_test_loss /= auxiliary_updates
+        mean_decoder_test_loss_student /= auxiliary_updates
         for label in PPO_Args.adaptation_labels:
-            mean_adaptation_losses[label] /= (num_updates * PPO_Args.num_adaptation_module_substeps)
+            mean_adaptation_losses[label] /= auxiliary_updates
         self.storage.clear()
 
         return mean_value_loss, mean_surrogate_loss, mean_adaptation_module_loss, mean_decoder_loss, mean_decoder_loss_student, mean_adaptation_module_test_loss, mean_decoder_test_loss, mean_decoder_test_loss_student, mean_adaptation_losses

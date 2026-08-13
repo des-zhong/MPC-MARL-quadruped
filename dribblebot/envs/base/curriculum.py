@@ -45,9 +45,12 @@ class Curriculum:
         self.bin_sizes = {key: (v_range[1] - v_range[0]) / v_range[2] for key, v_range in key_ranges.items()}
 
         self._raw_grid = np.stack(np.meshgrid(*cfg.values(), indexing='ij'))
+        
         self._idx_grid = np.stack(np.meshgrid(*indices.values(), indexing='ij'))
         self.keys = [*key_ranges.keys()]
         self.grid = self._raw_grid.reshape([len(self.keys), -1])
+        # import os
+        # os._exit(0)
         self.idx_grid = self._idx_grid.reshape([len(self.keys), -1])
         # self.grid = np.stack([params.flatten() for params in raw_grid])
 

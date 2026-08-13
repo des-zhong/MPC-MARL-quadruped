@@ -7,6 +7,11 @@ from torch.distributions import Normal
 class AC_Args(PrefixProto, cli=False):
     # policy
     init_noise_std = 1.0
+    min_action_std = 0.05
+    max_action_std = 2.0
+    # Optional bound applied to the Gaussian mean. Individual training scripts
+    # can enable it without changing the checkpoint parameter structure.
+    action_mean_bound = None
     actor_hidden_dims = [512, 256, 128]
     critic_hidden_dims = [512, 256, 128]
     activation = 'elu'  # can be elu, relu, selu, crelu, lrelu, tanh, sigmoid
@@ -18,6 +23,21 @@ class AC_Args(PrefixProto, cli=False):
     adaptation_weights = []
 
     use_decoder = False
+
+
+class ActionMeanBound(nn.Module):
+    """Parameter-free output bound that is preserved in exported actor JITs."""
+
+    __constants__ = ["bound"]
+
+    def __init__(self, bound):
+        super().__init__()
+        self.bound = float(bound)
+        if self.bound <= 0.0:
+            raise ValueError(f"Action mean bound must be positive, got {bound}")
+
+    def forward(self, actions):
+        return self.bound * torch.tanh(actions / self.bound)
 
 
 class ActorCritic(nn.Module):
@@ -74,6 +94,8 @@ class ActorCritic(nn.Module):
             else:
                 actor_layers.append(nn.Linear(AC_Args.actor_hidden_dims[l], AC_Args.actor_hidden_dims[l + 1]))
                 actor_layers.append(activation)
+        if AC_Args.action_mean_bound is not None and float(AC_Args.action_mean_bound) > 0.0:
+            actor_layers.append(ActionMeanBound(AC_Args.action_mean_bound))
         self.actor_body = nn.Sequential(*actor_layers)
 
         # Value function
@@ -125,7 +147,8 @@ class ActorCritic(nn.Module):
     def update_distribution(self, observation_history):
         latent = self.adaptation_module(observation_history)
         mean = self.actor_body(torch.cat((observation_history, latent), dim=-1))
-        self.distribution = Normal(mean, mean * 0. + self.std)
+        std = self.std.clamp(min=AC_Args.min_action_std, max=AC_Args.max_action_std)
+        self.distribution = Normal(mean, mean * 0. + std)
 
     def act(self, observation_history, **kwargs):
         self.update_distribution(observation_history)

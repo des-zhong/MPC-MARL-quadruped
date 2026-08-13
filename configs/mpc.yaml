@@ -1,0 +1,163 @@
+# Skill-level MPC configuration for the AS2 multi-robot football environment.
+seed: 42
+mpc_profile: fast_validation
+
+world_model:
+  # One HighLevelSkillWrapper.step already holds this many 20 ms updates.
+  macro_action_steps: 10
+  history_length: 1
+  max_obstacles: 2
+
+environment:
+  robot: as2
+  num_robots: 2
+  num_envs: 16
+  episode_length: 20.0
+  field_length: 8.0
+  field_width: 5.0
+  goal_half_width: 1.0
+
+mpc:
+  algorithm: cem
+  horizon: 8
+  num_candidates: 2048
+  num_elites: 128
+  num_iterations: 5
+  candidate_batch_size: 256
+  skill_temperature: 1.0
+  min_skill_probability: 0.02
+  initial_parameter_std_fraction: 0.50
+  min_parameter_std_fraction: 0.03
+  max_parameter_std_fraction: 0.75
+  categorical_smoothing: 0.25
+  continuous_smoothing: 0.25
+  warm_start: true
+  deterministic_world_model: true
+  gamma: 0.99
+  uncertainty_penalty: 0.10
+  ensemble_objective: mean_minus_std
+  return_std_penalty: 0.50
+  termination_threshold: 0.50
+  skill_switch_penalty: 0.01
+  command_change_penalty: 0.01
+  collision_penalty: 1.0
+  out_of_bounds_penalty: 2.0
+  robot_fall_penalty: 1.0
+  # This prevents planning a requested skill that the live wrapper would
+  # downgrade. Thresholds mirror the current wrapper affordance contract.
+  invalid_skill_penalty: 2.0
+  dribble_affordance_distance_m: 1.0
+  shoot_affordance_distance_m: 0.75
+  shoot_min_forward_m: -0.10
+  shoot_lateral_reach_m: 0.45
+  # Distance-only affordances consider a ball under the chassis valid. Shape
+  # close approach and predicted dribble/shoot states toward the setups used by
+  # the low-level policies: in front for dribbling and behind the ball along
+  # the kick command for shooting.
+  ball_setup_penalty: 0.5
+  dribble_target_forward_m: 0.35
+  shoot_target_distance_m: 0.45
+  # Reject predicted dribble trajectories where the base moves opposite its
+  # body-forward direction.
+  backward_dribble_penalty: 0.5
+  dribble_forward_speed_scale_mps: 1.0
+  # While the ball is outside dribble range, reward the closest repositioning
+  # robot for closing distance and directly score its body-frame walk command
+  # against the current ball bearing. The first-step emphasis prevents MPC
+  # from walking away now in exchange for an optimistic turn later.
+  reposition_approach_coefficient: 2.0
+  reposition_command_alignment_coefficient: 1.0
+  reposition_first_step_multiplier: 3.0
+  ball_progress_coefficient: 0.0
+  possession_coefficient: 0.0
+  goal_probability_bonus: 0.0
+  event_coefficients: {}
+  objective_mode: reward_plus_terminal_value
+  use_terminal_value: true
+  terminal_handling: hard_threshold
+  terminal_value:
+    enabled: true
+    checkpoint: null
+    required: false
+    coefficient: 1.0
+    clip_value: false
+    clip_min: null
+    clip_max: null
+    uncertainty_gating: false
+    uncertainty_beta: 1.0
+  execute_mean_action: false
+  execute_best_sample: true
+  execution_action_smoothing: 0.0
+  minimum_skill_duration: 1
+  fallback_policy: safe_reposition
+  uncertainty_fallback_threshold: 0.50
+  warm_start_uncertainty_threshold: 0.30
+  invalid_objective: -1000000000.0
+  max_candidate_diagnostics: 0
+  seed: 42
+
+mpc_profiles:
+  offline_high_quality:
+    horizon: 10
+    num_candidates: 4096
+    num_elites: 256
+    num_iterations: 7
+    candidate_batch_size: 256
+  fast_validation:
+    horizon: 10
+    num_candidates: 256
+    num_elites: 32
+    num_iterations: 3
+    candidate_batch_size: 128
+  realtime:
+    horizon: 5
+    num_candidates: 128
+    num_elites: 16
+    num_iterations: 3
+    candidate_batch_size: 128
+  visualization:
+    # Shorter rollouts reduce exploitation of accumulated yaw and command-lag
+    # error in the current world model.
+    horizon: 5
+    num_candidates: 512
+    num_elites: 64
+    num_iterations: 5
+    candidate_batch_size: 128
+    max_candidate_diagnostics: 128
+
+teacher:
+  distribution_source: final_cem
+  minimum_skill_probability: 0.01
+  minimum_parameter_std_fraction: 0.02
+  behavior_mode: mpc
+  detailed_diagnostic_episodes: 5
+
+world_model_expansion:
+  train_fraction: 0.80
+  validation_fraction: 0.20
+  test_fraction: 0.0
+
+evaluation:
+  confidence_level: 0.95
+  methods:
+    - random_valid
+    - scripted
+    - greedy_h1
+    - mpc_no_uncertainty
+    - mpc
+  horizons: [1, 3, 5, 8, 10]
+  terminal_value_coefficients: [0.0, 0.25, 0.5, 1.0, 2.0]
+  candidate_counts: [128, 256, 512, 1024, 2048, 4096]
+  cem_iterations: [1, 3, 5, 7]
+  objective_ablations:
+    - reward_only
+    - reward_uncertainty
+    - reward_constraints
+    - reward_uncertainty_constraints
+    - no_skill_switch
+    - no_command_smoothness
+
+visualization:
+  save_frame_sequence: true
+  save_video: true
+  fps: 5.0
