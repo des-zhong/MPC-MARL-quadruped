@@ -76,13 +76,19 @@ def build_environment(args, config):
             "Use scripts/go1_scripts/collect_world_model_data.py for GO1."
         )
     from dribblebot.envs.as2.two_robot_velocity_tracking import TwoRobotVelocityTrackingEasyEnv
+    joint_teams = "team_size" in env_config
+    configured_count = (
+        env_config.get("team_size", 2)
+        if joint_teams
+        else env_config.get("num_robots", 2)
+    )
     high_args = argparse.Namespace(
         device=args.device, policy_device=args.policy_device,
         headless=True, project=None, num_envs=int(env_config.get("num_envs", 256)), iterations=0,
-        self_play=True,
+        self_play=joint_teams,
         num_robots=int(
             getattr(args, "num_robots", None)
-            or env_config.get("team_size", env_config.get("num_robots", 2))
+            or configured_count
         ),
         episode_length=float(env_config.get("episode_length", 20.0)),
         control_interval=int(config["world_model"].get("macro_action_steps", 10)),

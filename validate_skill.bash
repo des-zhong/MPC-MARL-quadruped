@@ -1,12 +1,15 @@
-python scripts/validate_robot_abilities.py \
-  --ability dribble \
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "${PROJECT_ROOT}"
+PYTHON_BIN="${DRIBBLEBOT_PYTHON:-/home/zhz/anaconda3/envs/legged_env/bin/python}"
+
+exec "${PYTHON_BIN}" scripts/validate_robot_abilities.py \
+  --ability all \
   --skill-policy-source local \
-  --walk-policy-dir wandb/as2_walk-3a6g1def/files/tmp/legged_data \
-  --dribble-policy-dir wandb/run-20260809_220330-ofbwcsz3/files/tmp/legged_data/dribble \
-  --shoot-policy-dir wandb/as2_shoot-a95j09x7/files/tmp/legged_data/shoot \
-  --dribble-x 1.0 \
-  --dribble-y 0.6 \
-  --dribble-yaw -0.6 \
-  --shoot-x 1.5 \
-  --shoot-y 0.3 \
-  --headless
+  --walk-policy-dir checkpoints/reproduction/walk \
+  --dribble-policy-dir checkpoints/reproduction/dribble \
+  --shoot-policy-dir checkpoints/reproduction/shoot \
+  --headless \
+  "$@"

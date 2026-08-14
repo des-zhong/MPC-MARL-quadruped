@@ -60,6 +60,18 @@ cd MPC-MARL-quadruped
 pip install -e .
 ```
 
+Install Git LFS and download the curated reproduction checkpoints:
+
+```bash
+git lfs install
+git lfs pull
+./checkpoints/reproduction/assemble_world_model.bash
+```
+
+The complete bundle contract and file hashes are documented in
+[checkpoints/reproduction/README.md](checkpoints/reproduction/README.md). The
+top-level launchers use these checkpoint paths by default.
+
 The launcher scripts default to
 `/home/zhz/anaconda3/envs/legged_env/bin/python`. Override that without editing
 the scripts when necessary:

@@ -16,8 +16,8 @@ exec "${PYTHON_BIN}" scripts/collect_world_model_data.py \
   --num-robots 2 \
   --device cuda:6 \
   --skill-policy-source local \
-  --walk-policy-dir wandb/as2_walk-3a6g1def/files/tmp/legged_data \
-  --dribble-policy-dir wandb/as2_dribble-ofbwcsz3/files/tmp/legged_data/dribble \
-  --shoot-policy-dir wandb/as2_shoot-a95j09x7/files/tmp/legged_data/shoot \
+  --walk-policy-dir checkpoints/reproduction/walk \
+  --dribble-policy-dir checkpoints/reproduction/dribble \
+  --shoot-policy-dir checkpoints/reproduction/shoot \
   --num-episodes 20000 \
   "$@"

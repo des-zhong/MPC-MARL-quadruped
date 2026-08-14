@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -204,8 +205,15 @@ def main(args):
         "episodes": summaries,
         "simulator_camera_available_for_env": 0,
         "static_obstacle_rendering": (
-            "Conservative circumscribed radius because checkpoint state omits "
-            "the randomized static-box yaw."
+            "none; checkpoint uses two dynamic robot teams"
+            if not any(
+                feature.name.startswith("obstacle_")
+                for feature in runtime.model.schema.features
+            )
+            else (
+                "Conservative circumscribed radius because checkpoint state "
+                "omits the randomized static-box yaw."
+            )
         ),
     }
     (save_dir / "visualization_summary.json").write_text(
@@ -233,3 +241,9 @@ def parse_args():
 
 if __name__ == "__main__":
     main(parse_args())
+    # Isaac Gym's legacy native runtime may segfault while Python tears down
+    # CUDA/PhysX objects even after gym.destroy_sim has completed. All figures,
+    # videos, and summary files are explicitly closed/written by main().
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

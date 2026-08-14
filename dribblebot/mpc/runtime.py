@@ -46,7 +46,10 @@ def add_simulator_arguments(parser: argparse.ArgumentParser) -> argparse.Argumen
         "--num-robots",
         type=int,
         default=None,
-        help="Override the checkpoint/config robot count (obstacle count follows it).",
+        help=(
+            "Robots per team for joint-team configs; total controlled robots "
+            "for legacy static-obstacle configs."
+        ),
     )
     parser.add_argument("--skill-checkpoint", default="latest")
     parser.add_argument(
@@ -113,11 +116,6 @@ def build_runtime(
         mpc_config.validate()
     if args.num_envs is not None:
         config["environment"]["num_envs"] = int(args.num_envs)
-    if args.num_robots is not None:
-        if int(args.num_robots) < 1:
-            raise ValueError("--num-robots must be at least 1")
-        config["environment"]["num_robots"] = int(args.num_robots)
-        config["world_model"]["max_obstacles"] = int(args.num_robots)
     model, checkpoint = load_checkpoint(args.world_model_checkpoint, args.device)
     model.eval()
     value_model = value_checkpoint = None
@@ -156,14 +154,47 @@ def build_runtime(
         mpc_config.objective_mode = "reward_only"
         mpc_config.use_terminal_value = False
     checkpoint_num_robots = model.action_adapter.num_robots
-    if args.num_robots is None:
-        config["environment"]["num_robots"] = checkpoint_num_robots
-        config["world_model"]["max_obstacles"] = checkpoint_num_robots
-    elif int(args.num_robots) != checkpoint_num_robots:
-        raise ValueError(
-            f"--num-robots={args.num_robots} does not match world-model checkpoint "
-            f"robot count {checkpoint_num_robots}"
+    checkpoint_num_obstacles = sum(
+        feature.name.startswith("obstacle_")
+        for feature in model.schema.features
+    )
+    environment_config = config["environment"]
+    joint_teams = "team_size" in environment_config
+    if args.num_robots is not None and int(args.num_robots) < 1:
+        raise ValueError("--num-robots must be at least 1")
+    if joint_teams:
+        team_size = int(
+            args.num_robots
+            if args.num_robots is not None
+            else environment_config["team_size"]
         )
+        expected_robots = 2 * team_size
+        if expected_robots != checkpoint_num_robots:
+            raise ValueError(
+                f"--num-robots={team_size} means {expected_robots} physical robots "
+                f"for two teams, but the checkpoint contains {checkpoint_num_robots}"
+            )
+        if checkpoint_num_obstacles:
+            raise ValueError(
+                "Joint-team MPC requires a checkpoint with zero static obstacles; "
+                f"this checkpoint contains {checkpoint_num_obstacles} obstacle slots"
+            )
+        environment_config["team_size"] = team_size
+        environment_config["num_robots"] = expected_robots
+        config["world_model"]["max_obstacles"] = 0
+    else:
+        requested_robots = int(
+            checkpoint_num_robots
+            if args.num_robots is None
+            else args.num_robots
+        )
+        if requested_robots != checkpoint_num_robots:
+            raise ValueError(
+                f"--num-robots={requested_robots} does not match world-model "
+                f"checkpoint robot count {checkpoint_num_robots}"
+            )
+        environment_config["num_robots"] = requested_robots
+        config["world_model"]["max_obstacles"] = checkpoint_num_obstacles
     # Local import preserves Isaac Gym's required import-before-torch order in
     # each simulator-facing entry point.
     from scripts.collect_world_model_data import build_environment

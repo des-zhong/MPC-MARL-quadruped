@@ -29,7 +29,7 @@ env/
 wandb/
 tmp/
 data/
-checkpoints/
+checkpoints/*
 outputs/
 runs/
 logs/
@@ -41,6 +41,13 @@ logs/
 *.onnx
 *.mp4
 *.avi
+
+# Curated reproduction bundles are intentionally versioned through Git LFS.
+# Everything else under checkpoints/ remains local training output.
+!checkpoints/reproduction/
+!checkpoints/reproduction/**
+# Rebuilt locally from the tracked Git LFS parts.
+checkpoints/reproduction/world_model/best.pt
 
 # OS metadata
 .DS_Store
