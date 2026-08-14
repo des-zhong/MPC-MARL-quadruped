@@ -55,6 +55,7 @@ def plot_top_down(
     output: Optional[Union[str, Path]] = None,
     title: str = "MPC tactical view",
     terminal_value: Optional[float] = None,
+    controlled_robot_count: Optional[int] = None,
 ):
     """Plot field, real history, predicted plan, and optional actual future."""
 
@@ -121,7 +122,30 @@ def plot_top_down(
     num_robots = _num_robots(schema)
     marker_choices = ("^", "s", "P", "X", "D", "v", "<", ">")
     markers = [marker_choices[index % len(marker_choices)] for index in range(num_robots)]
-    colors = [plt.get_cmap("tab10")(index % 10) for index in range(num_robots)]
+    if controlled_robot_count is None:
+        colors = [plt.get_cmap("tab10")(index % 10) for index in range(num_robots)]
+    else:
+        controlled_robot_count = int(controlled_robot_count)
+        learning_colors = ("tab:blue", "tab:cyan", "navy", "deepskyblue")
+        opponent_colors = ("tab:red", "firebrick", "lightcoral", "darkred")
+        colors = [
+            (
+                learning_colors[index % len(learning_colors)]
+                if index < controlled_robot_count
+                else opponent_colors[
+                    (index - controlled_robot_count) % len(opponent_colors)
+                ]
+            )
+            for index in range(num_robots)
+        ]
+
+    def robot_label(index, suffix):
+        if controlled_robot_count is None:
+            return f"robot {index} {suffix}"
+        if index < controlled_robot_count:
+            return f"learning {index} {suffix}"
+        return f"opponent {index - controlled_robot_count} {suffix}"
+
     for robot in range(num_robots):
         xy = current_robot[0, robot]
         axis.scatter(
@@ -131,7 +155,7 @@ def plot_top_down(
             s=100,
             color=colors[robot],
             edgecolor="black",
-            label=f"robot {robot} current",
+            label=robot_label(robot, "current"),
             zorder=6,
         )
         yaw_pair = current[schema.slice(f"robot_{robot}.yaw_sin_cos")]
@@ -166,7 +190,7 @@ def plot_top_down(
                 marker=markers[robot],
                 markevery=max(1, len(history_robot) // 8),
                 linewidth=2,
-                label=f"robot {robot} real history",
+                label=robot_label(robot, "real history"),
             )
         axis.plot(
             history_ball[:, 0],
@@ -191,7 +215,7 @@ def plot_top_down(
                 linestyle="--",
                 marker=markers[robot],
                 linewidth=2,
-                label=f"robot {robot} predicted",
+                label=robot_label(robot, "predicted"),
             )
         axis.plot(
             predicted_ball[:, 0],
@@ -248,7 +272,7 @@ def plot_top_down(
                 linestyle="-.",
                 marker="P",
                 linewidth=2,
-                label=f"robot {robot} actual future",
+                label=robot_label(robot, "actual future"),
             )
         axis.plot(
             actual_ball[:, 0],
@@ -522,6 +546,152 @@ def plot_prediction_vs_reality(
     output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output, dpi=160)
     plt.close(figure)
+
+
+@torch.no_grad()
+def multi_step_prediction_errors(
+    model,
+    states,
+    actions,
+    rewards=None,
+    max_horizon: Optional[int] = None,
+):
+    """Evaluate compounding model error under the actions actually executed.
+
+    Unlike the tactical plan overlay, this keeps the future action sequence
+    fixed to what happened in the simulator. It therefore isolates world-model
+    rollout error from changes caused by receding-horizon replanning.
+    """
+
+    states = torch.as_tensor(states)
+    actions = torch.as_tensor(actions)
+    if states.ndim != 2 or actions.ndim != 2:
+        raise ValueError("states and actions must be [time, feature] tensors")
+    if states.shape[0] != actions.shape[0] + 1:
+        raise ValueError("multi-step diagnostics require one more state than action")
+    available = int(actions.shape[0])
+    limit = min(
+        available,
+        int(max_horizon if max_horizon is not None else available),
+    )
+    if limit < 1:
+        return []
+    device = next(model.parameters()).device
+    schema = model.schema
+    reward_tensor = None if rewards is None else torch.as_tensor(rewards).float()
+    metrics = []
+    for horizon in range(1, limit + 1):
+        starts = available - horizon + 1
+        initial = states[:starts].to(device=device, dtype=torch.float)
+        sequences = torch.stack(
+            [actions[start : start + horizon] for start in range(starts)], dim=0
+        ).to(device=device, dtype=torch.float)
+        rollout = model.rollout(
+            initial,
+            sequences[:, None],
+            deterministic=True,
+            stop_on_done=False,
+        )
+        predicted = rollout["predicted_states"][:, 0, -1]
+        actual = states[horizon : horizon + starts].to(
+            device=device, dtype=predicted.dtype
+        )
+        scale = actual[:, schema.slice("field.geometry")][:, :2].abs()
+        robot_errors = []
+        for robot in range(model.action_adapter.num_robots):
+            difference = (
+                predicted[:, schema.slice(f"robot_{robot}.position")][:, :2]
+                - actual[:, schema.slice(f"robot_{robot}.position")][:, :2]
+            ) * scale
+            robot_errors.append(difference.square().sum(dim=-1))
+        robot_position_rmse_m = torch.stack(robot_errors, dim=-1).mean().sqrt()
+        ball_difference = (
+            predicted[:, schema.slice("ball.position")][:, :2]
+            - actual[:, schema.slice("ball.position")][:, :2]
+        ) * scale
+        ball_position_rmse_m = ball_difference.square().sum(dim=-1).mean().sqrt()
+        state_rmse = (predicted - actual).square().mean().sqrt()
+        row = {
+            "horizon": horizon,
+            "samples": starts,
+            "state_rmse": float(state_rmse.detach().cpu()),
+            "robot_position_rmse_m": float(
+                robot_position_rmse_m.detach().cpu()
+            ),
+            "ball_position_rmse_m": float(ball_position_rmse_m.detach().cpu()),
+        }
+        if reward_tensor is not None:
+            actual_returns = torch.stack(
+                [
+                    reward_tensor[start : start + horizon].sum()
+                    for start in range(starts)
+                ]
+            ).to(device=device, dtype=predicted.dtype)
+            predicted_returns = rollout["predicted_rewards"][:, 0].sum(dim=-1)
+            row["cumulative_reward_mae"] = float(
+                (predicted_returns - actual_returns).abs().mean().detach().cpu()
+            )
+        metrics.append(row)
+    return metrics
+
+
+def plot_mpc_execution_diagnostics(
+    step_diagnostics,
+    multi_step_errors,
+    output: Union[str, Path] = "mpc_diagnostics.png",
+):
+    """Plot fallback/action modification and compounding model errors."""
+
+    steps = np.arange(len(step_diagnostics))
+    fallback = np.asarray([row["fallback_used"] for row in step_diagnostics])
+    modified = np.asarray(
+        [row["requested_action_modified"] for row in step_diagnostics]
+    )
+    objective = np.asarray([row["best_objective"] for row in step_diagnostics])
+    planning = np.asarray(
+        [row["planning_time_seconds"] for row in step_diagnostics]
+    )
+    figure, axes = plt.subplots(2, 2, figsize=(13, 9))
+    axes[0, 0].step(steps, fallback, where="post", label="fallback used")
+    axes[0, 0].step(
+        steps, modified, where="post", linestyle="--", label="action modified"
+    )
+    axes[0, 0].set(ylim=(-0.1, 1.1), title="Execution interventions")
+    axes[0, 0].legend()
+    axes[0, 1].plot(steps, objective, marker="o", label="best objective")
+    axes[0, 1].set_title("Selected-plan objective")
+    axes[1, 0].plot(steps, planning, marker="s", color="tab:purple")
+    axes[1, 0].set(title="Planning latency", ylabel="seconds")
+    horizons = np.asarray([row["horizon"] for row in multi_step_errors])
+    if len(horizons):
+        axes[1, 1].plot(
+            horizons,
+            [row["robot_position_rmse_m"] for row in multi_step_errors],
+            "o-",
+            label="robot position RMSE",
+        )
+        axes[1, 1].plot(
+            horizons,
+            [row["ball_position_rmse_m"] for row in multi_step_errors],
+            "s-",
+            label="ball position RMSE",
+        )
+    axes[1, 1].set(
+        title="World-model rollout error under executed actions",
+        xlabel="macro-step horizon",
+        ylabel="metres",
+    )
+    axes[1, 1].legend()
+    for axis in axes.flat:
+        axis.grid(True, linestyle=":", alpha=0.3)
+        if axis is not axes[1, 1]:
+            axis.set_xlabel("executed macro step")
+    figure.tight_layout()
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output, dpi=160)
+    plt.close(figure)
+    return output
 
 
 def plot_skill_and_parameters(

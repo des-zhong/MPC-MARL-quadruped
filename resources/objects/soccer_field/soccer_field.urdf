@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<!--
+  field.png has grass margins around its painted boundary. Scaling the full
+  image to 8.533333 x 5.533679 m makes the painted lines span the simulation's
+  8 m x 5 m playable area.
+-->
+<robot name="soccer_field">
+  <link name="soccer_field">
+    <visual>
+      <origin xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="field_plane.obj" scale="8.5333336 5.533679 0.01"/>
+      </geometry>
+      <material name="field_white">
+        <color rgba="1 1 1 1"/>
+      </material>
+    </visual>
+
+    <collision>
+      <origin xyz="0 0 0"/>
+      <geometry>
+        <box size="8.5333336 5.533679 0.01"/>
+      </geometry>
+    </collision>
+  </link>
+</robot>

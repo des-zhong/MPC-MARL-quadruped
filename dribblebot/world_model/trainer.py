@@ -36,11 +36,16 @@ def repository_commit() -> Optional[str]:
         return None
 
 
-def periodic_best_checkpoint_due(epoch: int, interval: int) -> bool:
+def periodic_checkpoint_due(epoch: int, interval: int) -> bool:
     """Return whether this zero-based epoch completes a rolling-save interval."""
 
     interval = int(interval)
     return interval > 0 and (int(epoch) + 1) % interval == 0
+
+
+# Backward-compatible import for callers/tests written before rolling.pt was
+# separated from the true validation-best checkpoint.
+periodic_best_checkpoint_due = periodic_checkpoint_due
 
 
 def _to_device(batch, device):
@@ -249,17 +254,43 @@ class WorldModelTrainer:
         output.mkdir(parents=True, exist_ok=True)
         training = self.config["training"]
         start_epoch = 0
+        best = float("inf")
         if resume:
             payload = torch.load(resume, map_location=self.device)
             self.model.load_state_dict(payload["model_state"])
             for optimizer, state in zip(self.optimizers, payload["optimizer_states"]): optimizer.load_state_dict(state)
             for scheduler, state in zip(self.schedulers, payload["scheduler_states"]): scheduler.load_state_dict(state)
             start_epoch = int(payload["epoch"]) + 1
-        best = float("inf")
+            best = float(
+                payload.get("validation_metrics", {}).get("loss", float("inf"))
+            )
+            # A resumed latest/rolling checkpoint may be worse than the best
+            # validation checkpoint from the same run. Preserve that lower
+            # threshold instead of treating the first resumed epoch as best.
+            candidate_best_paths = {
+                output / "best.pt",
+                Path(resume).expanduser().resolve().parent / "best.pt",
+            }
+            for candidate in candidate_best_paths:
+                if not candidate.exists():
+                    continue
+                candidate_payload = torch.load(candidate, map_location="cpu")
+                candidate_loss = candidate_payload.get(
+                    "validation_metrics", {}
+                ).get("loss")
+                if candidate_loss is not None:
+                    best = min(best, float(candidate_loss))
         patience = 0
-        best_checkpoint_interval = int(training.get("best_checkpoint_interval", 10))
-        if best_checkpoint_interval < 0:
-            raise ValueError("training.best_checkpoint_interval must be non-negative")
+        rolling_checkpoint_interval = int(
+            training.get(
+                "rolling_checkpoint_interval",
+                training.get("best_checkpoint_interval", 10),
+            )
+        )
+        if rolling_checkpoint_interval < 0:
+            raise ValueError(
+                "training.rolling_checkpoint_interval must be non-negative"
+            )
         history = {"train": [], "validation": []}
         for epoch in range(start_epoch, int(training["max_epochs"])):
             epoch_started_at = time.perf_counter()
@@ -275,11 +306,13 @@ class WorldModelTrainer:
                 patience = 0
             else:
                 patience += 1
-            periodic_best_save = periodic_best_checkpoint_due(
-                epoch, best_checkpoint_interval
+            periodic_checkpoint_save = periodic_checkpoint_due(
+                epoch, rolling_checkpoint_interval
             )
-            if validation_improved or periodic_best_save:
+            if validation_improved:
                 save_checkpoint(output / "best.pt", self.model, self.optimizers, self.schedulers, epoch, validation_metrics, self.config, int(self.config.get("seed", 42)))
+            if periodic_checkpoint_save:
+                save_checkpoint(output / "rolling.pt", self.model, self.optimizers, self.schedulers, epoch, validation_metrics, self.config, int(self.config.get("seed", 42)))
             (output / "history.json").write_text(json.dumps(history, indent=2))
             if epoch_callback is not None:
                 learning_rates = [float(optimizer.param_groups[0]["lr"]) for optimizer in self.optimizers]
@@ -292,7 +325,7 @@ class WorldModelTrainer:
                         "early_stopping_patience": patience,
                         "epoch_seconds": time.perf_counter() - epoch_started_at,
                         "is_best": validation_improved,
-                        "periodic_best_save": periodic_best_save,
+                        "periodic_checkpoint_save": periodic_checkpoint_save,
                         "learning_rate": float(np.mean(learning_rates)),
                     },
                 )

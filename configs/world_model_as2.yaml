@@ -4,7 +4,9 @@ seed: 42
 
 world_model:
   macro_action_steps: 10
-  history_length: 1
+  # Match the high-level coordinator checkpoint observation history so the
+  # frozen opponent can be forecast consistently by standalone MPC scripts.
+  history_length: 4
   max_obstacles: 0
 
 environment:
@@ -27,28 +29,28 @@ environment:
   near_ball_init_max_angle: 0.35
 
 data_collection:
-  num_episodes: 10000
+  num_episodes: 20000
   shard_episodes: 1
   repeat_previous_skill_probability: 0.35
   behavior_mixture:
-    # Every robot on both teams is sampled from this same random distribution.
-    # This avoids baking a stronger scripted behavior into either side.
-    random_valid: 1.0
-    scripted: 0.0
+    # Base samples are 90% goal-oriented scripted soccer and 10% exploratory.
+    # Both teams use the same controller, mirrored toward opposite goals.
+    # Repeat/targeted overrides are logged separately in each transition.
+    random_valid: 0.10
+    scripted: 0.90
     existing_policy: 0.0
     targeted_rare_event: 0.0
   random_sampling:
-    uniform: 0.50
-    gaussian_nominal: 0.30
+    uniform: 0.20
+    gaussian_nominal: 0.20
     boundary_focused: 0.20
-    goal_directed: 0.0
-  # Disabled for symmetric random-policy collection. Enabling this manager
-  # also selects scenario-specific actions, so it is intentionally not mixed
-  # into the default joint-team dataset.
+    goal_directed: 0.40
+  # Stage a minority of episodes near rare tactical outcomes. These actions
+  # override the base sampler and retain their targeted_rare_event source tag.
   targeted_rare_events:
-    enabled: false
-    episode_probability: 0.0
-    max_macro_steps: 3
+    enabled: true
+    episode_probability: 0.25
+    max_macro_steps: 5
     ball_speed: 3.0
     scenarios:
       - goal
@@ -60,9 +62,18 @@ data_collection:
       - successful_shot
       - failed_shot
       - pass
-  minimum_event_counts: {}
-  max_extra_episodes: 0
-  require_minimum_event_counts: false
+  minimum_event_counts:
+    goal: 1000
+    own_goal: 1000
+    out_of_bounds: 1000
+    teammate_collision: 5000
+    possession_acquired: 5000
+    possession_lost: 3000
+    successful_shot: 3000
+    failed_shot: 3000
+    pass: 2000
+  max_extra_episodes: 5000
+  require_minimum_event_counts: true
 
 dataset:
   train_fraction: 0.80
@@ -99,9 +110,9 @@ training:
   max_epochs: 500
   gradient_clip_norm: 10.0
   early_stopping_patience: 20
-  # Overwrite best.pt with the current rolling checkpoint every N completed epochs.
-  # Validation improvements still update best.pt immediately. Set to 0 to disable.
-  best_checkpoint_interval: 10
+  # Save rolling.pt every N completed epochs. best.pt is written only when
+  # validation improves and can therefore never be overwritten by a worse epoch.
+  rolling_checkpoint_interval: 10
   mixed_precision: true
   num_workers: 4
   normalize_reward: false

@@ -32,6 +32,9 @@ class TwoRobotLeggedRobot(LeggedRobot):
             getattr(self.cfg.env, "num_static_opponents", 0)
         )
         all_assets = []
+        project_root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "../../..")
+        )
 
         from dribblebot.robots.as2 import As2
         from dribblebot.robots.go1 import Go1
@@ -94,6 +97,118 @@ class TwoRobotLeggedRobot(LeggedRobot):
             self.static_opponent_asset = None
             self.num_static_opponent_bodies = 0
 
+        self.add_goalposts = bool(getattr(self.cfg.env, "add_goalposts", False))
+        if self.add_goalposts:
+            configured_goalpost_file = getattr(
+                self.cfg.env,
+                "goalpost_asset_file",
+                "resources/objects/goalpost/goalpost.urdf",
+            )
+            goalpost_file = os.path.expanduser(configured_goalpost_file)
+            if not os.path.isabs(goalpost_file):
+                goalpost_file = os.path.join(project_root, goalpost_file)
+            goalpost_file = os.path.abspath(goalpost_file)
+            if not os.path.isfile(goalpost_file):
+                raise FileNotFoundError(f"Goalpost asset not found: {goalpost_file}")
+            goalpost_options = gymapi.AssetOptions()
+            goalpost_options.fix_base_link = True
+            goalpost_options.disable_gravity = True
+            goalpost_options.collapse_fixed_joints = True
+            self.goalpost_asset = self.gym.load_asset(
+                self.sim,
+                os.path.dirname(goalpost_file),
+                os.path.basename(goalpost_file),
+                goalpost_options,
+            )
+            self.num_goalpost_bodies = self.gym.get_asset_rigid_body_count(
+                self.goalpost_asset
+            )
+        else:
+            self.goalpost_asset = None
+            self.num_goalpost_bodies = 0
+
+        self.add_field_texture = bool(
+            getattr(self.cfg.env, "add_field_texture", False)
+        )
+        if self.add_field_texture:
+            configured_texture_file = getattr(
+                self.cfg.env,
+                "field_texture_file",
+                "resources/textures/field.png",
+            )
+            field_texture_file = os.path.expanduser(configured_texture_file)
+            if not os.path.isabs(field_texture_file):
+                field_texture_file = os.path.join(project_root, field_texture_file)
+            field_texture_file = os.path.abspath(field_texture_file)
+            if not os.path.isfile(field_texture_file):
+                raise FileNotFoundError(
+                    f"Soccer field texture not found: {field_texture_file}"
+                )
+
+            configured_surface_file = getattr(
+                self.cfg.env,
+                "field_surface_asset_file",
+                "resources/objects/soccer_field/soccer_field.urdf",
+            )
+            field_surface_file = os.path.expanduser(configured_surface_file)
+            if not os.path.isabs(field_surface_file):
+                field_surface_file = os.path.join(project_root, field_surface_file)
+            field_surface_file = os.path.abspath(field_surface_file)
+            if not os.path.isfile(field_surface_file):
+                raise FileNotFoundError(
+                    f"Soccer field surface asset not found: {field_surface_file}"
+                )
+
+            field_length = float(getattr(self.cfg.env, "field_length", 8.0))
+            field_width = float(getattr(self.cfg.env, "field_width", 5.0))
+            texture_length_scale = float(
+                getattr(self.cfg.env, "field_texture_length_scale", 1.0)
+            )
+            texture_width_scale = float(
+                getattr(self.cfg.env, "field_texture_width_scale", 1.0)
+            )
+            if texture_length_scale <= 0.0 or texture_width_scale <= 0.0:
+                raise ValueError(
+                    "Field texture length/width scales must both be positive"
+                )
+            self.field_surface_thickness = max(
+                float(getattr(self.cfg.env, "field_surface_thickness", 0.01)),
+                0.001,
+            )
+            field_surface_options = gymapi.AssetOptions()
+            field_surface_options.fix_base_link = True
+            field_surface_options.disable_gravity = True
+            self.field_surface_asset = self.gym.load_asset(
+                self.sim,
+                os.path.dirname(field_surface_file),
+                os.path.basename(field_surface_file),
+                field_surface_options,
+            )
+            field_surface_props = self.gym.get_asset_rigid_shape_properties(
+                self.field_surface_asset
+            )
+            for shape_prop in field_surface_props:
+                shape_prop.friction = float(self.cfg.terrain.static_friction)
+                shape_prop.restitution = float(self.cfg.terrain.restitution)
+            self.gym.set_asset_rigid_shape_properties(
+                self.field_surface_asset, field_surface_props
+            )
+            self.field_texture_handle = self.gym.create_texture_from_file(
+                self.sim, field_texture_file
+            )
+            if self.field_texture_handle < 0:
+                raise RuntimeError(
+                    f"Isaac Gym could not load soccer field texture: {field_texture_file}"
+                )
+            self.num_field_surface_bodies = self.gym.get_asset_rigid_body_count(
+                self.field_surface_asset
+            )
+        else:
+            self.field_surface_asset = None
+            self.field_texture_handle = None
+            self.field_surface_thickness = 0.0
+            self.num_field_surface_bodies = 0
+
         self.add_field_markers = bool(getattr(self.cfg.env, "add_field_markers", False))
         self.num_field_markers = 0
         self.num_field_marker_bodies = 0
@@ -122,19 +237,26 @@ class TwoRobotLeggedRobot(LeggedRobot):
                 self.field_marker_height,
                 marker_asset_options,
             )
-            self.goal_marker_asset = self.gym.create_box(
-                self.sim,
-                2.0 * self.field_marker_width,
-                2.0 * self.field_marker_width,
-                4.0 * self.field_marker_height,
-                marker_asset_options,
-            )
-            self.num_field_markers = 6
+            if self.add_goalposts:
+                self.goal_marker_asset = None
+                self.num_field_markers = 4
+            else:
+                self.goal_marker_asset = self.gym.create_box(
+                    self.sim,
+                    2.0 * self.field_marker_width,
+                    2.0 * self.field_marker_width,
+                    4.0 * self.field_marker_height,
+                    marker_asset_options,
+                )
+                self.num_field_markers = 8
             self.num_field_marker_bodies = (
                 2 * self.gym.get_asset_rigid_body_count(self.field_marker_long_asset)
                 + 2 * self.gym.get_asset_rigid_body_count(self.field_marker_short_asset)
-                + 2 * self.gym.get_asset_rigid_body_count(self.goal_marker_asset)
             )
+            if self.goal_marker_asset is not None:
+                self.num_field_marker_bodies += (
+                    4 * self.gym.get_asset_rigid_body_count(self.goal_marker_asset)
+                )
         else:
             self.field_marker_long_asset = None
             self.field_marker_short_asset = None
@@ -155,7 +277,9 @@ class TwoRobotLeggedRobot(LeggedRobot):
             self.num_robots * self.num_robot_bodies
             + self.num_object_bodies
             + self.num_static_opponent_bodies
+            + self.num_field_surface_bodies
             + self.num_field_marker_bodies
+            + self.num_goalpost_bodies
         )
 
         if self.cfg.terrain.mesh_type == "boxes":
@@ -165,8 +289,14 @@ class TwoRobotLeggedRobot(LeggedRobot):
         self.other_robot_rigid_body_offset = self.num_robot_bodies
         self.object_rigid_body_offset = self.num_robots * self.num_robot_bodies
         self.static_opponent_rigid_body_offset = self.object_rigid_body_offset + self.num_object_bodies
-        self.field_marker_rigid_body_offset = (
+        self.field_surface_rigid_body_offset = (
             self.static_opponent_rigid_body_offset + self.num_static_opponent_bodies
+        )
+        self.field_marker_rigid_body_offset = (
+            self.field_surface_rigid_body_offset + self.num_field_surface_bodies
+        )
+        self.goalpost_rigid_body_offset = (
+            self.field_marker_rigid_body_offset + self.num_field_marker_bodies
         )
 
         self.ball_init_pose = gymapi.Transform()
@@ -241,6 +371,10 @@ class TwoRobotLeggedRobot(LeggedRobot):
         self.static_opponent_actor_idxs = []
         self.field_marker_actor_handles = []
         self.field_marker_actor_idxs = []
+        self.field_surface_actor_handles = []
+        self.field_surface_actor_idxs = []
+        self.goalpost_actor_handles = []
+        self.goalpost_actor_idxs = []
 
         self.object_rigid_body_idxs = []
         self.static_opponent_rigid_body_idxs = []
@@ -406,6 +540,41 @@ class TwoRobotLeggedRobot(LeggedRobot):
             self.static_opponent_actor_handles.append(static_opponent_handles)
             self.static_opponent_actor_idxs.append(static_opponent_actor_idxs)
 
+            if self.add_field_texture:
+                field_surface_pose = gymapi.Transform()
+                surface_offset = float(
+                    getattr(self.cfg.env, "field_surface_offset", 0.002)
+                )
+                field_surface_pose.p = gymapi.Vec3(
+                    float(self.env_origins[i, 0].item()),
+                    float(self.env_origins[i, 1].item()),
+                    float(self.env_origins[i, 2].item())
+                    - 0.5 * self.field_surface_thickness
+                    + surface_offset,
+                )
+                field_surface_handle = self.gym.create_actor(
+                    env_handle,
+                    self.field_surface_asset,
+                    field_surface_pose,
+                    "soccer_field",
+                    i,
+                    0,
+                    0,
+                )
+                self.gym.set_rigid_body_texture(
+                    env_handle,
+                    field_surface_handle,
+                    0,
+                    gymapi.MESH_VISUAL,
+                    self.field_texture_handle,
+                )
+                self.field_surface_actor_handles.append(field_surface_handle)
+                self.field_surface_actor_idxs.append(
+                    self.gym.get_actor_index(
+                        env_handle, field_surface_handle, gymapi.DOMAIN_SIM
+                    )
+                )
+
             field_marker_handles = []
             field_marker_actor_idxs = []
             if self.add_field_markers:
@@ -434,6 +603,29 @@ class TwoRobotLeggedRobot(LeggedRobot):
             self.field_marker_actor_handles.append(field_marker_handles)
             self.field_marker_actor_idxs.append(field_marker_actor_idxs)
 
+            if self.add_goalposts:
+                goalpost_pose = gymapi.Transform()
+                goalpost_pose.p = gymapi.Vec3(
+                    float(self.env_origins[i, 0].item()),
+                    float(self.env_origins[i, 1].item()),
+                    float(self.env_origins[i, 2].item()),
+                )
+                goalpost_handle = self.gym.create_actor(
+                    env_handle,
+                    self.goalpost_asset,
+                    goalpost_pose,
+                    "goalposts",
+                    i,
+                    0,
+                    0,
+                )
+                self.goalpost_actor_handles.append(goalpost_handle)
+                self.goalpost_actor_idxs.append(
+                    self.gym.get_actor_index(
+                        env_handle, goalpost_handle, gymapi.DOMAIN_SIM
+                    )
+                )
+
             self.envs.append(env_handle)
 
         self.robot_actor_idxs = torch.as_tensor(self.robot_actor_idxs, device=self.device, dtype=torch.long)
@@ -457,6 +649,16 @@ class TwoRobotLeggedRobot(LeggedRobot):
             device=self.device,
             dtype=torch.long,
         ).view(self.num_envs, self.num_field_markers)
+        self.field_surface_actor_idxs = torch.as_tensor(
+            self.field_surface_actor_idxs,
+            device=self.device,
+            dtype=torch.long,
+        ).view(self.num_envs, int(self.add_field_texture))
+        self.goalpost_actor_idxs = torch.as_tensor(
+            self.goalpost_actor_idxs,
+            device=self.device,
+            dtype=torch.long,
+        ).view(self.num_envs, int(self.add_goalposts))
 
         self.feet_indices = torch.zeros(len(feet_names), dtype=torch.long, device=self.device, requires_grad=False)
         self.other_feet_indices = torch.zeros(len(feet_names), dtype=torch.long, device=self.device, requires_grad=False)
@@ -580,7 +782,8 @@ class TwoRobotLeggedRobot(LeggedRobot):
         outside_clearance = ball_radius + 0.02
 
         boundary_color = gymapi.Vec3(0.92, 0.92, 0.88)
-        goal_color = gymapi.Vec3(0.0, 0.85, 0.25)
+        learning_target_color = gymapi.Vec3(0.0, 0.85, 0.25)
+        opponent_target_color = gymapi.Vec3(0.85, 0.10, 0.10)
 
         def pose_at(x, y, z):
             pose = gymapi.Transform()
@@ -589,7 +792,7 @@ class TwoRobotLeggedRobot(LeggedRobot):
 
         boundary_z = marker_half_height
         goal_z = 2.0 * self.field_marker_height
-        return [
+        specs = [
             (
                 self.field_marker_long_asset,
                 pose_at(0.0, half_width + marker_half_width + outside_clearance, boundary_z),
@@ -610,6 +813,10 @@ class TwoRobotLeggedRobot(LeggedRobot):
                 pose_at(-half_length - marker_half_width - outside_clearance, 0.0, boundary_z),
                 boundary_color,
             ),
+        ]
+        if self.goal_marker_asset is None:
+            return specs
+        specs.extend([
             (
                 self.goal_marker_asset,
                 pose_at(
@@ -617,7 +824,7 @@ class TwoRobotLeggedRobot(LeggedRobot):
                     goal_half_width + marker_half_width + outside_clearance,
                     goal_z,
                 ),
-                goal_color,
+                learning_target_color,
             ),
             (
                 self.goal_marker_asset,
@@ -626,9 +833,28 @@ class TwoRobotLeggedRobot(LeggedRobot):
                     -goal_half_width - marker_half_width - outside_clearance,
                     goal_z,
                 ),
-                goal_color,
+                learning_target_color,
             ),
-        ]
+            (
+                self.goal_marker_asset,
+                pose_at(
+                    -goal_x - marker_half_width - outside_clearance,
+                    goal_half_width + marker_half_width + outside_clearance,
+                    goal_z,
+                ),
+                opponent_target_color,
+            ),
+            (
+                self.goal_marker_asset,
+                pose_at(
+                    -goal_x - marker_half_width - outside_clearance,
+                    -goal_half_width - marker_half_width - outside_clearance,
+                    goal_z,
+                ),
+                opponent_target_color,
+            ),
+        ])
+        return specs
 
     def _get_high_level_camera_pose(self):
         field_length = float(getattr(self.cfg.env, "field_length", 8.0))

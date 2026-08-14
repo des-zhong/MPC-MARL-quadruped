@@ -31,6 +31,7 @@ from scripts.train_high_level import (
 SKILL_NAMES = ("walk", "dribble", "shoot")
 TERMINAL_KEYS = (
     "high_level_goal",
+    "high_level_opponent_goal",
     "high_level_ball_off_border",
     "high_level_obstacle_contact",
     "high_level_accidental_termination",
@@ -405,7 +406,8 @@ def save_plot(path, rows, args, show):
 
     fig, axes = plt.subplots(5, 1, figsize=(12, 11), sharex=True)
     axes[0].plot(times, ball_x, color="tab:blue", label="ball x")
-    axes[0].axhline(goal_x, color="tab:green", linestyle="--", label="goal x")
+    axes[0].axhline(goal_x, color="tab:green", linestyle="--", label="learning target +x")
+    axes[0].axhline(-goal_x, color="tab:red", linestyle="--", label="opponent target -x")
     axes[0].set_ylabel("x (m)")
     axes[0].grid(True, alpha=0.25)
     axes[0].legend(loc="upper right")
@@ -475,6 +477,7 @@ def print_summary(rows):
     total_reward = sum(row["reward"] for row in rows)
     terminations = sum(row["done"] for row in rows)
     goals = sum(row["high_level_goal"] for row in rows)
+    opponent_goals = sum(row["high_level_opponent_goal"] for row in rows)
     off_border = sum(row["high_level_ball_off_border"] for row in rows)
     obstacle_hits = sum(row["high_level_obstacle_contact"] for row in rows)
     accidental = sum(row["high_level_accidental_termination"] for row in rows)
@@ -487,7 +490,11 @@ def print_summary(rows):
 
     print(f"Total reward: {total_reward:.3f}")
     print(f"Mean reward per high-level step: {total_reward / len(rows):.3f}")
-    print(f"Terminations: {terminations} | goals: {goals} | off border: {off_border} | obstacles: {obstacle_hits} | accidental: {accidental}")
+    print(
+        f"Terminations: {terminations} | learning-team goals (+x): {goals} | "
+        f"opponent-team goals (-x): {opponent_goals} | off border: {off_border} | "
+        f"obstacles: {obstacle_hits} | accidental: {accidental}"
+    )
     print(f"Invalid low-level skill requests: {invalid_requests}")
     print(f"Final ball x: {final_ball_x:.3f} | max ball speed: {max_ball_speed:.3f}")
 

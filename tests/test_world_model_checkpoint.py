@@ -9,7 +9,9 @@ from dribblebot.world_model.ensemble import WorldModelEnsemble
 from dribblebot.world_model.normalizer import WorldModelNormalizer
 from dribblebot.world_model.schema import default_state_schema
 from dribblebot.world_model.trainer import (
+    WorldModelTrainer,
     load_checkpoint,
+    periodic_checkpoint_due,
     periodic_best_checkpoint_due,
     save_checkpoint,
 )
@@ -44,6 +46,39 @@ def test_periodic_best_checkpoint_uses_completed_epoch_count():
     assert periodic_best_checkpoint_due(9, 10)
     assert periodic_best_checkpoint_due(19, 10)
     assert not periodic_best_checkpoint_due(9, 0)
+    assert periodic_checkpoint_due(9, 10)
+
+
+def test_fit_never_overwrites_best_with_periodic_checkpoint(tmp_path, monkeypatch):
+    trainer = object.__new__(WorldModelTrainer)
+    trainer.config = {
+        "training": {
+            "max_epochs": 3,
+            "rolling_checkpoint_interval": 2,
+            "early_stopping_patience": 20,
+        },
+        "seed": 42,
+    }
+    trainer.device = "cpu"
+    trainer.model = object()
+    trainer.optimizers = []
+    trainer.schedulers = []
+    trainer.train_epoch = lambda epoch: {"loss": float(3 - epoch)}
+    validation_losses = iter((1.0, 0.5, 0.8))
+    trainer.validate = lambda: {"loss": next(validation_losses)}
+    saves = []
+
+    def record_save(path, *args):
+        saves.append((Path(path).name, args[3]))
+
+    monkeypatch.setattr(
+        "dribblebot.world_model.trainer.save_checkpoint", record_save
+    )
+
+    trainer.fit(tmp_path)
+
+    assert [epoch for name, epoch in saves if name == "best.pt"] == [0, 1]
+    assert [epoch for name, epoch in saves if name == "rolling.pt"] == [1]
 
 
 def test_one_optimizer_step_does_not_nan():

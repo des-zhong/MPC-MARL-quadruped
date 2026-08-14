@@ -276,12 +276,18 @@ def evaluate_method(
     accumulator = _EpisodeMetrics(runtime.env.num_envs)
     scripted = None
     if method == "scripted":
+        environment = runtime.config.get("environment", {})
         scripted = BehaviorMixture(
             runtime.model.action_adapter,
             runtime.model.schema,
             {"scripted": 1.0},
             repeat_previous_probability=0.0,
             seed=int(runtime.config.get("seed", 42)),
+            team_size=(
+                int(environment["team_size"])
+                if "team_size" in environment
+                else None
+            ),
         )
     while len(accumulator.completed) < num_episodes:
         state = runtime.state_adapter.extract_state(runtime.env)["tensor"]

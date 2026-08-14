@@ -23,6 +23,8 @@ from matplotlib import pyplot as plt
 from dribblebot.mpc.runtime import add_simulator_arguments, build_runtime
 from dribblebot.mpc.visualization import (
     figure_to_rgb,
+    multi_step_prediction_errors,
+    plot_mpc_execution_diagnostics,
     plot_prediction_vs_reality,
     plot_skill_and_parameters,
     plot_top_down,
@@ -68,6 +70,7 @@ def main(args):
     actual_events = []
     predicted_events = []
     selected_actions = []
+    step_diagnostics = []
     summaries = []
     try:
         while completed < args.episodes:
@@ -78,6 +81,11 @@ def main(args):
             if step == 0:
                 _remove_legacy_episode_outputs(episode_dir)
             plan = transition.plan
+            team_size = (
+                int(runtime.config["environment"]["team_size"])
+                if "team_size" in runtime.config["environment"]
+                else None
+            )
             tactical = plot_top_down(
                 runtime.model.schema,
                 transition.state[env_index],
@@ -95,9 +103,11 @@ def main(args):
                     f"R_H {plan.predicted_discounted_reward_return[env_index]:.3f} + "
                     f"V {plan.terminal_value_contribution[env_index]:.3f} | "
                     f"objective {plan.best_objective[env_index]:.3f} | "
-                    f"planning {plan.planning_time_seconds:.3f}s"
+                    f"planning {plan.planning_time_seconds:.3f}s | "
+                    f"fallback {bool(plan.fallback_used[env_index])}"
                 ),
                 terminal_value=float(plan.terminal_state_value[env_index]),
+                controlled_robot_count=team_size,
             )
             tactical_rgb = figure_to_rgb(tactical)
             plt.close(tactical)
@@ -151,6 +161,30 @@ def main(args):
             selected_actions.append(
                 transition.executed_action[env_index].detach().cpu()
             )
+            step_diagnostics.append(
+                {
+                    "step": step,
+                    "fallback_used": bool(plan.fallback_used[env_index]),
+                    "requested_action_modified": bool(
+                        transition.requested_action_modified[env_index]
+                    ),
+                    "teacher_action_executed": bool(
+                        transition.teacher_action_executed[env_index]
+                    ),
+                    "best_objective": float(plan.best_objective[env_index]),
+                    "predicted_discounted_reward_return": float(
+                        plan.predicted_discounted_reward_return[env_index]
+                    ),
+                    "planning_time_seconds": float(plan.planning_time_seconds),
+                    "max_plan_state_uncertainty": float(
+                        plan.uncertainty["state"][env_index].max()
+                    ),
+                    "objective_components": {
+                        name: float(value[env_index])
+                        for name, value in plan.objective_components.items()
+                    },
+                }
+            )
             step += 1
             if bool(transition.done[env_index]):
                 prediction_path = episode_dir / "prediction_vs_reality.png"
@@ -172,6 +206,46 @@ def main(args):
                     runtime.model.action_adapter.num_robots,
                     skill_path,
                 )
+                multi_step_errors = multi_step_prediction_errors(
+                    runtime.model,
+                    torch.stack(actual_states),
+                    torch.stack(selected_actions),
+                    actual_rewards,
+                    max_horizon=runtime.mpc_config.horizon,
+                )
+                diagnostic_path = episode_dir / "mpc_diagnostics.png"
+                plot_mpc_execution_diagnostics(
+                    step_diagnostics,
+                    multi_step_errors,
+                    diagnostic_path,
+                )
+                diagnostics_json = episode_dir / "diagnostics.json"
+                diagnostics = {
+                    "fallback_fraction": float(
+                        np.mean([row["fallback_used"] for row in step_diagnostics])
+                    ),
+                    "requested_action_modified_fraction": float(
+                        np.mean(
+                            [
+                                row["requested_action_modified"]
+                                for row in step_diagnostics
+                            ]
+                        )
+                    ),
+                    "teacher_action_executed_fraction": float(
+                        np.mean(
+                            [
+                                row["teacher_action_executed"]
+                                for row in step_diagnostics
+                            ]
+                        )
+                    ),
+                    "multi_step_prediction_errors": multi_step_errors,
+                    "steps": step_diagnostics,
+                }
+                diagnostics_json.write_text(
+                    json.dumps(diagnostics, indent=2, sort_keys=True)
+                )
                 video_path = save_video_or_frames(
                     episode_frames,
                     episode_dir / "mpc_episode.mp4",
@@ -185,6 +259,12 @@ def main(args):
                         "video": str(video_path),
                         "prediction_vs_reality": str(prediction_path),
                         "skill_and_parameters": str(skill_path),
+                        "mpc_diagnostics": str(diagnostic_path),
+                        "diagnostics_json": str(diagnostics_json),
+                        "fallback_fraction": diagnostics["fallback_fraction"],
+                        "requested_action_modified_fraction": diagnostics[
+                            "requested_action_modified_fraction"
+                        ],
                     }
                 )
                 completed += 1
@@ -197,6 +277,7 @@ def main(args):
                 actual_events = []
                 predicted_events = []
                 selected_actions = []
+                step_diagnostics = []
                 step = 0
     finally:
         runtime.controller.close()

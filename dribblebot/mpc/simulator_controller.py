@@ -139,6 +139,7 @@ class MPCSimulatorController:
         state_adapter,
         local_observation_adapter: Optional[LocalObservationAdapter] = None,
         capture_terminal_state: bool = True,
+        opponent_forecaster=None,
     ):
         self.env = env
         self.planner = planner
@@ -151,6 +152,7 @@ class MPCSimulatorController:
         self.capture = (
             TerminalStateCapture(env, state_adapter) if capture_terminal_state else None
         )
+        self.opponent_forecaster = opponent_forecaster
 
     def close(self) -> None:
         if self.capture is not None:
@@ -163,13 +165,29 @@ class MPCSimulatorController:
             self.planner_state = None
             if self.capture is not None:
                 self.capture.clear()
+            if self.opponent_forecaster is not None:
+                self.opponent_forecaster.reset()
             return observations
         if self.planner_state is not None:
             self.planner_state.reset(env_ids)
+        if self.opponent_forecaster is not None:
+            self.opponent_forecaster.reset(env_ids)
         return None
 
     def act(self, global_states: torch.Tensor) -> MPCPlanResult:
-        plan = self.planner.plan(global_states, self.planner_state)
+        fixed_action_sequence = fixed_robot_mask = None
+        if self.opponent_forecaster is not None:
+            fixed_action_sequence, fixed_robot_mask = (
+                self.opponent_forecaster.fixed_action_sequence(
+                    self.planner.config.horizon
+                )
+            )
+        plan = self.planner.plan(
+            global_states,
+            self.planner_state,
+            fixed_action_sequence=fixed_action_sequence,
+            fixed_robot_mask=fixed_robot_mask,
+        )
         self.planner_state = plan.planner_state
         return plan
 
@@ -290,6 +308,8 @@ class MPCSimulatorController:
             event_labels,
             modified | ~teacher_action_executed,
         )
+        if self.opponent_forecaster is not None:
+            self.opponent_forecaster.observe(done)
         return MPCTransition(
             state=state,
             local_observations=local,

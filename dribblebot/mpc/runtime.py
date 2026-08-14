@@ -6,6 +6,7 @@ import argparse
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 from dribblebot.world_model.state_adapter import FootballWorldModelStateAdapter
@@ -13,6 +14,7 @@ from dribblebot.world_model.trainer import load_checkpoint
 
 from .config import load_mpc_config
 from .hybrid_cem import HybridCEMMPC
+from .objective import MPCObjective
 from .terminal_value import load_value_checkpoint
 from .local_observation import LocalObservationAdapter
 from .simulator_controller import (
@@ -36,6 +38,8 @@ class MPCRuntime:
     controller: object
     value_model: object = None
     value_checkpoint: object = None
+    opponent_forecaster: object = None
+    opponent_policy: object = None
 
 
 def add_simulator_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -74,6 +78,21 @@ def add_simulator_arguments(parser: argparse.ArgumentParser) -> argparse.Argumen
     parser.add_argument("--walk-policy-dir", default=None)
     parser.add_argument("--dribble-policy-dir", default=None)
     parser.add_argument("--shoot-policy-dir", default=None)
+    parser.add_argument(
+        "--opponent-policy-source",
+        choices=("local", "wandb", "none"),
+        default="local",
+        help=(
+            "Frozen high-level opponent used by joint-team MPC. 'none' holds "
+            "opponent robots on zero-command reposition actions."
+        ),
+    )
+    parser.add_argument(
+        "--opponent-policy-dir",
+        default="checkpoints/reproduction/high_level",
+    )
+    parser.add_argument("--opponent-wandb-run", default=None)
+    parser.add_argument("--opponent-policy-checkpoint", default="latest")
     parser.add_argument("--walk-x-speed-scale", type=float, default=1.5)
     parser.add_argument("--walk-y-speed-scale", type=float, default=1.5)
     parser.add_argument("--walk-yaw-speed-scale", type=float, default=1.0)
@@ -214,19 +233,62 @@ def build_runtime(
         num_robots=model.action_adapter.num_robots,
     )
     local_adapter = LocalObservationAdapter(model.schema)
+    controlled_robot_count = team_size if joint_teams else checkpoint_num_robots
+    objective = MPCObjective(
+        model.schema,
+        model.action_adapter,
+        model.event_names,
+        mpc_config,
+        terminal_value=None if value_model is None else value_model.predict,
+        controlled_robot_count=controlled_robot_count,
+    )
     planner = HybridCEMMPC(
         model,
         state_adapter,
         model.action_adapter,
+        objective=objective,
         config=mpc_config,
         terminal_value=None if value_model is None else value_model.predict,
     )
+    opponent_forecaster = opponent_policy = None
+    if joint_teams:
+        from .opponent_forecast import (
+            FrozenPolicyOpponentForecaster,
+            ZeroOpponentForecaster,
+        )
+
+        opponent_source = str(getattr(args, "opponent_policy_source", "local"))
+        if opponent_source == "none":
+            opponent_forecaster = ZeroOpponentForecaster(
+                env, team_size, model.action_adapter
+            )
+        else:
+            from scripts.play_high_level import load_high_level_policy
+
+            opponent_args = SimpleNamespace(
+                high_level_policy_source=opponent_source,
+                high_level_policy_dir=getattr(args, "opponent_policy_dir", None),
+                high_level_wandb_run=getattr(args, "opponent_wandb_run", None),
+                high_level_checkpoint=getattr(
+                    args, "opponent_policy_checkpoint", "latest"
+                ),
+                policy_device=args.policy_device,
+            )
+            opponent_policy = load_high_level_policy(opponent_args)
+            opponent_forecaster = FrozenPolicyOpponentForecaster(
+                env,
+                team_size,
+                model.action_adapter,
+                opponent_policy,
+                opponent_device=args.policy_device,
+            )
     controller = MPCSimulatorController(
         env,
         planner,
         state_adapter,
         local_adapter,
         capture_terminal_state=capture_terminal_state,
+        opponent_forecaster=opponent_forecaster,
     )
     checkpoint_id = file_sha256(args.world_model_checkpoint)
     return MPCRuntime(
@@ -242,4 +304,6 @@ def build_runtime(
         controller,
         value_model,
         value_checkpoint,
+        opponent_forecaster,
+        opponent_policy,
     )

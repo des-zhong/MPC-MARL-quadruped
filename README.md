@@ -141,6 +141,10 @@ High-level training runs two equal AS2 teams. `--num-robots` is the number of
 robots **per team**, and every learning-team robot uses the same actor
 parameters. The opponent is a frozen older snapshot updated at
 `--self-play-update-interval` PPO iterations.
+The learning team attacks the `+x` goal and the red opponent team attacks the
+`-x` goal. Shared-policy observations are rotated into the same canonical
+perspective, while field-frame dribble and shooting commands are rotated back
+before opponent execution.
 
 ```bash
 python scripts/train_high_level.py \
@@ -150,10 +154,13 @@ python scripts/train_high_level.py \
   --walk-policy-dir /path/to/walk/checkpoint-directory \
   --dribble-policy-dir /path/to/dribble/checkpoint-directory \
   --shoot-policy-dir /path/to/shoot/checkpoint-directory \
-  --checkpoint-dir tmp/legged_data/high_level \
   --device cuda:0 \
   --headless
 ```
+
+[train_high_level.py](scripts/train_high_level.py) automatically stores each
+run in `wandb/run-<timestamp>-<id>/files/tmp/legged_data/high_level`. Use
+`--checkpoint-dir` only when an explicit output override is needed.
 
 [train_high_level.bash](train_high_level.bash) provides the same workflow with
 the local paths used during development.
@@ -183,15 +190,16 @@ example.
 
 The collector uses two equal teams of real AS2 robot actors—there are no
 static obstacle actors in this dataset. It records the global joint state,
-joint action, reward, termination, and event labels. Both teams draw actions
-from the same random-valid distribution.
+joint action, reward, termination, and event labels. Both teams use the same
+behavior mixture while attacking opposite goals: 90% of base samples use the
+goal-oriented scripted controller and 10% are exploratory. A separate targeted
+scenario manager oversamples rare goals, possessions, passes, and collisions.
 
 ```bash
 python scripts/collect_world_model_data.py \
   --config configs/world_model_as2.yaml \
   --output data/world_model_as2 \
   --num-robots 2 \
-  --num-episodes 20000 \
   --skill-policy-source local \
   --walk-policy-dir /path/to/walk/checkpoint-directory \
   --dribble-policy-dir /path/to/dribble/checkpoint-directory \
@@ -200,14 +208,18 @@ python scripts/collect_world_model_data.py \
 ```
 
 Here `--num-robots 2` means two robots per team and therefore four robot slots
-in the saved world-model schema. [collect.bash](collect.bash) is the equivalent
-development launcher.
+in the saved world-model schema. The configuration collects 20,000 base
+episodes and may add up to 5,000 targeted episodes to satisfy event-coverage
+quotas. Passing `--num-episodes` instead imposes an explicit hard cap.
+[collect.bash](collect.bash) is the equivalent development launcher.
 
 ## 6. Train and evaluate the world model
 
 Training settings live in
 [configs/world_model_as2.yaml](configs/world_model_as2.yaml). In particular,
 change `training.max_epochs` there to control the maximum epoch count.
+`best.pt` is updated only on validation improvement; `rolling.pt` is the
+periodic recovery checkpoint.
 
 ```bash
 python scripts/train_world_model.py \
@@ -230,6 +242,11 @@ python scripts/evaluate_world_model.py \
   --device cuda:0
 ```
 
+Visualize receding-horizon MPC against the frozen high-level opponent with
+`./mpc_visualize.bash`. Each episode directory includes the video, one-step
+prediction plots, `mpc_diagnostics.png`, and `diagnostics.json` containing
+fallback/action-modification rates plus rollout error at horizons 1 through H.
+
 ## 7. Train with privileged MPC teacher guidance
 
 After training the joint world model, MPC can guide self-play PPO. The student
@@ -248,7 +265,6 @@ python scripts/train_high_level_with_mpc_teacher.py \
   --walk-policy-dir /path/to/walk/checkpoint-directory \
   --dribble-policy-dir /path/to/dribble/checkpoint-directory \
   --shoot-policy-dir /path/to/shoot/checkpoint-directory \
-  --checkpoint-dir tmp/legged_data/high_level_mpc_teacher \
   --device cuda:0 \
   --headless
 ```

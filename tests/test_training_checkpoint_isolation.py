@@ -3,8 +3,13 @@ from scripts.train_high_level import (
     build_arg_parser as build_high_level_parser,
     find_run_level_config,
     newest_complete_local_checkpoint,
+    resolve_high_level_checkpoint_dir,
 )
 from scripts.train_shooting import build_arg_parser as build_shoot_parser
+from dribblebot_learn.ppo_cse import (
+    checkpoint_next_iteration,
+    checkpoint_wandb_base_path,
+)
 
 
 def test_dribble_and_shoot_checkpoint_defaults_are_isolated():
@@ -14,15 +19,8 @@ def test_dribble_and_shoot_checkpoint_defaults_are_isolated():
 
     assert dribble_args.checkpoint_dir == "tmp/legged_data/dribble"
     assert shoot_args.checkpoint_dir == "tmp/legged_data/shoot"
-    assert high_level_args.checkpoint_dir == "tmp/legged_data/high_level"
-    assert len(
-        {
-            dribble_args.checkpoint_dir,
-            shoot_args.checkpoint_dir,
-            high_level_args.checkpoint_dir,
-        }
-    ) == 3
-    assert high_level_args.checkpoint_dir != "tmp/legged_data"
+    assert high_level_args.checkpoint_dir is None
+    assert dribble_args.checkpoint_dir != shoot_args.checkpoint_dir
 
 
 def test_resume_defaults_follow_isolated_checkpoint_directories():
@@ -43,6 +41,26 @@ def test_checkpoint_directory_can_be_overridden_per_run():
     )
 
     assert args.checkpoint_dir == "checkpoints/dribble-experiment-2"
+
+
+def test_high_level_checkpoint_directory_defaults_inside_new_wandb_run(tmp_path):
+    run_dir = tmp_path / "wandb" / "run-20260814_120000-abc123" / "files"
+
+    resolved = resolve_high_level_checkpoint_dir(None, run_dir)
+
+    assert resolved == str(
+        (run_dir / "tmp" / "legged_data" / "high_level").resolve()
+    )
+
+
+def test_wandb_base_path_does_not_nest_run_scoped_checkpoints(tmp_path):
+    working = tmp_path / "project"
+    run_dir = working / "wandb" / "run-abc" / "files"
+    checkpoint_dir = run_dir / "tmp" / "legged_data" / "high_level"
+
+    assert checkpoint_wandb_base_path(
+        checkpoint_dir, run_dir, working
+    ) == str(run_dir.resolve())
 
 
 def test_high_level_pins_only_complete_numbered_skill_checkpoint(tmp_path):
@@ -87,6 +105,11 @@ def test_high_level_resume_accepts_explicit_checkpoint():
 
     assert args.resume
     assert args.resume_checkpoint == checkpoint
+
+
+def test_numbered_high_level_resume_continues_iteration_numbering():
+    assert checkpoint_next_iteration("/run/ac_weights_6800.pt") == 6801
+    assert checkpoint_next_iteration("/run/ac_weights_latest.pt") == 0
 
 
 def test_dribble_defaults_keep_policy_distribution_inside_action_range():

@@ -6,6 +6,11 @@ import torch
 import torch.nn as nn
 from isaacgym.torch_utils import quat_apply
 
+from .team_frame import (
+    mirror_high_level_commands,
+    mirror_high_level_policy_actions,
+)
+
 
 class FrozenOpponentPolicy(nn.Module):
     """Inference-only copy of the trainable actor.
@@ -199,7 +204,15 @@ class SharedPolicySelfPlayWrapper(gym.Wrapper):
             skill_one_hot = torch.nn.functional.one_hot(
                 self.env.skill_ids[:, slot], num_classes=3
             ).float()
-            command = self.env.skill_commands[:, slot] / command_scale
+            command = self.env.skill_commands[:, slot]
+            if team == 1:
+                # Ball-skill xy commands are stored in the fixed world frame,
+                # unlike body-frame walk commands. Rotate them back into the
+                # opponent policy's canonical attack-positive frame.
+                command = mirror_high_level_commands(
+                    command, self.env.skill_ids[:, slot]
+                )
+            command = command / command_scale
             obs = torch.cat(
                 (
                     own_xy,
@@ -266,10 +279,17 @@ class SharedPolicySelfPlayWrapper(gym.Wrapper):
                 actions = self.opponent_policy_callable(opponent_obs)
             else:
                 actions = self.opponent_policy.act_student(history.to(self.opponent_device))
-        return actions.to(self.device).view(self.match_count, self.team_size, self.num_actions)
+        actions = actions.to(self.device).view(
+            self.match_count, self.team_size, self.num_actions
+        )
+        # The opponent observes a world rotated by pi so that its -x target is
+        # canonical +x. Walk commands are body-relative and need no change, but
+        # field-frame dribble/shoot commands must be rotated back before the
+        # shared skill wrapper executes them in the real world.
+        return mirror_high_level_policy_actions(actions)
 
     def preview_opponent_actions(self):
-        """Return the deterministic frozen-policy action without stepping the env."""
+        """Return deterministic opponent actions in executable world semantics."""
 
         return self._opponent_actions()
 

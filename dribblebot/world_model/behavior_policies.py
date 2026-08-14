@@ -65,6 +65,7 @@ class BehaviorMixture:
         existing_policy: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         seed: int = 42,
         random_sampling: Optional[Mapping[str, float]] = None,
+        team_size: Optional[int] = None,
     ):
         self.action_adapter = action_adapter
         self.schema = schema
@@ -102,6 +103,15 @@ class BehaviorMixture:
             raise ValueError("repeat_previous_probability must lie in [0, 1]")
         self.repeat_previous_probability = probability
         self.generator = torch.Generator().manual_seed(seed)
+        self.team_size = None if team_size is None else int(team_size)
+        if self.team_size is not None:
+            if self.team_size < 1:
+                raise ValueError("team_size must be at least 1")
+            if self.action_adapter.num_robots != 2 * self.team_size:
+                raise ValueError(
+                    "Team-aware scripted collection requires exactly two equal teams: "
+                    f"got {self.action_adapter.num_robots} robots for team_size={self.team_size}"
+                )
         self._obstacle_names = tuple(
             feature.name
             for feature in self.schema.features
@@ -211,38 +221,65 @@ class BehaviorMixture:
         field, _, robot_xy, ball_xy, yaw = self._field_coordinates(states)
         to_ball = ball_xy[:, None, :] - robot_xy
         distances = torch.linalg.vector_norm(to_ball, dim=-1)
-        closest = distances.argmin(dim=1)
         skills = torch.full((batch, self.action_adapter.num_robots), int(Skill.REPOSITION), device=device, dtype=torch.long)
         normalized = torch.zeros(batch, self.action_adapter.num_robots, 3, device=device, dtype=states.dtype)
 
-        goal_xy = torch.stack((field[:, 3], torch.zeros_like(field[:, 3])), dim=-1)
-        to_goal = goal_xy - ball_xy
-        goal_direction = self._unit(to_goal)
-        for robot in range(self.action_adapter.num_robots):
-            actor = closest == robot
-            ball_direction = self._unit(to_ball[:, robot])
-            aligned = torch.sum(ball_direction * goal_direction, dim=-1) > 0.5
-            # Match the wrapper's physical affordance radii: shooting requires
-            # a tighter setup than dribbling.  Both thresholds are metres.
-            shoot_near = distances[:, robot] < 0.75
-            dribble_near = distances[:, robot] < 1.00
-            shoot = actor & shoot_near & aligned
-            dribble = actor & dribble_near & ~shoot
-            skills[dribble, robot] = int(Skill.DRIBBLE)
-            skills[shoot, robot] = int(Skill.SHOOT)
-
-            behind_ball = ball_xy - 0.45 * goal_direction
-            target = torch.where(actor[:, None], to_ball[:, robot], behind_ball - robot_xy[:, robot])
-            engaged = dribble_near[:, None] & actor[:, None]
-            command_world = torch.where(engaged, goal_direction, self._unit(target))
-            normalized[:, robot, :2] = self._world_to_local(command_world, yaw[:, robot])
-            desired_direction = torch.where(engaged, goal_direction, self._unit(target))
-            desired_yaw = torch.atan2(desired_direction[:, 1], desired_direction[:, 0])
-            yaw_error = torch.atan2(
-                torch.sin(desired_yaw - yaw[:, robot]),
-                torch.cos(desired_yaw - yaw[:, robot]),
+        # Legacy/static-obstacle datasets contain one team and attack +x.  The
+        # joint-team collector passes team_size explicitly, making the second
+        # team independently select its ball actor and attack -x.
+        teams = (
+            ((0, self.action_adapter.num_robots, 3),)
+            if self.team_size is None
+            else (
+                (0, self.team_size, 3),
+                (self.team_size, 2 * self.team_size, 2),
             )
-            normalized[:, robot, 2] = (yaw_error / torch.pi).clamp(-1.0, 1.0)
+        )
+        for start, stop, goal_field_index in teams:
+            team_closest = distances[:, start:stop].argmin(dim=1) + start
+            goal_x = field[:, goal_field_index]
+            goal_xy = torch.stack((goal_x, torch.zeros_like(goal_x)), dim=-1)
+            goal_direction = self._unit(goal_xy - ball_xy)
+            behind_ball = ball_xy - 0.45 * goal_direction
+
+            for robot in range(start, stop):
+                actor = team_closest == robot
+                ball_direction = self._unit(to_ball[:, robot])
+                aligned = torch.sum(ball_direction * goal_direction, dim=-1) > 0.5
+                # Match the wrapper's physical affordance radii: shooting
+                # requires a tighter setup than dribbling. Both are metres.
+                shoot_near = distances[:, robot] < 0.75
+                dribble_near = distances[:, robot] < 1.00
+                shoot = actor & shoot_near & aligned
+                dribble = actor & dribble_near & ~shoot
+                skills[dribble, robot] = int(Skill.DRIBBLE)
+                skills[shoot, robot] = int(Skill.SHOOT)
+
+                target = torch.where(
+                    actor[:, None],
+                    to_ball[:, robot],
+                    behind_ball - robot_xy[:, robot],
+                )
+                engaged = dribble_near[:, None] & actor[:, None]
+                command_world = torch.where(
+                    engaged, goal_direction, self._unit(target)
+                )
+                normalized[:, robot, :2] = self._world_to_local(
+                    command_world, yaw[:, robot]
+                )
+                desired_direction = torch.where(
+                    engaged, goal_direction, self._unit(target)
+                )
+                desired_yaw = torch.atan2(
+                    desired_direction[:, 1], desired_direction[:, 0]
+                )
+                yaw_error = torch.atan2(
+                    torch.sin(desired_yaw - yaw[:, robot]),
+                    torch.cos(desired_yaw - yaw[:, robot]),
+                )
+                normalized[:, robot, 2] = (yaw_error / torch.pi).clamp(
+                    -1.0, 1.0
+                )
 
         return self.action_adapter.pack(
             skills,
@@ -285,12 +322,23 @@ class BehaviorMixture:
         device = states.device
         field, half_extents, robot_xy, ball_xy, yaw = self._field_coordinates(states)
         to_ball = ball_xy[:, None, :] - robot_xy
-        closest = torch.linalg.vector_norm(to_ball, dim=-1).argmin(dim=1)
+        controlled_count = (
+            self.action_adapter.num_robots
+            if self.team_size is None
+            else self.team_size
+        )
+        closest = torch.linalg.vector_norm(
+            to_ball[:, :controlled_count], dim=-1
+        ).argmin(dim=1)
         possessor = states[:, self.schema.slice("ball.possessor_one_hot")]
         robot_possessor = possessor[:, 1:].argmax(dim=1)
-        valid_possessor = (possessor[:, 0] < 0.5) & (possessor[:, 1:].sum(dim=1) == 1)
+        valid_possessor = (
+            (possessor[:, 0] < 0.5)
+            & (possessor[:, 1:].sum(dim=1) == 1)
+            & (robot_possessor < controlled_count)
+        )
         actor = torch.where(valid_possessor, robot_possessor, closest)
-        teammate = (actor + 1) % self.action_adapter.num_robots
+        teammate = (actor + 1) % controlled_count
 
         goal_xy = torch.stack((field[:, 3], torch.zeros_like(field[:, 3])), dim=-1)
         own_goal_xy = torch.stack((field[:, 2], torch.zeros_like(field[:, 2])), dim=-1)
@@ -304,8 +352,14 @@ class BehaviorMixture:
         sideline_direction = torch.zeros_like(ball_xy)
         sideline_direction[:, 1] = torch.where(ball_xy[:, 1] >= 0.0, 1.0, -1.0)
 
-        skills = torch.full((batch, self.action_adapter.num_robots), int(Skill.REPOSITION), device=device, dtype=torch.long)
-        normalized = torch.zeros(batch, self.action_adapter.num_robots, 3, device=device, dtype=states.dtype)
+        # Retain ordinary soccer behavior for robots not involved in the
+        # staged scenario, especially the opponent team in joint collection.
+        scripted = self._scripted(states)
+        skills, scripted_parameters = self.action_adapter.unpack(scripted)
+        skills = skills.clone()
+        normalized = self.action_adapter.normalize_parameters(
+            skills, scripted_parameters
+        ).clone()
         rows = torch.arange(batch, device=device)
 
         def command(
@@ -351,7 +405,7 @@ class BehaviorMixture:
             0.92,
         )
 
-        if self.action_adapter.num_robots > 1:
+        if controlled_count > 1:
             teammate_collision = scenario_masks["teammate_collision"]
             toward_teammate = self._unit(robot_xy[:, 1] - robot_xy[:, 0])
             robot_zero = torch.zeros_like(actor)
@@ -363,7 +417,7 @@ class BehaviorMixture:
         command(scenario_masks["possession_lost"], actor, Skill.SHOOT, goal_direction, 0.63)
         command(scenario_masks["successful_shot"], actor, Skill.SHOOT, goal_direction, 1.00)
         command(scenario_masks["failed_shot"], actor, Skill.SHOOT, -goal_direction, 0.18)
-        pass_mask = scenario_masks["pass"] & (self.action_adapter.num_robots > 1)
+        pass_mask = scenario_masks["pass"] & (controlled_count > 1)
         command(pass_mask, actor, Skill.SHOOT, pass_direction, 0.54)
 
         # Receivers/supporting robots actively move into the play.  The

@@ -61,7 +61,9 @@ class MPCTeacherGuidanceWrapper(gym.Wrapper):
         self.planner_state = None
         return self.env.reset()
 
-    def _canonical_opponent_forecast(self):
+    def _world_opponent_forecast(self):
+        """Encode the frozen opponent's executable world-frame decision."""
+
         raw = self.env.preview_opponent_actions()
         skills = raw[..., :3].argmax(dim=-1)
         commands = torch.tanh(raw[..., 3:6]) * self.env.env._command_scales(skills)
@@ -108,7 +110,7 @@ class MPCTeacherGuidanceWrapper(gym.Wrapper):
     @torch.no_grad()
     def step(self, actions):
         encoded = self.state_adapter.extract_state(self.env.env)["tensor"]
-        fixed = self._canonical_opponent_forecast()
+        fixed = self._world_opponent_forecast()
         fixed_mask = torch.zeros(
             self.planner.num_robots, dtype=torch.bool, device=encoded.device
         )

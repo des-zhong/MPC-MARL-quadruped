@@ -16,5 +16,4 @@ exec "${PYTHON_BIN}" scripts/train_high_level_with_mpc_teacher.py \
   --walk-policy-dir checkpoints/reproduction/walk \
   --dribble-policy-dir checkpoints/reproduction/dribble \
   --shoot-policy-dir checkpoints/reproduction/shoot \
-  --checkpoint-dir tmp/legged_data/high_level_mpc_teacher \
   "$@"

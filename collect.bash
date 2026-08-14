@@ -19,5 +19,4 @@ exec "${PYTHON_BIN}" scripts/collect_world_model_data.py \
   --walk-policy-dir checkpoints/reproduction/walk \
   --dribble-policy-dir checkpoints/reproduction/dribble \
   --shoot-policy-dir checkpoints/reproduction/shoot \
-  --num-episodes 20000 \
   "$@"

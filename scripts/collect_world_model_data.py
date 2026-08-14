@@ -223,8 +223,8 @@ def collect(args) -> None:
             "opponent": list(range(team_size, 2 * team_size)),
         },
         "team_behavior": {
-            "learning": "random_valid",
-            "opponent": "same random_valid distribution as learning team",
+            "learning": "shared configured behavior mixture; attacks +x",
+            "opponent": "same behavior mixture; attacks -x",
         },
         "num_obstacles": env.env.num_static_opponents,
         "state_schema": adapter.schema.to_dict(), "action_schema": action_adapter.to_dict(),
@@ -246,6 +246,7 @@ def collect(args) -> None:
         float(behavior_cfg.get("repeat_previous_skill_probability", 0.35)),
         seed=int(config.get("seed", 42)),
         random_sampling=behavior_cfg.get("random_sampling"),
+        team_size=team_size,
     )
     scenario_manager = TargetedScenarioManager(
         env,

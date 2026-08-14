@@ -39,6 +39,25 @@ HIGH_LEVEL_REWARD_SCALES = {
 }
 
 
+def resolve_high_level_checkpoint_dir(configured, wandb_run_dir):
+    """Resolve an optional override or create the standard per-run W&B path."""
+
+    if configured:
+        return str(Path(configured).expanduser().resolve())
+    if not wandb_run_dir:
+        raise RuntimeError(
+            "W&B did not provide a run directory for automatic checkpoint storage"
+        )
+    return str(
+        (
+            Path(wandb_run_dir).expanduser().resolve()
+            / "tmp"
+            / "legged_data"
+            / "high_level"
+        )
+    )
+
+
 def _wandb_config_value(value):
     """Unwrap W&B's ``{desc, value}`` representation when present."""
 
@@ -339,9 +358,12 @@ def configure_high_level_cfg(Cfg, args):
     Cfg.env.team_goal_x = 0.5 * args.field_length
     Cfg.env.team_goal_half_width = args.goal_half_width
     Cfg.env.high_level_camera_height = 1.2 * max(args.field_length, args.field_width)
-    Cfg.env.add_field_markers = True
+    # field.png already contains the boundary, halfway, and penalty-area lines.
+    Cfg.env.add_field_markers = False
     Cfg.env.field_marker_width = 0.05
     Cfg.env.field_marker_height = 0.035
+    Cfg.env.add_field_texture = True
+    Cfg.env.add_goalposts = True
     Cfg.env.robot_init_x_range = [-0.5 * args.field_length + 0.6, 0.0]
     Cfg.env.robot_init_y_range = [-0.5 * args.field_width + 0.6, 0.5 * args.field_width - 0.6]
     Cfg.env.robot_yaw_init_range = [-3.14159265, 3.14159265]
@@ -746,10 +768,8 @@ def train_robot(args):
     RunnerArgs.resume_path = args.resume_run
     RunnerArgs.resume_checkpoint = args.resume_checkpoint
     RunnerArgs.save_video_interval = 500
-    # Keep coordinator checkpoints out of the legacy low-level walking
-    # directory (tmp/legged_data).  The runner writes generic names such as
-    # body_latest.jit, so sharing that directory silently replaces the walking
-    # policy while high-level training is running.
+    # Resolved after wandb.init: by default each run owns its checkpoint
+    # directory under wandb/run-<timestamp>-<id>/files/.
     RunnerArgs.checkpoint_dir = args.checkpoint_dir
     RunnerArgs.self_play_update_interval = args.self_play_update_interval
     PPO_Args.learning_rate = args.learning_rate
@@ -772,7 +792,7 @@ def train_robot(args):
     AC_Args.adaptation_labels = []
     AC_Args.adaptation_dims = []
 
-    wandb.init(
+    run = wandb.init(
         project=args.project or "as2_high_level_soccer",
         config={
             "AC_Args": vars(AC_Args),
@@ -814,6 +834,14 @@ def train_robot(args):
             ),
         },
     )
+    RunnerArgs.checkpoint_dir = resolve_high_level_checkpoint_dir(
+        args.checkpoint_dir, run.dir
+    )
+    run.config.update(
+        {"resolved_checkpoint_dir": RunnerArgs.checkpoint_dir},
+        allow_val_change=True,
+    )
+    print(f"High-level checkpoint directory: {RunnerArgs.checkpoint_dir}")
 
     raw_env = TwoRobotVelocityTrackingEasyEnv(sim_device=args.device, headless=args.headless, cfg=Cfg)
     match_env = HighLevelSkillWrapper(raw_env, skill_policies)
@@ -908,8 +936,11 @@ def build_arg_parser():
     parser.add_argument("--project", default=None)
     parser.add_argument(
         "--checkpoint-dir",
-        default="tmp/legged_data/high_level",
-        help="Checkpoint output directory reserved for the high-level coordinator.",
+        default=None,
+        help=(
+            "Optional output override. By default checkpoints are stored under "
+            "the new W&B run's files/tmp/legged_data/high_level directory."
+        ),
     )
     parser.add_argument(
         "--resume",

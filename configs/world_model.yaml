@@ -63,9 +63,9 @@ training:
   max_epochs: 200
   gradient_clip_norm: 10.0
   early_stopping_patience: 20
-  # Overwrite best.pt with the current rolling checkpoint every N completed epochs.
-  # Validation improvements still update best.pt immediately. Set to 0 to disable.
-  best_checkpoint_interval: 10
+  # Save rolling.pt every N completed epochs. best.pt is written only when
+  # validation improves and can therefore never be overwritten by a worse epoch.
+  rolling_checkpoint_interval: 10
   mixed_precision: true
   num_workers: 4
   normalize_reward: false

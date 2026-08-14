@@ -43,7 +43,9 @@ def main(args):
         for plan_index in range(args.num_plans):
             runtime.controller.reset()
             initial = runtime.state_adapter.extract_state(runtime.env)["tensor"]
-            plan = runtime.planner.plan(initial)
+            # Route through the controller so joint-team plans optimize only
+            # the learning team and keep the frozen opponent forecast fixed.
+            plan = runtime.controller.act(initial)
             actual_states = [initial.detach().cpu()]
             real_rewards = []
             real_events = []

@@ -15,6 +15,33 @@ from .actor_critic import AC_Args, ActorCritic
 from .rollout_storage import RolloutStorage
 
 
+def checkpoint_next_iteration(path):
+    """Return the next iteration encoded by ac_weights_<iteration>.pt."""
+
+    if not path:
+        return 0
+    name = os.path.basename(path)
+    prefix, suffix = "ac_weights_", ".pt"
+    if not (name.startswith(prefix) and name.endswith(suffix)):
+        return 0
+    token = name[len(prefix) : -len(suffix)]
+    return int(token) + 1 if token.isdigit() else 0
+
+
+def checkpoint_wandb_base_path(checkpoint_dir, wandb_run_dir, working_directory):
+    """Choose a base that preserves layout without nesting a run into itself."""
+
+    checkpoint_dir = os.path.abspath(checkpoint_dir)
+    working_directory = os.path.abspath(working_directory)
+    if wandb_run_dir:
+        wandb_run_dir = os.path.abspath(wandb_run_dir)
+        if os.path.commonpath((wandb_run_dir, checkpoint_dir)) == wandb_run_dir:
+            return wandb_run_dir
+    if os.path.commonpath((working_directory, checkpoint_dir)) == working_directory:
+        return working_directory
+    return checkpoint_dir
+
+
 def class_to_dict(obj) -> dict:
     if not hasattr(obj, "__dict__"):
         return obj
@@ -83,6 +110,7 @@ class Runner:
                                       self.env.num_actions,
                                       ).to(self.device)
         checkpoint_path = None
+        resume_iteration = 0
         # Load weights from checkpoint 
         if RunnerArgs.resume:
             if RunnerArgs.resume_path:
@@ -112,10 +140,13 @@ class Runner:
                 # safer weights_only loader argument.
                 state_dict = torch.load(checkpoint_path, map_location=self.device)
             actor_critic.load_state_dict(state_dict)
+            resume_iteration = checkpoint_next_iteration(checkpoint_path)
             print(
                 f"Successfully loaded weights from {checkpoint_path} "
                 f"({source})."
             )
+            if resume_iteration:
+                print(f"Continuing iteration numbering at {resume_iteration}.")
 
         self.alg = PPO(actor_critic, device=self.device)
         self.num_steps_per_env = RunnerArgs.num_steps_per_env
@@ -124,9 +155,11 @@ class Runner:
         self.alg.init_storage(self.env.num_train_envs, self.num_steps_per_env, [self.env.num_obs],
                               [self.env.num_privileged_obs], [self.env.num_obs_history], [self.env.num_actions])
 
-        self.tot_timesteps = 0
+        self.tot_timesteps = (
+            resume_iteration * self.num_steps_per_env * self.env.num_envs
+        )
         self.tot_time = 0
-        self.current_learning_iteration = 0
+        self.current_learning_iteration = resume_iteration
         self.last_recording_it = -RunnerArgs.save_video_interval
 
         self.env.reset()
@@ -134,9 +167,29 @@ class Runner:
         if hasattr(self.env, "update_opponent_policy"):
             self.env.update_opponent_policy(self.alg.actor_critic, iteration=0)
             if checkpoint_path and not RunnerArgs.resume_path:
-                opponent_path = os.path.join(
-                    os.path.dirname(checkpoint_path),
-                    "opponent_ac_weights_latest.pt",
+                checkpoint_name = os.path.basename(checkpoint_path)
+                opponent_candidates = []
+                if (
+                    checkpoint_name.startswith("ac_weights_")
+                    and checkpoint_name.endswith(".pt")
+                ):
+                    suffix = checkpoint_name[len("ac_weights_") :]
+                    if suffix != "latest.pt":
+                        opponent_candidates.append(
+                            os.path.join(
+                                os.path.dirname(checkpoint_path),
+                                f"opponent_ac_weights_{suffix}",
+                            )
+                        )
+                opponent_candidates.append(
+                    os.path.join(
+                        os.path.dirname(checkpoint_path),
+                        "opponent_ac_weights_latest.pt",
+                    )
+                )
+                opponent_path = next(
+                    (path for path in opponent_candidates if os.path.isfile(path)),
+                    opponent_candidates[-1],
                 )
                 if os.path.isfile(opponent_path) and hasattr(
                     self.env, "load_opponent_policy_state_dict"
@@ -148,7 +201,9 @@ class Runner:
                     except TypeError:
                         opponent_state = torch.load(opponent_path, map_location=self.device)
                     self.env.load_opponent_policy_state_dict(
-                        opponent_state, self.alg.actor_critic, iteration=-1
+                        opponent_state,
+                        self.alg.actor_critic,
+                        iteration=max(resume_iteration - 1, -1),
                     )
                     print(f"Loaded frozen opponent weights from {opponent_path}.")
 
@@ -388,11 +443,10 @@ class Runner:
                             shutil.copy2(wandb_config_path, local_config_path)
                         config_paths.append(local_config_path)
 
-                working_directory = os.path.abspath(os.getcwd())
-                wandb_base_path = (
-                    working_directory
-                    if os.path.commonpath((working_directory, path)) == working_directory
-                    else path
+                wandb_base_path = checkpoint_wandb_base_path(
+                    path,
+                    wandb_run_dir,
+                    os.getcwd(),
                 )
                 artifact_paths = (
                     adaptation_paths

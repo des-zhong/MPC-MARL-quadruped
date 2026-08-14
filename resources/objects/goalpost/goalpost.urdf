@@ -1,0 +1,61 @@
+<?xml version="1.0"?>
+<!--
+  The source mesh uses Y as the field-length axis and was authored for a much
+  larger pitch.  This transform fits it to DribbleBot's default 8 m x 5 m
+  field: the goal lines are at X = +/-4 m and each clear opening is roughly
+  2 m wide x 1 m high.  The small translation recenters the slightly
+  asymmetric source mesh and places its lowest point on the ground.
+-->
+<robot name="goalpost_dual">
+  <link name="goalpost_dual">
+    <visual>
+      <origin xyz="-0.02175 0 0.04159" rpy="0 0 -1.57079632679"/>
+      <geometry>
+        <mesh filename="./goalpost_dual.stl" scale="0.55647 0.24878 0.49375"/>
+      </geometry>
+      <material name="goal_white">
+        <color rgba="0.92 0.92 0.88 1"/>
+      </material>
+    </visual>
+
+    <!-- Primitive collisions keep the mouth open; convexifying the detailed
+         net mesh would incorrectly turn each goal into a solid obstacle. -->
+    <collision name="positive_left_post">
+      <origin xyz="4.01 1.04 0.50"/>
+      <geometry>
+        <box size="0.04 0.08 1.00"/>
+      </geometry>
+    </collision>
+    <collision name="positive_right_post">
+      <origin xyz="4.01 -1.04 0.50"/>
+      <geometry>
+        <box size="0.04 0.08 1.00"/>
+      </geometry>
+    </collision>
+    <collision name="positive_crossbar">
+      <origin xyz="4.01 0 1.02"/>
+      <geometry>
+        <box size="0.04 2.16 0.04"/>
+      </geometry>
+    </collision>
+
+    <collision name="negative_left_post">
+      <origin xyz="-4.01 1.04 0.50"/>
+      <geometry>
+        <box size="0.04 0.08 1.00"/>
+      </geometry>
+    </collision>
+    <collision name="negative_right_post">
+      <origin xyz="-4.01 -1.04 0.50"/>
+      <geometry>
+        <box size="0.04 0.08 1.00"/>
+      </geometry>
+    </collision>
+    <collision name="negative_crossbar">
+      <origin xyz="-4.01 0 1.02"/>
+      <geometry>
+        <box size="0.04 2.16 0.04"/>
+      </geometry>
+    </collision>
+  </link>
+</robot>

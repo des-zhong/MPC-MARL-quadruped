@@ -64,8 +64,8 @@ def _wandb_epoch_logger(wandb):
                 "early_stopping/patience": state["early_stopping_patience"],
                 "validation/best_loss": state["best_validation_loss"],
                 "checkpoint/is_best": int(bool(state["is_best"])),
-                "checkpoint/periodic_best_save": int(
-                    bool(state["periodic_best_save"])
+                "checkpoint/periodic_rolling_save": int(
+                    bool(state["periodic_checkpoint_save"])
                 ),
             }
         )

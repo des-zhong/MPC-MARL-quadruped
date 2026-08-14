@@ -9,11 +9,13 @@ export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-${TMPDIR:-/tmp}/dribblebot_
 
 exec "${PYTHON_BIN}" scripts/visualize_mpc.py \
   --config configs/mpc_joint_teams.yaml \
-  --profile teacher_training \
+  --profile teacher_high_quality \
   --skill-policy-source local \
   --num-robots 2 \
   --walk-policy-dir checkpoints/reproduction/walk \
   --dribble-policy-dir checkpoints/reproduction/dribble \
   --shoot-policy-dir checkpoints/reproduction/shoot \
+  --opponent-policy-source local \
+  --opponent-policy-dir checkpoints/reproduction/high_level \
   --world-model-checkpoint checkpoints/reproduction/world_model/best.pt \
   "$@"

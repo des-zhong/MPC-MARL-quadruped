@@ -60,6 +60,42 @@ def test_scripted_geometry_is_invariant_to_field_normalization(action_adapter):
     assert torch.allclose(policy._scripted(small_field), policy._scripted(large_field), atol=1e-6)
 
 
+def test_joint_team_scripted_policy_attacks_opposite_goals():
+    adapter = JointActionAdapter(
+        {
+            0: SkillBounds((-1.2, -0.6, 0.0), (1.2, 0.6, 0.0), (1.0, 1.0, 0.0)),
+            1: SkillBounds((-1.5, -1.5, -1.0), (1.5, 1.5, 1.0), (1.0, 1.0, 1.0)),
+            2: SkillBounds((-3.0, -3.0, 0.0), (3.0, 3.0, 0.0), (1.0, 1.0, 0.0)),
+        },
+        num_robots=4,
+    )
+    schema = default_state_schema(0, num_robots=4)
+    states = torch.zeros(1, schema.state_dim)
+    states[:, schema.slice("field.geometry")] = torch.tensor(
+        [4.0, 2.5, -4.0, 4.0, 1.0, 0.09]
+    )
+    positions = ((-0.2, 0.0), (-1.5, 1.0), (0.2, 0.0), (1.5, -1.0))
+    for robot, (x, y) in enumerate(positions):
+        states[:, schema.slice(f"robot_{robot}.position")][:, :2] = torch.tensor(
+            [x / 4.0, y / 2.5]
+        )
+        states[:, schema.slice(f"robot_{robot}.yaw_sin_cos")][:, 1] = 1.0
+    policy = BehaviorMixture(
+        adapter,
+        schema,
+        {"scripted": 1.0},
+        repeat_previous_probability=0.0,
+        team_size=2,
+    )
+
+    skills, commands = adapter.unpack(policy._scripted(states))
+
+    assert skills[0, 0].item() == 2
+    assert skills[0, 2].item() == 2
+    assert commands[0, 0, 0] > 0.0
+    assert commands[0, 2, 0] < 0.0
+
+
 def test_random_sampling_goal_directed_weight_is_honored(action_adapter):
     schema, states = _states(batch=32)
     policy = BehaviorMixture(

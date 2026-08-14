@@ -13,5 +13,6 @@ exec "${PYTHON_BIN}" scripts/train_high_level.py \
   --walk-policy-dir checkpoints/reproduction/walk \
   --dribble-policy-dir checkpoints/reproduction/dribble \
   --shoot-policy-dir checkpoints/reproduction/shoot \
-  --checkpoint-dir tmp/legged_data/high_level \
+  --resume \
+  --resume-checkpoint wandb/run-20260812_233656-nkgeuto7/files/tmp/legged_data/high_level/ac_weights_6800.pt \
   "$@"

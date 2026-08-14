@@ -79,6 +79,17 @@ class Cfg(PrefixProto, cli=False):
         add_field_markers = False
         field_marker_width = 0.04
         field_marker_height = 0.03
+        add_goalposts = False
+        goalpost_asset_file = "resources/objects/goalpost/goalpost.urdf"
+        add_field_texture = False
+        field_texture_file = "resources/textures/field.png"
+        field_surface_asset_file = "resources/objects/soccer_field/soccer_field.urdf"
+        # The painted boundary is inset within field.png. These factors make
+        # that boundary, rather than the image edges, span the configured field.
+        field_texture_length_scale = 1.0666667
+        field_texture_width_scale = 1.1067358
+        field_surface_thickness = 0.01
+        field_surface_offset = 0.002
 
         priv_observe_ball_drag = False
 

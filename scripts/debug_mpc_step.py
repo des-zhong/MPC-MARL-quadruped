@@ -103,6 +103,11 @@ def main(args):
                         (transition.state[0], transition.next_state[0])
                     ),
                     output=Path(args.save_dir) / f"step_{step:06d}.png",
+                    controlled_robot_count=(
+                        int(runtime.config["environment"]["team_size"])
+                        if "team_size" in runtime.config["environment"]
+                        else None
+                    ),
                 )
                 plt.close(figure)
             step += 1

@@ -3,7 +3,7 @@
 seed: 42
 world_model:
   macro_action_steps: 10
-  history_length: 1
+  history_length: 4
   max_obstacles: 0
 environment:
   robot: as2
@@ -11,10 +11,10 @@ environment:
   num_robots: 4
 mpc:
   algorithm: cem
-  horizon: 5
-  num_candidates: 128
-  num_elites: 16
-  num_iterations: 3
+  horizon: 8
+  num_candidates: 256
+  num_elites: 32
+  num_iterations: 4
   candidate_batch_size: 128
   skill_temperature: 1.0
   min_skill_probability: 0.02
@@ -30,9 +30,9 @@ mpc:
   return_std_penalty: 0.50
   ensemble_objective: mean_minus_std
   termination_threshold: 0.50
-  skill_switch_penalty: 0.01
-  command_change_penalty: 0.01
-  collision_penalty: 1.0
+  skill_switch_penalty: 0.10
+  command_change_penalty: 0.05
+  collision_penalty: 2.0
   out_of_bounds_penalty: 2.0
   robot_fall_penalty: 1.0
   invalid_skill_penalty: 2.0
@@ -48,31 +48,36 @@ mpc:
   reposition_approach_coefficient: 2.0
   reposition_command_alignment_coefficient: 1.0
   reposition_first_step_multiplier: 3.0
-  ball_progress_coefficient: 0.0
-  possession_coefficient: 0.0
-  goal_probability_bonus: 0.0
-  event_coefficients: {}
+  ball_progress_coefficient: 2.0
+  possession_coefficient: 0.5
+  goal_probability_bonus: 10.0
+  event_coefficients:
+    own_goal: -10.0
+    successful_shot: 2.0
+    pass: 0.5
+    possession_acquired: 0.5
+    possession_lost: -0.5
   objective_mode: reward_only
   use_terminal_value: false
   execute_mean_action: false
   execute_best_sample: true
-  execution_action_smoothing: 0.0
-  minimum_skill_duration: 1
-  fallback_policy: safe_reposition
-  uncertainty_fallback_threshold: 0.50
-  warm_start_uncertainty_threshold: 0.30
+  execution_action_smoothing: 0.35
+  minimum_skill_duration: 3
+  fallback_policy: previous_action
+  uncertainty_fallback_threshold: 0.90
+  warm_start_uncertainty_threshold: 0.50
   invalid_objective: -1000000000.0
   max_candidate_diagnostics: 0
   seed: 42
 mpc_profiles:
   teacher_training:
-    horizon: 5
-    num_candidates: 128
-    num_elites: 16
-    num_iterations: 3
+    horizon: 8
+    num_candidates: 256
+    num_elites: 32
+    num_iterations: 4
     candidate_batch_size: 128
   teacher_high_quality:
-    horizon: 8
+    horizon: 12
     num_candidates: 512
     num_elites: 64
     num_iterations: 5

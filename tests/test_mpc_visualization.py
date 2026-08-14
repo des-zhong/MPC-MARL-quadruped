@@ -6,6 +6,7 @@ pytest.importorskip("matplotlib")
 from matplotlib import pyplot as plt
 
 from dribblebot.mpc.visualization import (
+    plot_mpc_execution_diagnostics,
     plot_prediction_vs_reality,
     plot_skill_and_parameters,
     plot_top_down,
@@ -71,6 +72,42 @@ def test_skill_and_parameter_timeline_runs_headlessly(tmp_path):
     output = tmp_path / "skill_and_parameters.png"
 
     returned = plot_skill_and_parameters(actions, num_robots=2, output=output)
+
+    assert returned == output
+    assert output.exists()
+    assert output.stat().st_size > 0
+
+
+def test_mpc_execution_diagnostics_runs_headlessly(tmp_path):
+    rows = [
+        {
+            "fallback_used": False,
+            "requested_action_modified": False,
+            "best_objective": 1.0,
+            "planning_time_seconds": 0.02,
+        },
+        {
+            "fallback_used": True,
+            "requested_action_modified": True,
+            "best_objective": 0.2,
+            "planning_time_seconds": 0.03,
+        },
+    ]
+    errors = [
+        {
+            "horizon": 1,
+            "robot_position_rmse_m": 0.1,
+            "ball_position_rmse_m": 0.05,
+        },
+        {
+            "horizon": 2,
+            "robot_position_rmse_m": 0.2,
+            "ball_position_rmse_m": 0.12,
+        },
+    ]
+    output = tmp_path / "mpc_diagnostics.png"
+
+    returned = plot_mpc_execution_diagnostics(rows, errors, output)
 
     assert returned == output
     assert output.exists()
