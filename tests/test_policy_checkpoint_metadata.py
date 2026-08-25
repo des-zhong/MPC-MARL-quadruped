@@ -428,6 +428,7 @@ def test_decode_executes_requested_skills_when_geometric_fallback_is_disabled(mo
     wrapper.requested_skill_ids = torch.zeros(1, 2, dtype=torch.long)
     wrapper.skill_ids = torch.zeros(1, 2, dtype=torch.long)
     wrapper.invalid_skill_mask = torch.ones(1, 2, dtype=torch.bool)
+    wrapper.collision_avoidance_mask = torch.zeros(1, 2, dtype=torch.bool)
     wrapper.skill_commands = torch.zeros(1, 2, 3)
     wrapper.env = types.SimpleNamespace(
         cfg=types.SimpleNamespace(
@@ -459,3 +460,72 @@ def test_decode_executes_requested_skills_when_geometric_fallback_is_disabled(mo
     assert torch.equal(wrapper.skill_ids, torch.tensor([[1, 2]]))
     assert torch.equal(wrapper.requested_skill_ids, wrapper.skill_ids)
     assert not torch.any(wrapper.invalid_skill_mask)
+
+
+def test_predictive_collision_avoidance_overrides_closing_pair(monkeypatch):
+    module, torch = _load_wrapper_module(monkeypatch)
+    wrapper = module.HighLevelSkillWrapper.__new__(module.HighLevelSkillWrapper)
+    wrapper.device = torch.device("cpu")
+    wrapper.num_envs = 1
+    wrapper.num_robots = 2
+    wrapper.env = types.SimpleNamespace(
+        cfg=types.SimpleNamespace(
+            env=types.SimpleNamespace(
+                high_level_collision_avoidance=True,
+                high_level_walk_command_scale=[1.5, 1.5, 1.0],
+            ),
+            rewards=types.SimpleNamespace(
+                high_level_robot_avoidance_distance=0.55,
+                high_level_robot_avoidance_lookahead=0.25,
+                high_level_robot_avoidance_speed=0.5,
+            ),
+        )
+    )
+    roots = torch.zeros(1, 2, 13)
+    roots[:, :, 6] = 1.0
+    roots[0, :, 0] = torch.tensor([-0.45, 0.45])
+    roots[0, :, 7] = torch.tensor([1.0, -1.0])
+    skills = torch.tensor([[1, 2]])
+    commands = torch.ones(1, 2, 3)
+
+    safe_skills, safe_commands, mask = wrapper._apply_collision_avoidance(
+        skills, commands, roots
+    )
+
+    assert torch.all(mask)
+    assert torch.equal(safe_skills, torch.zeros_like(skills))
+    assert safe_commands[0, 0, 0] < 0.0
+    assert safe_commands[0, 1, 0] > 0.0
+    assert torch.all(safe_commands[:, :, 2] == 0.0)
+
+
+def test_predictive_collision_avoidance_leaves_separating_pair_unchanged(monkeypatch):
+    module, torch = _load_wrapper_module(monkeypatch)
+    wrapper = module.HighLevelSkillWrapper.__new__(module.HighLevelSkillWrapper)
+    wrapper.device = torch.device("cpu")
+    wrapper.num_envs = 1
+    wrapper.num_robots = 2
+    wrapper.env = types.SimpleNamespace(
+        cfg=types.SimpleNamespace(
+            env=types.SimpleNamespace(high_level_collision_avoidance=True),
+            rewards=types.SimpleNamespace(
+                high_level_robot_avoidance_distance=0.55,
+                high_level_robot_avoidance_lookahead=0.25,
+                high_level_robot_avoidance_speed=0.5,
+            ),
+        )
+    )
+    roots = torch.zeros(1, 2, 13)
+    roots[:, :, 6] = 1.0
+    roots[0, :, 0] = torch.tensor([-0.45, 0.45])
+    roots[0, :, 7] = torch.tensor([-1.0, 1.0])
+    skills = torch.tensor([[1, 2]])
+    commands = torch.ones(1, 2, 3)
+
+    safe_skills, safe_commands, mask = wrapper._apply_collision_avoidance(
+        skills, commands, roots
+    )
+
+    assert not torch.any(mask)
+    assert torch.equal(safe_skills, skills)
+    assert torch.equal(safe_commands, commands)

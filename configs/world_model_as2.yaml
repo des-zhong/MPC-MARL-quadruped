@@ -4,8 +4,7 @@ seed: 42
 
 world_model:
   macro_action_steps: 10
-  # Match the high-level coordinator checkpoint observation history so the
-  # frozen opponent can be forecast consistently by standalone MPC scripts.
+  # Match the high-level coordinator observation history.
   history_length: 4
   max_obstacles: 0
 
@@ -20,6 +19,7 @@ environment:
   field_length: 8.0
   field_width: 5.0
   goal_half_width: 1.0
+  boundary_walls: true
   # Keep a substantial fraction of ordinary resets immediately usable by the
   # dribble/shoot policies instead of exposing the collector almost only to
   # far-away walking states.
@@ -28,13 +28,22 @@ environment:
   near_ball_init_max_distance: 0.95
   near_ball_init_max_angle: 0.35
 
+# Use the same deterministic opponent during data collection, MPC rollout, and
+# simulator execution. Only the learning team uses the behavior mixture below.
+opponent:
+  mode: slow_walk_to_ball
+  walk_speed_mps: 0.35
+  stop_distance_m: 0.25
+  slow_distance_m: 1.0
+  yaw_gain: 1.0
+
 data_collection:
   num_episodes: 20000
   shard_episodes: 1
   repeat_previous_skill_probability: 0.35
   behavior_mixture:
     # Base samples are 90% goal-oriented scripted soccer and 10% exploratory.
-    # Both teams use the same controller, mirrored toward opposite goals.
+    # These samples control the learning team; the opponent is fixed above.
     # Repeat/targeted overrides are logged separately in each transition.
     random_valid: 0.10
     scripted: 0.90
@@ -55,7 +64,6 @@ data_collection:
     scenarios:
       - goal
       - own_goal
-      - out_of_bounds
       - teammate_collision
       - possession_acquired
       - possession_lost
@@ -65,7 +73,6 @@ data_collection:
   minimum_event_counts:
     goal: 1000
     own_goal: 1000
-    out_of_bounds: 1000
     teammate_collision: 5000
     possession_acquired: 5000
     possession_lost: 3000
@@ -98,6 +105,9 @@ loss:
   ball_position_weight: 2.0
   ball_velocity_weight: 2.0
   reward_weight: 1.0
+  # MPC consumes the reward mean, so optimize it directly. Variance is trained
+  # separately and cannot down-weight rare/high-magnitude reward errors.
+  reward_variance_weight: 0.1
   termination_weight: 1.0
   event_weight: 1.0
 
@@ -115,10 +125,11 @@ training:
   rolling_checkpoint_interval: 10
   mixed_precision: true
   num_workers: 4
-  normalize_reward: false
+  normalize_reward: true
   sequence_length: 5
   multi_step_loss_weight: 0.25
-  multi_step_start_epoch: 10
+  # Do not allow best.pt to be selected before rollout reward training starts.
+  multi_step_start_epoch: 0
   multi_step_discount: 0.8
   teacher_forcing_probability_start: 1.0
   teacher_forcing_probability_end: 0.0

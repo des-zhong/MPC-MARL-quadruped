@@ -7,16 +7,28 @@ import math
 import gym
 import torch
 
+from dribblebot.mpc.opponent_forecast import (
+    SlowWalkToBallOpponentForecaster,
+    ZeroOpponentForecaster,
+)
+
 
 class MPCTeacherGuidanceWrapper(gym.Wrapper):
     """Add a dense MPC action-agreement reward to the learning team.
 
     The student's observations remain agent-local.  The teacher alone receives
     the world model's global state and plans the learning-team actions while the
-    frozen opponent policy's current action is held over the planning horizon.
+    simple opponent's current action is held over the planning horizon.
     """
 
-    def __init__(self, env, planner, state_adapter, reward_coefficient=1.0):
+    def __init__(
+        self,
+        env,
+        planner,
+        state_adapter,
+        reward_coefficient=1.0,
+        opponent_config=None,
+    ):
         super().__init__(env)
         self.env = env
         self.planner = planner
@@ -30,6 +42,25 @@ class MPCTeacherGuidanceWrapper(gym.Wrapper):
             raise ValueError(
                 f"Teacher world model has {planner.num_robots} robots; expected {expected}"
             )
+        opponent = dict(opponent_config or {})
+        mode = str(opponent.get("mode", "slow_walk_to_ball"))
+        if mode == "stationary":
+            self.opponent_forecaster = ZeroOpponentForecaster(
+                env.env, env.team_size, planner.action_adapter
+            )
+        elif mode == "slow_walk_to_ball":
+            self.opponent_forecaster = SlowWalkToBallOpponentForecaster(
+                env.env,
+                env.team_size,
+                planner.action_adapter,
+                speed_mps=float(opponent.get("walk_speed_mps", 0.35)),
+                stop_distance_m=float(opponent.get("stop_distance_m", 0.25)),
+                slow_distance_m=float(opponent.get("slow_distance_m", 1.0)),
+                yaw_gain=float(opponent.get("yaw_gain", 1.0)),
+            )
+        else:
+            raise ValueError(f"Unknown opponent mode {mode!r}")
+        env.set_opponent_action_provider(self.opponent_forecaster.wrapper_actions)
 
     @property
     def cfg(self):
@@ -59,29 +90,17 @@ class MPCTeacherGuidanceWrapper(gym.Wrapper):
 
     def reset(self):
         self.planner_state = None
-        return self.env.reset()
+        observations = self.env.reset()
+        self.opponent_forecaster.reset()
+        return observations
 
     def _world_opponent_forecast(self):
-        """Encode the frozen opponent's executable world-frame decision."""
+        """Return the simple action requested from the simulator opponent."""
 
-        raw = self.env.preview_opponent_actions()
-        skills = raw[..., :3].argmax(dim=-1)
-        commands = torch.tanh(raw[..., 3:6]) * self.env.env._command_scales(skills)
-        commands[..., 2] = torch.where(
-            skills == 2, torch.zeros_like(commands[..., 2]), commands[..., 2]
+        fixed, _ = self.opponent_forecaster.fixed_action_sequence(
+            self.planner.config.horizon
         )
-        batch = raw.shape[0]
-        team_size = self.env.team_size
-        all_skills = torch.zeros(
-            batch, 2 * team_size, dtype=torch.long, device=raw.device
-        )
-        all_commands = torch.zeros(
-            batch, 2 * team_size, 3, dtype=raw.dtype, device=raw.device
-        )
-        all_skills[:, team_size:] = skills
-        all_commands[:, team_size:] = commands
-        joint = self.planner.action_adapter.pack(all_skills, all_commands)
-        return joint[:, None].expand(-1, self.planner.config.horizon, -1).clone()
+        return fixed
 
     def _per_agent_guidance(self, executed, teacher):
         adapter = self.planner.action_adapter
@@ -145,9 +164,6 @@ class MPCTeacherGuidanceWrapper(gym.Wrapper):
         info["mpc_teacher_reward"] = guidance.reshape(-1)
         info["mpc_teacher_disagreement"] = disagreement.reshape(-1)
         info["mpc_teacher_objective"] = plan.best_objective.repeat_interleave(
-            self.env.team_size
-        )
-        info["mpc_teacher_fallback"] = plan.fallback_used.repeat_interleave(
             self.env.team_size
         )
         return observations, rewards, dones, info

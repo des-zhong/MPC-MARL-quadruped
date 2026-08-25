@@ -2,8 +2,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# ===== Paths to edit when the checkpoint layout changes =====
 WORLD_MODEL_DIR="${SCRIPT_DIR}/world_model"
 TARGET="${WORLD_MODEL_DIR}/best.pt"
+# ============================================================
 EXPECTED_SHA256="da6d12ee2cb59e09d98cfc6b14f80b11843072755d186e1fc02e1a3886f4ebb3"
 PARTS=(
   "${WORLD_MODEL_DIR}/best.pt.part-00"

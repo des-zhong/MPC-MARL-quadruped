@@ -58,22 +58,6 @@ TEACHER_REQUIRED_KEYS = (
     "student_teacher_disagreement",
 )
 
-# Written by value-aware collectors but intentionally optional when reading
-# legacy reward-only teacher shards.
-TERMINAL_VALUE_DIAGNOSTIC_KEYS = (
-    "predicted_plan_values",
-    "predicted_finite_horizon_return",
-    "predicted_terminal_value",
-    "discounted_terminal_value",
-    "terminal_value_contribution",
-    "terminal_state_uncertainty",
-    "terminal_value_clipped",
-    "selected_plan_total_objective",
-    "real_return_to_go",
-    "real_episode_return",
-)
-
-
 def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, indent=2, sort_keys=True))
@@ -350,24 +334,8 @@ def transition_to_teacher_record(
         "predicted_plan": array(plan.best_action_sequence),
         "predicted_plan_states": array(plan.predicted_states),
         "predicted_plan_rewards": array(plan.predicted_rewards),
-        "predicted_plan_values": array(plan.predicted_state_values),
         "predicted_finite_horizon_return": np.float32(
             plan.predicted_discounted_reward_return[env_index].item()
-        ),
-        "predicted_terminal_value": np.float32(
-            plan.terminal_state_value[env_index].item()
-        ),
-        "discounted_terminal_value": np.float32(
-            plan.discounted_terminal_value[env_index].item()
-        ),
-        "terminal_value_contribution": np.float32(
-            plan.terminal_value_contribution[env_index].item()
-        ),
-        "terminal_state_uncertainty": np.float32(
-            plan.terminal_state_uncertainty[env_index].item()
-        ),
-        "terminal_value_clipped": np.bool_(
-            plan.terminal_value_clipped[env_index].item() > 0
         ),
         "selected_plan_total_objective": np.float32(
             plan.best_objective[env_index].item()
@@ -380,6 +348,16 @@ def transition_to_teacher_record(
         "state_uncertainty": array(plan.uncertainty["state"]),
         "reward_uncertainty": array(plan.uncertainty["reward"]),
         "return_uncertainty": np.float32(plan.uncertainty["return"][env_index].item()),
+        "ood_fallback_used": np.bool_(
+            plan.uncertainty.get(
+                "ood_fallback_used",
+                torch.zeros(
+                    transition.state.shape[0],
+                    dtype=torch.bool,
+                    device=transition.state.device,
+                ),
+            )[env_index].item()
+        ),
         "teacher_skill_probabilities": array(
             plan.final_skill_probabilities[:, 0]
         ),
@@ -397,7 +375,6 @@ def transition_to_teacher_record(
         "has_student_action": np.bool_(has_student[env_index].item()),
         "teacher_intervention": np.bool_(intervention[env_index].item()),
         "student_teacher_disagreement": np.float32(disagreement[env_index].item()),
-        "fallback_used": np.bool_(plan.fallback_used[env_index].item()),
     }
     for robot in range(num_robots):
         record[f"robot_{robot}_local_observation"] = array(

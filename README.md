@@ -139,17 +139,27 @@ its checkpoint paths before using it.
 
 High-level training runs two equal AS2 teams. `--num-robots` is the number of
 robots **per team**, and every learning-team robot uses the same actor
-parameters. The opponent is a frozen older snapshot updated at
-`--self-play-update-interval` PPO iterations.
+parameters. Every `--self-play-update-interval` PPO iterations, the current
+actor is added to a bounded historical opponent pool. Matches sample the newest
+snapshot with `--opponent-latest-probability` and distribute the remaining
+probability across older policies, including the initialization anchor.
 The learning team attacks the `+x` goal and the red opponent team attacks the
 `-x` goal. Shared-policy observations are rotated into the same canonical
 perspective, while field-frame dribble and shooting commands are rotated back
 before opponent execution.
 
+The default collision term now begins at a 0.65 m robot-centre distance with a
+penalty magnitude of 2.0. Override these with
+`--robot-collision-distance`/`--robot-collision-penalty`. The predictive safety
+override is deliberately disabled during PPO because it changes the executed
+action; enable it only when needed with `--collision-avoidance`.
+
 ```bash
 python scripts/train_high_level.py \
   --num-robots 2 \
-  --self-play-update-interval 500 \
+  --self-play-update-interval 2000 \
+  --opponent-pool-size 8 \
+  --opponent-latest-probability 0.5 \
   --skill-policy-source local \
   --walk-policy-dir /path/to/walk/checkpoint-directory \
   --dribble-policy-dir /path/to/dribble/checkpoint-directory \
@@ -162,8 +172,20 @@ python scripts/train_high_level.py \
 run in `wandb/run-<timestamp>-<id>/files/tmp/legged_data/high_level`. Use
 `--checkpoint-dir` only when an explicit output override is needed.
 
+Use `--resume-mode full` only to continue the same reward and environment.
+When initializing from a checkpoint trained under an older objective, use
+`--resume --resume-mode policy-only --resume-checkpoint /path/to/ac_weights.pt`;
+this retains the actor while resetting the critic, exploration noise, and
+iteration counter.
+
 [train_high_level.bash](train_high_level.bash) provides the same workflow with
 the local paths used during development.
+
+The coordinator samples walk/dribble/shoot from a true categorical
+distribution and samples only the three command values from a Gaussian. Its
+categorical entropy coefficient anneals from `0.002` to `0.0002` over the first
+4,000 PPO iterations. Opponent-pool state is saved as
+`opponent_pool_<iteration>.pt` beside the ordinary policy checkpoints.
 
 ## 4. Validate the high-level policy
 
@@ -184,7 +206,23 @@ python scripts/play_high_level.py \
 
 Videos, plots, and CSV metrics are saved under `outputs/` by default. See
 [validate_high_level.bash](validate_high_level.bash) for a local launcher
-example.
+example. It uses a fixed seed by default.
+
+Do not select a checkpoint from training return alone. Run the fixed-seed,
+fixed-opponent benchmark to rank every complete numbered checkpoint against
+the same early, middle, and final opponent actors:
+
+```bash
+./benchmark_high_level.bash \
+  --policy-dir /path/to/high-level/checkpoint-directory \
+  --candidate-checkpoints auto \
+  --opponent-checkpoints auto \
+  --seeds 0,1,2
+```
+
+The complete matrix is written to `outputs/high_level_benchmark/evaluations.csv`,
+with the aggregate ranking and chosen checkpoint in
+`checkpoint_ranking.csv` and `best_checkpoint.json`.
 
 ## 5. Collect joint world-model data
 
@@ -231,6 +269,30 @@ python scripts/train_world_model.py \
 
 The same defaults are available through [train_world_model.bash](train_world_model.bash).
 
+For the complete dynamics/value workflow, use the single resumable launcher:
+
+```bash
+./train_world_model_pipeline.bash all --wandb-mode offline
+```
+
+It bootstraps the world model, trains an initial value model, collects MPC
+expansion data and fine-tunes dynamics, then retrains terminal value on both
+realized and MPC-imagined terminal states. Individual stages can be rerun with
+`world_model`, `terminal_bootstrap`, `iterative`, `terminal_final`, or
+`validate`. Completed stages are skipped unless `--force` is passed.
+
+After changing the environment, collect and train under a fresh run name so
+the old dataset and normalizer cannot be reused accidentally:
+
+```bash
+./collect.bash initial env_v2
+./train_world_model_pipeline.bash all --run env_v2 --wandb-mode offline
+```
+
+This recollection is required for changes to dynamics, state/action schemas,
+rewards, control timing, field geometry, robot count, or opponent behavior. It
+is unnecessary for rendering-only changes.
+
 Evaluate the trained ensemble on a held-out split:
 
 ```bash
@@ -242,17 +304,23 @@ python scripts/evaluate_world_model.py \
   --device cuda:0
 ```
 
-Visualize receding-horizon MPC against the frozen high-level opponent with
+Visualize receding-horizon MPC against the slow walk-to-ball opponent with
 `./mpc_visualize.bash`. Each episode directory includes the video, one-step
 prediction plots, `mpc_diagnostics.png`, and `diagnostics.json` containing
-fallback/action-modification rates plus rollout error at horizons 1 through H.
+action-modification rates plus rollout error at horizons 1 through H.
+
+The terminal-value contribution is deliberately conservative (`0.05`) and is
+soft-gated by ensemble disagreement. Run the pipeline's `validate` stage after
+training to check value ranking. On a CUDA-enabled host, set
+`RUN_CANDIDATE_RANKING=1` to additionally require counterfactual simulator
+candidate ranking before increasing that coefficient.
 
 ## 7. Train with privileged MPC teacher guidance
 
 After training the joint world model, MPC can guide self-play PPO. The student
 policy still receives decentralized observations. MPC alone sees the joint
-state, plans learning-team actions against the frozen opponent-policy forecast,
-and supplies a dense action-agreement reward.
+state, plans learning-team actions against the same slow walk-to-ball opponent
+requested from the simulator, and supplies a dense action-agreement reward.
 
 ```bash
 python scripts/train_high_level_with_mpc_teacher.py \

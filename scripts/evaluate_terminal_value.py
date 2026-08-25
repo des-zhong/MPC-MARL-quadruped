@@ -29,7 +29,21 @@ def main(args):
         targets.append(batch["return_to_go"])
     prediction, target = torch.cat(predictions), torch.cat(targets)
     metrics = value_metrics(prediction, target)
-    (output / "metrics.json").write_text(json.dumps(metrics, indent=2, sort_keys=True))
+    checks = {
+        "minimum_spearman": metrics["spearman"] >= args.minimum_spearman,
+        "minimum_pairwise_accuracy": (
+            metrics["pairwise_accuracy"] >= args.minimum_pairwise_accuracy
+        ),
+        "maximum_rmse": metrics["rmse"] <= args.maximum_rmse,
+    }
+    result = {
+        **metrics,
+        "acceptance": {"passed": all(checks.values()), "checks": checks},
+        "checkpoint": str(Path(args.checkpoint).resolve()),
+        "dataset": str(Path(args.dataset).resolve()),
+        "split": args.split,
+    }
+    (output / "metrics.json").write_text(json.dumps(result, indent=2, sort_keys=True))
     np.savez_compressed(output / "predictions.npz", prediction=prediction.numpy(), target=target.numpy())
     try:
         import matplotlib
@@ -47,15 +61,21 @@ def main(args):
         fig.tight_layout(); fig.savefig(output / "calibration.png", dpi=160); plt.close(fig)
     except ImportError:
         pass
-    print(json.dumps(metrics, indent=2, sort_keys=True))
+    print(json.dumps(result, indent=2, sort_keys=True))
+    if args.fail_on_threshold and not result["acceptance"]["passed"]:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", default="checkpoints/terminal_value/best.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/terminal_value_mpc/best.pt")
     parser.add_argument("--dataset", default="data/terminal_value")
     parser.add_argument("--split", default="test")
     parser.add_argument("--output", default="outputs/terminal_value_evaluation")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch-size", type=int, default=2048)
+    parser.add_argument("--minimum-spearman", type=float, default=0.65)
+    parser.add_argument("--minimum-pairwise-accuracy", type=float, default=0.65)
+    parser.add_argument("--maximum-rmse", type=float, default=2.5)
+    parser.add_argument("--fail-on-threshold", action="store_true")
     main(parser.parse_args())

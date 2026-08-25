@@ -33,6 +33,35 @@ def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
     temporary.replace(path)
 
 
+def _collection_is_complete(
+    root: Path, iteration: int, expected_episodes: int
+) -> bool:
+    """Recognize finalized collection so interrupted orchestration can resume."""
+
+    teacher = root / f"teacher_iteration_{iteration:03d}"
+    expansion = root / "world_model" / f"mpc_iteration_{iteration:03d}"
+    required = (
+        teacher / "collection_summary.json",
+        teacher / "manifest.json",
+        expansion / "manifest.json",
+        expansion / "train_manifest.json",
+        expansion / "validation_manifest.json",
+        expansion / "iteration_manifest.json",
+    )
+    if all(path.is_file() for path in required):
+        summary = json.loads(required[0].read_text())
+        return int(summary.get("episodes", -1)) == int(expected_episodes)
+    if any(path.exists() for path in (teacher, expansion)):
+        present = [str(path) for path in required if path.exists()]
+        missing = [str(path) for path in required if not path.exists()]
+        raise RuntimeError(
+            f"Iteration {iteration:03d} contains incomplete collection output. "
+            f"Present: {present}; missing: {missing}. Move the partial iteration "
+            "directories aside before retrying."
+        )
+    return False
+
+
 def build_collection_command(
     config: Mapping[str, object],
     iteration: int,
@@ -191,8 +220,11 @@ def finetune_and_gate(
 def run_iterative_pipeline(
     config_path: Union[str, Path],
     dry_run: bool = False,
+    overrides: Optional[Mapping[str, object]] = None,
 ) -> Dict[str, object]:
     config = load_config(config_path)
+    if overrides:
+        config = deep_update(config, overrides)
     required = (
         "mpc_config",
         "initial_world_model_checkpoint",
@@ -207,16 +239,30 @@ def run_iterative_pipeline(
     root.mkdir(parents=True, exist_ok=True)
     pointer_path = root / "active_checkpoint.json"
     if pointer_path.exists():
-        active_checkpoint = Path(
-            json.loads(pointer_path.read_text())["active_checkpoint"]
-        )
+        pointer = json.loads(pointer_path.read_text())
+        active_checkpoint = Path(pointer["active_checkpoint"])
+        start_iteration = int(pointer["iteration"]) + 1
     else:
         active_checkpoint = Path(config["initial_world_model_checkpoint"])
+        start_iteration = 0
     iteration_count = int(config["iterative_training"]["num_iterations"])
-    expansion_roots: List[Path] = []
+    completed_summary = root / "iterative_summary.json"
+    if not dry_run and start_iteration >= iteration_count and completed_summary.exists():
+        return json.loads(completed_summary.read_text())
+    expansion_roots: List[Path] = [
+        root / "world_model" / f"mpc_iteration_{iteration:03d}"
+        for iteration in range(start_iteration)
+    ]
     decisions = []
+    for iteration in range(start_iteration):
+        decision_path = (
+            root / "checkpoints" / f"world_model_iteration_{iteration:03d}"
+            / "acceptance_decision.json"
+        )
+        if decision_path.exists():
+            decisions.append(json.loads(decision_path.read_text()))
     commands = []
-    for iteration in range(iteration_count):
+    for iteration in range(start_iteration, iteration_count):
         command = build_collection_command(
             config, iteration, active_checkpoint, root
         )
@@ -227,7 +273,12 @@ def run_iterative_pipeline(
         expansion_roots.append(expansion_root)
         if dry_run:
             continue
-        subprocess.run(command, check=True)
+        if not _collection_is_complete(
+            root,
+            iteration,
+            int(config["iterative_training"]["episodes_per_iteration"]),
+        ):
+            subprocess.run(command, check=True)
         candidate_output = (
             root / "checkpoints" / f"world_model_iteration_{iteration:03d}"
         )
@@ -254,5 +305,8 @@ def run_iterative_pipeline(
         "decisions": decisions,
         "active_checkpoint": str(active_checkpoint),
     }
-    _atomic_json(root / "iterative_summary.json", summary)
+    summary_name = (
+        "iterative_dry_run_summary.json" if dry_run else "iterative_summary.json"
+    )
+    _atomic_json(root / summary_name, summary)
     return summary

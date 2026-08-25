@@ -68,7 +68,7 @@ The report checks finiteness, constant features, duplicates, skill imbalance, mi
 
 Statistics are fit only on the training manifest. Continuous state inputs, dynamic deltas, and optionally rewards are standardized with standard deviations clamped to `1e-6`. Binary flags, categorical IDs/one-hot values, masks, and already normalized skill commands remain untouched.
 
-Each independently initialized member has a learned skill embedding, masked parameter encoder, DeepSets obstacle encoder, residual SiLU MLP, Gaussian state-delta and reward heads, and separate binary, termination, truncation, and event logits. Continuous heads use Gaussian NLL; classification heads use BCE. Feature-group weighting gives ball position/velocity higher default weight. The rare portion of each training epoch samples event types uniformly before sampling transitions, preventing frequent failure/proximity labels from drowning out goals, passes, boundaries, or collisions. Members receive independent bootstrap minibatch resamples.
+Each independently initialized member has a learned skill embedding, masked parameter encoder, DeepSets obstacle encoder, residual SiLU MLP, Gaussian state-delta and reward heads, and separate binary, termination, truncation, and event logits. State deltas use Gaussian NLL. The normalized reward mean uses direct MSE because MPC consumes that mean; reward variance is calibrated separately against detached residuals so high predicted variance cannot hide a bad reward prediction. Classification heads use BCE. Feature-group weighting gives ball position/velocity higher default weight. The rare portion of each training epoch samples event types uniformly before sampling transitions, preventing frequent failure/proximity labels from drowning out goals, passes, boundaries, or collisions. Members receive independent bootstrap minibatch resamples.
 
 Scheduled multi-step training starts from real contiguous sequences, never treats imagined transitions as ground truth, stops loss after real terminal transitions, discounts later errors, and linearly schedules teacher forcing. Set `multi_step_loss_weight: 0` to disable it.
 
@@ -108,27 +108,24 @@ python3 scripts/validate_world_model_in_env.py \
 
 Offline evaluation reports state/feature-group/reward errors, NLL, termination and event classification, uncertainty/error correlation, and contiguous rollouts at horizons 1, 3, 5, 10, and 20. It saves metrics plus an error-versus-horizon plot when Matplotlib is installed. Environment validation executes the same random valid open-loop actions in the simulator and model; this is evaluation, not MPC.
 
-## Loading and future MPC use
+## Loading and reward-only MPC use
 
 ```python
 import torch
 from dribblebot.world_model.trainer import load_checkpoint
 
 model, checkpoint = load_checkpoint("checkpoints/world_model_as2/best.pt", "cuda")
-result = model.rollout(
+rollout = model.rollout(
     initial_states,       # [batch, state_dim]
     candidate_actions,   # [batch, candidates, horizon, 8]
     deterministic=True,
+    stop_on_done=False,
 )
-scores = model.evaluate_action_sequences(
-    initial_states,
-    candidate_actions,
-    gamma=0.99,
-    uncertainty_penalty=0.1,
-)
+scores = rollout["predicted_rewards"].sum(dim=-1)
+best_candidate = scores.argmax(dim=1)
 ```
 
-Candidates are flattened into the batch dimension, so there is no Python loop over candidates; only horizon is looped. Results include `[B,C,H+1,D]` states, rewards, done probabilities, event probabilities, and separate state/reward uncertainty. Epistemic variance is disagreement of member means; aleatoric variance is the mean predicted member variance. The model never folds uncertainty into reward; `evaluate_action_sequences` applies an optional external penalty.
+Candidates are flattened into the batch dimension, so there is no Python loop over candidates; only horizon is looped. Results include `[B,C,H+1,D]` states, rewards, done probabilities, event probabilities, and separate state/reward uncertainty. Epistemic variance is disagreement of member means; aleatoric variance is the mean predicted member variance. The MPC records uncertainty for diagnostics but ranks candidates only by predicted reward return.
 
 ## Known limitations
 

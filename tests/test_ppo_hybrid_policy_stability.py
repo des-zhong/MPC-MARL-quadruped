@@ -5,9 +5,10 @@ import math
 import torch
 
 from dribblebot_learn.ppo_cse.ppo import (
-    categorical_skill_entropy,
     gaussian_kl_mean,
+    hybrid_policy_kl_mean,
 )
+from dribblebot_learn.ppo_cse.actor_critic import HybridSkillDistribution
 
 
 def test_gaussian_kl_is_zero_for_identical_policies_and_never_negative():
@@ -21,27 +22,57 @@ def test_gaussian_kl_is_zero_for_identical_policies_and_never_negative():
     assert float(shifted) > 0.0
 
 
-def test_skill_entropy_detects_argmax_collapse_for_each_robot():
-    uniform_logits = torch.zeros(4, 12)
-    collapsed_logits = uniform_logits.clone()
-    collapsed_logits[:, 0] = 10.0
-    collapsed_logits[:, 6] = 10.0
+def test_true_categorical_skill_entropy_detects_collapse():
+    uniform = torch.zeros(4, 6)
+    collapsed = uniform.clone()
+    collapsed[:, 0] = 10.0
+    std = torch.full((6,), 0.2)
 
-    uniform_entropy = categorical_skill_entropy(uniform_logits)
-    collapsed_entropy = categorical_skill_entropy(collapsed_logits)
+    uniform_entropy = HybridSkillDistribution(uniform, std).skill_entropy.mean()
+    collapsed_entropy = HybridSkillDistribution(collapsed, std).skill_entropy.mean()
 
     assert torch.isclose(uniform_entropy, torch.tensor(math.log(3.0)))
     assert float(collapsed_entropy) < 0.01
     assert float(uniform_entropy) > float(collapsed_entropy)
 
 
-def test_skill_entropy_accounts_for_gaussian_exploration_scale():
-    means = torch.tensor([[0.4, 0.0, 0.0, 0.0, 0.0, 0.0]])
-    low_std = torch.full_like(means, 0.1)
-    high_std = torch.full_like(means, 1.0)
+def test_categorical_skill_entropy_is_independent_of_command_noise():
+    parameters = torch.tensor([[0.4, 0.0, 0.0, 0.0, 0.0, 0.0]])
+    low_std = torch.full_like(parameters, 0.1)
+    high_std = torch.full_like(parameters, 1.0)
 
-    low_noise_entropy = categorical_skill_entropy(means, action_std=low_std)
-    high_noise_entropy = categorical_skill_entropy(means, action_std=high_std)
+    low_noise_entropy = HybridSkillDistribution(
+        parameters, low_std
+    ).skill_entropy.mean()
+    high_noise_entropy = HybridSkillDistribution(
+        parameters, high_std
+    ).skill_entropy.mean()
 
-    assert float(low_noise_entropy) < 0.2
-    assert float(high_noise_entropy) > 1.0
+    torch.testing.assert_close(low_noise_entropy, high_noise_entropy)
+
+
+def test_hybrid_distribution_samples_one_hot_skill_and_exact_log_prob():
+    parameters = torch.tensor([[1.5, 0.0, -0.5, 0.2, -0.1, 0.4]])
+    distribution = HybridSkillDistribution(parameters, torch.full((6,), 0.2))
+
+    actions = distribution.sample()
+
+    assert actions.shape == parameters.shape
+    torch.testing.assert_close(actions[:, :3].sum(dim=-1), torch.ones(1))
+    assert torch.all((actions[:, :3] == 0.0) | (actions[:, :3] == 1.0))
+    assert distribution.log_prob(actions).shape == (1,)
+
+
+def test_hybrid_kl_includes_categorical_and_continuous_changes():
+    old = torch.zeros(2, 6)
+    std = torch.full_like(old, 0.2)
+
+    identical = hybrid_policy_kl_mean(old, std, old, std)
+    changed_skill = old.clone()
+    changed_skill[:, 0] = 1.0
+    changed_command = old.clone()
+    changed_command[:, 3] = 0.25
+
+    assert float(identical) == 0.0
+    assert float(hybrid_policy_kl_mean(old, std, changed_skill, std)) > 0.0
+    assert float(hybrid_policy_kl_mean(old, std, changed_command, std)) > 0.0

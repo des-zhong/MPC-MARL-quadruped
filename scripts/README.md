@@ -70,7 +70,7 @@ global state and joint hybrid action for all robots. `--num-robots` is the
 number of robots per team:
 
 ```bash
-./collect.bash --num-robots 2 --num-episodes 20000
+./collect.bash initial as2 --episodes 20000
 python scripts/train_world_model.py \
   --dataset data/world_model_as2 \
   --output checkpoints/world_model_as2 \
@@ -84,8 +84,45 @@ After training that model, start self-play PPO with privileged MPC guidance:
   --world-model-checkpoint checkpoints/world_model_as2/best.pt
 ```
 
-The student and frozen opponent keep their decentralized shared-policy
-observations. MPC sees the joint world-model state, optimizes only the learning
-team, holds the frozen opponent's current policy action over its horizon, and
-adds a dense per-agent action-agreement reward. MPC is used only during
-training and is not required when evaluating the learned policy.
+The student keeps its decentralized shared-policy observations. The opponent
+uses a deterministic slow walk-to-ball action in both the MPC forecast and the
+simulator request. MPC sees the joint world-model state, optimizes only the learning
+team, and adds a dense per-agent action-agreement reward. Candidate plans
+combine the analytical short-horizon reward with a conservatively weighted
+terminal value; world-model and value uncertainty are used as risk gates. MPC
+is used only during training and is not required when evaluating the learned
+policy.
+### MPC reward-ranking and terminal-value evaluation
+
+`scripts/evaluate_mpc_candidate_ranking.py` evaluates candidate ordering, not
+just scalar reward RMSE. It disables initialization/domain randomization,
+branches sampled CEM sequences across identical vector environments, and
+reports Pearson/Spearman correlation, pairwise accuracy, top-k overlap, and
+selection regret for the learned reward, analytical reconstruction, and full
+objective.
+
+The default MPC configs reconstruct the known high-level reward from imagined
+state transitions/events, apply geometric skill fallback inside every imagined
+step, reject state uncertainty above the measured maximum deployment threshold,
+and load the consolidated pipeline's `checkpoints/terminal_value_mpc/best.pt`
+for terminal continuation value. The value ensemble is trained on both real
+and MPC-imagined terminal states; use `--fail-on-threshold` for ranking gates.
+
+### World-model collection modes
+
+Use a new run name whenever environment dynamics, observations, actions,
+rewards, timing, field geometry, robot count, or opponent behavior changes:
+
+```bash
+./collect.bash initial env_v2
+./train_world_model_pipeline.bash all --run env_v2
+```
+
+The first command writes `data/world_model_env_v2`. It refuses to reuse an
+existing directory, preventing old and new environment transitions from being
+mixed. Rendering-only changes do not require recollection.
+
+The training pipeline automatically performs MPC collection. For a manual MPC
+collection, use `./collect.bash mpc env_v2`; optional controls are limited to
+`--episodes`, `--num-envs`, `--iteration`, and `--device`. Lower-level Python
+scripts remain available for experiments that need detailed overrides.

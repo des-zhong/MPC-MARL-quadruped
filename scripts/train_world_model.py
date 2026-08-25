@@ -76,6 +76,8 @@ def _wandb_epoch_logger(wandb):
 
 def main(args) -> None:
     config = load_config(args.config)
+    if args.device is not None:
+        config["training"]["device"] = args.device
     if args.num_robots is not None:
         if int(args.num_robots) < 1:
             raise ValueError("--num-robots must be at least 1")
@@ -166,6 +168,7 @@ def parse_args():
     parser.add_argument("--dataset", default="data/world_model_as2")
     parser.add_argument("--output", default="checkpoints/world_model_as2")
     parser.add_argument("--resume", default=None)
+    parser.add_argument("--device", default=None)
     parser.add_argument(
         "--num-robots", type=int, default=None,
         help="Robots per team; the dataset contains twice this many robot actors.",

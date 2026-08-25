@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -112,3 +113,9 @@ def parse_args():
 
 if __name__ == "__main__":
     main(parse_args())
+    # Isaac Gym can segfault in native static destructors after env.close(). At
+    # this point all manifests, summaries, and stdout are complete, so bypass
+    # only interpreter teardown and report successful collection to callers.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

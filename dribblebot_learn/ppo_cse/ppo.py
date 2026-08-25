@@ -25,40 +25,60 @@ def gaussian_kl_mean(old_mu, old_sigma, new_mu, new_sigma):
     return per_dimension.sum(dim=-1).mean().clamp_min(0.0)
 
 
-def categorical_skill_entropy(
-    action_mean,
+def hybrid_policy_kl_mean(
+    old_parameters,
+    old_std,
+    new_parameters,
+    new_std,
     action_stride=6,
     num_skill_logits=3,
-    action_std=None,
 ):
-    """Approximate entropy of argmax skills from Gaussian action coordinates.
-
-    Skill choice is made by taking an argmax after Gaussian sampling.  Raw
-    means are therefore not calibrated logits: the same mean gap is exploratory
-    at a large standard deviation and effectively deterministic at a small
-    one.  Scaling by the sampling standard deviation makes this regularizer
-    detect the collapse that actually reaches the environment.
-    """
+    """Exact KL for categorical skill choices and Gaussian commands."""
 
     if action_stride <= 0 or num_skill_logits <= 1 or num_skill_logits > action_stride:
         raise ValueError("Invalid skill-action layout")
-    if action_mean.shape[-1] % action_stride != 0:
+    if old_parameters.shape != new_parameters.shape:
+        raise ValueError("Old and new hybrid policy parameters must have the same shape")
+    if old_parameters.shape[-1] % action_stride != 0:
         raise ValueError(
-            f"Action width {action_mean.shape[-1]} is not divisible by stride {action_stride}"
+            f"Action width {old_parameters.shape[-1]} is not divisible by stride {action_stride}"
         )
-    logits = action_mean.reshape(*action_mean.shape[:-1], -1, action_stride)[
-        ..., :num_skill_logits
-    ]
-    if action_std is not None:
-        if action_std.shape != action_mean.shape:
-            action_std = torch.broadcast_to(action_std, action_mean.shape)
-        skill_std = action_std.reshape(
-            *action_std.shape[:-1], -1, action_stride
-        )[..., :num_skill_logits]
-        logits = logits / skill_std.clamp_min(1e-6)
-    probabilities = torch.softmax(logits, dim=-1)
-    log_probabilities = torch.log_softmax(logits, dim=-1)
-    return -(probabilities * log_probabilities).sum(dim=-1).mean()
+    old_grouped = old_parameters.reshape(
+        *old_parameters.shape[:-1], -1, action_stride
+    )
+    new_grouped = new_parameters.reshape_as(old_grouped)
+    old_log_probs = torch.log_softmax(old_grouped[..., :num_skill_logits], dim=-1)
+    new_log_probs = torch.log_softmax(new_grouped[..., :num_skill_logits], dim=-1)
+    old_probs = torch.exp(old_log_probs)
+    categorical_kl = (
+        old_probs * (old_log_probs - new_log_probs)
+    ).sum(dim=-1).sum(dim=-1)
+
+    old_std_grouped = torch.broadcast_to(old_std, old_parameters.shape).reshape_as(
+        old_grouped
+    )
+    new_std_grouped = torch.broadcast_to(new_std, new_parameters.shape).reshape_as(
+        new_grouped
+    )
+    old_command_mean = old_grouped[..., num_skill_logits:].reshape(
+        *old_parameters.shape[:-1], -1
+    )
+    new_command_mean = new_grouped[..., num_skill_logits:].reshape_as(
+        old_command_mean
+    )
+    old_command_std = old_std_grouped[..., num_skill_logits:].reshape_as(
+        old_command_mean
+    )
+    new_command_std = new_std_grouped[..., num_skill_logits:].reshape_as(
+        old_command_mean
+    )
+    command_kl = gaussian_kl_mean(
+        old_command_mean,
+        old_command_std,
+        new_command_mean,
+        new_command_std,
+    )
+    return (categorical_kl.mean() + command_kl).clamp_min(0.0)
 
 
 class PPO_Args(PrefixProto):
@@ -201,12 +221,22 @@ class PPO:
             # KL
             if PPO_Args.desired_kl is not None:
                 with torch.inference_mode():
-                    kl_mean = gaussian_kl_mean(
-                        old_mu_batch,
-                        old_sigma_batch,
-                        mu_batch,
-                        sigma_batch,
-                    )
+                    if self.actor_critic.hybrid_skill_policy:
+                        kl_mean = hybrid_policy_kl_mean(
+                            old_mu_batch,
+                            old_sigma_batch,
+                            mu_batch,
+                            sigma_batch,
+                            PPO_Args.skill_action_stride,
+                            PPO_Args.num_skill_logits,
+                        )
+                    else:
+                        kl_mean = gaussian_kl_mean(
+                            old_mu_batch,
+                            old_sigma_batch,
+                            mu_batch,
+                            sigma_batch,
+                        )
                     self.last_kl_mean = kl_mean.item()
 
                     if PPO_Args.schedule == 'adaptive':
@@ -248,19 +278,21 @@ class PPO:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
             skill_entropy = torch.zeros((), device=mu_batch.device)
-            if PPO_Args.skill_entropy_coef > 0.0:
-                skill_entropy = categorical_skill_entropy(
-                    mu_batch,
-                    PPO_Args.skill_action_stride,
-                    PPO_Args.num_skill_logits,
-                    sigma_batch,
-                )
+            if self.actor_critic.hybrid_skill_policy:
+                skill_entropy = self.actor_critic.skill_entropy.mean()
                 self.last_skill_entropy = skill_entropy.detach().item()
+                entropy_bonus = (
+                    PPO_Args.entropy_coef
+                    * self.actor_critic.continuous_entropy.mean()
+                    + PPO_Args.skill_entropy_coef * skill_entropy
+                )
+            else:
+                self.last_skill_entropy = 0.0
+                entropy_bonus = PPO_Args.entropy_coef * entropy_batch.mean()
             loss = (
                 surrogate_loss
                 + PPO_Args.value_loss_coef * value_loss
-                - PPO_Args.entropy_coef * entropy_batch.mean()
-                - PPO_Args.skill_entropy_coef * skill_entropy
+                - entropy_bonus
             )
 
             # Gradient step

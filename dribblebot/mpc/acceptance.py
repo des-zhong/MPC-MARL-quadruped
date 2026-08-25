@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Dict, Mapping
+from typing import Dict, Mapping, Optional
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+
+from dribblebot.world_model.metrics import reward_ranking_metrics
 
 
 @dataclass
@@ -20,6 +22,9 @@ class ModelAcceptanceConfig:
     minimum_uncertainty_ratio: float = 0.10
     maximum_uncertainty_ratio: float = 10.0
     require_finite_horizon_20_rollout: bool = True
+    minimum_recent_reward_spearman: Optional[float] = None
+    minimum_recent_reward_pairwise_accuracy: Optional[float] = None
+    max_reward_ranking_degradation_fraction: float = 0.05
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, object]):
@@ -30,6 +35,13 @@ class ModelAcceptanceConfig:
         for name, value in asdict(result).items():
             if isinstance(value, float) and value < 0:
                 raise ValueError(f"model_acceptance.{name} cannot be negative")
+        for name in (
+            "minimum_recent_reward_spearman",
+            "minimum_recent_reward_pairwise_accuracy",
+        ):
+            value = getattr(result, name)
+            if value is not None and not -1.0 <= float(value) <= 1.0:
+                raise ValueError(f"model_acceptance.{name} must lie in [-1, 1]")
         return result
 
 
@@ -82,6 +94,22 @@ class ModelAcceptanceGate:
                 else True
             ),
         }
+        if self.config.minimum_recent_reward_spearman is not None:
+            checks["recent_reward_spearman"] = (
+                new_recent["rollout_reward_spearman"]
+                >= self.config.minimum_recent_reward_spearman
+                and new_recent["rollout_reward_spearman"]
+                >= old_recent["rollout_reward_spearman"]
+                - self.config.max_reward_ranking_degradation_fraction
+            )
+        if self.config.minimum_recent_reward_pairwise_accuracy is not None:
+            checks["recent_reward_pairwise_accuracy"] = (
+                new_recent["rollout_reward_pairwise_accuracy"]
+                >= self.config.minimum_recent_reward_pairwise_accuracy
+                and new_recent["rollout_reward_pairwise_accuracy"]
+                >= old_recent["rollout_reward_pairwise_accuracy"]
+                - self.config.max_reward_ranking_degradation_fraction
+            )
         old_uncertainty = max(old_original["mean_state_uncertainty"], 1.0e-12)
         ratio = new_original["mean_state_uncertainty"] / old_uncertainty
         checks["uncertainty_not_collapsed"] = (
@@ -115,6 +143,8 @@ def evaluate_model_for_acceptance(
     batch_size: int = 2048,
     rollout_horizon: int = 20,
     max_sequences: int = 256,
+    ranking_horizon: int = 2,
+    ranking_max_sequences: int = 1024,
 ) -> Dict[str, float]:
     model.eval()
     dynamic = model.schema.continuous_dynamic_indices
@@ -169,6 +199,27 @@ def evaluate_model_for_acceptance(
         target = sequence["next_state"].float().to(device)[:, ball]
         finite &= bool(torch.isfinite(prediction).all().item())
         ball_errors.append(float((prediction - target).square().mean().sqrt()))
+    ranking_available = dataset.sequences(ranking_horizon)
+    predicted_returns, actual_returns = [], []
+    for episode_index, start in ranking_available[:ranking_max_sequences]:
+        sequence = dataset.get_sequence(episode_index, start, ranking_horizon)
+        initial = sequence["state"][0:1].float().to(device)
+        actions = sequence["joint_action"][None, None].float().to(device)
+        rollout = model.rollout(initial, actions, deterministic=True)
+        predicted_returns.append(rollout["predicted_rewards"][0, 0].sum().cpu())
+        actual_returns.append(sequence["reward"].float().sum())
+    if predicted_returns:
+        ranking = reward_ranking_metrics(
+            torch.stack(predicted_returns), torch.stack(actual_returns), top_k=10
+        )
+    else:
+        ranking = {"spearman": 0.0, "pairwise_accuracy": 0.5}
+    ranking_spearman = float(ranking["spearman"])
+    ranking_pairwise = float(ranking["pairwise_accuracy"])
+    if not np.isfinite(ranking_spearman):
+        ranking_spearman = 0.0
+    if not np.isfinite(ranking_pairwise):
+        ranking_pairwise = 0.5
     return {
         "normalized_state_rmse": float(np.sqrt(state_sse / max(state_count, 1))),
         "reward_rmse": float(np.sqrt(reward_sse / max(reward_count, 1))),
@@ -180,4 +231,8 @@ def evaluate_model_for_acceptance(
         "finite_horizon_rollout": bool(finite and bool(ball_errors)),
         "rollout_horizon": int(rollout_horizon),
         "rollout_sequence_count": int(len(ball_errors)),
+        "rollout_reward_spearman": ranking_spearman,
+        "rollout_reward_pairwise_accuracy": ranking_pairwise,
+        "ranking_horizon": int(ranking_horizon),
+        "ranking_sequence_count": int(len(predicted_returns)),
     }

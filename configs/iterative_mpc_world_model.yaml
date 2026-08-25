@@ -1,32 +1,32 @@
 seed: 42
-mpc_config: configs/mpc.yaml
-terminal_value_config: configs/terminal_value.yaml
-initial_terminal_value_checkpoint: null
-initial_value_dataset: data/world_model_as2
-mpc_profile: offline_high_quality
+mpc_config: configs/mpc_joint_teams.yaml
+mpc_profile: teacher_training
 initial_world_model_checkpoint: checkpoints/world_model_as2/best.pt
 initial_dataset: data/world_model_as2
-working_root: outputs/iterative_mpc_world_model
+working_root: outputs/iterative_mpc_world_model_finetune
 
 skill_policies:
-  skill_policy_source: wandb
+  skill_policy_source: local
   skill_checkpoint: latest
-  walk_wandb_run: des_zhong/as2_walking/3a6g1def
-  dribble_wandb_run: des_zhong/as2_dribbling/cp9m21ay
-  shoot_wandb_run: des_zhong/as2_shooting/bve3isir
-  device: cuda:0
+  walk_policy_dir: checkpoints/reproduction/walk
+  dribble_policy_dir: checkpoints/reproduction/dribble
+  shoot_policy_dir: checkpoints/reproduction/shoot
+  terminal_value_checkpoint: checkpoints/terminal_value_bootstrap/best.pt
+  terminal_value_coefficient: 0.05
+  num_envs: 16
+  device: cuda:6
   policy_device: cpu
 
 iterative_training:
-  num_iterations: 5
-  episodes_per_iteration: 1000
+  num_iterations: 3
+  episodes_per_iteration: 2000
   warm_start_world_model: true
   max_finetune_epochs: 50
   early_stopping_patience: 10
   preserve_initial_validation_set: true
   create_iteration_validation_set: true
   accept_only_if_improved: true
-  device: cuda
+  device: cuda:6
 
 world_model_update:
   sampling:
@@ -50,8 +50,15 @@ model_acceptance:
   minimum_uncertainty_ratio: 0.10
   maximum_uncertainty_ratio: 10.0
   require_finite_horizon_20_rollout: true
+  # Average RMSE is insufficient for MPC: accepted checkpoints must also order
+  # held-out short action sequences better than chance.
+  minimum_recent_reward_spearman: 0.20
+  minimum_recent_reward_pairwise_accuracy: 0.55
+  max_reward_ranking_degradation_fraction: 0.05
 
 acceptance_evaluation:
   batch_size: 2048
   rollout_horizon: 20
   max_sequences: 256
+  ranking_horizon: 2
+  ranking_max_sequences: 1024

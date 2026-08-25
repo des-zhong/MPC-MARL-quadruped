@@ -13,13 +13,26 @@ value_model:
   learning_rate: 0.0003
   weight_decay: 0.00001
   batch_size: 1024
-  max_epochs: 200
-  early_stopping_patience: 20
+  max_epochs: 800
+  early_stopping_patience: 50
   gradient_clip_norm: 10.0
   num_workers: 0
   mixed_precision: true
   normalize_targets: true
-  ensemble_size: 1
+  # MPC evaluates V on world-model-imagined terminal states. Teacher datasets
+  # therefore add those imagined states with realized continuation targets.
+  include_imagined_terminal_states: true
+  imagined_terminal_sample_weight: 1.0
+  # Optimize ordering as well as scalar calibration; MPC only needs the best
+  # candidate, so validation checkpoint selection is rank-aware.
+  ranking_loss_weight: 0.25
+  ranking_temperature: 1.0
+  ranking_min_return_difference: 0.25
+  selection_spearman_weight: 0.25
+  selection_pairwise_weight: 0.25
+  # Ensemble disagreement is used to gate the value contribution in MPC.
+  ensemble_size: 5
+  ensemble_bootstrap_probability: 0.8
   seed: 42
   device: cuda
   split:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Mapping
+from typing import Dict, Mapping, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -17,6 +17,30 @@ def gaussian_nll(mean: torch.Tensor, log_variance: torch.Tensor, target: torch.T
     return loss.mean()
 
 
+def reward_prediction_loss(
+    mean: torch.Tensor,
+    log_variance: torch.Tensor,
+    target: torch.Tensor,
+    variance_weight: float = 0.1,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Train reward accuracy without allowing variance to hide mean errors.
+
+    A heteroscedastic Gaussian NLL weights the mean gradient by inverse predicted
+    variance.  That is useful for density estimation, but is a poor objective for
+    MPC: the network can assign high variance to rare, high-value transitions and
+    barely train the reward mean that the planner actually consumes.  Regress the
+    normalized mean directly and calibrate variance against a detached residual.
+    """
+
+    mean_squared_error = F.mse_loss(mean, target)
+    residual_log_variance = (target - mean.detach()).square().clamp(min=1e-6).log()
+    variance_calibration = F.smooth_l1_loss(
+        log_variance, residual_log_variance
+    )
+    loss = mean_squared_error + float(variance_weight) * variance_calibration
+    return loss, mean_squared_error, variance_calibration
+
+
 def one_step_member_loss(
     model: WorldModelEnsemble,
     member_index: int,
@@ -25,6 +49,7 @@ def one_step_member_loss(
     reward_weight: float = 1.0,
     termination_weight: float = 1.0,
     event_weight: float = 1.0,
+    reward_variance_weight: float = 0.1,
 ) -> Dict[str, torch.Tensor]:
     member = model.members[member_index]
     states = batch["state"].float()
@@ -35,7 +60,19 @@ def one_step_member_loss(
     delta_target = model.normalizer.normalize_delta_target(next_states[:, dynamic] - states[:, dynamic])
     state_loss = gaussian_nll(outputs["delta_mean"], outputs["delta_log_variance"], delta_target, feature_weights)
     reward_target = model.normalizer.normalize_reward(batch["reward"].float().reshape(-1))
-    reward_loss = gaussian_nll(outputs["reward_mean"], outputs["reward_log_variance"], reward_target)
+    reward_loss, reward_mse, reward_variance_calibration = reward_prediction_loss(
+        outputs["reward_mean"], outputs["reward_log_variance"], reward_target,
+        reward_variance_weight,
+    )
+    # Keep the proper scoring rule as a diagnostic, but do not optimize it: its
+    # inverse-variance mean gradient is exactly what can hide reward errors.
+    reward_nll = gaussian_nll(
+        outputs["reward_mean"], outputs["reward_log_variance"], reward_target
+    )
+    reward_mse_physical = F.mse_loss(
+        model.normalizer.denormalize_reward(outputs["reward_mean"]),
+        batch["reward"].float().reshape(-1),
+    )
     binary_target = next_states[:, model.schema.binary_dynamic_indices]
     binary_loss = F.binary_cross_entropy_with_logits(outputs["binary_logits"], binary_target)
     terminated = batch["terminated"].float().reshape(-1)
@@ -46,7 +83,10 @@ def one_step_member_loss(
     total = state_loss + binary_loss + reward_weight * reward_loss + termination_weight * (termination_loss + truncation_loss) + event_weight * event_loss
     return {
         "loss": total, "state_nll": state_loss, "binary_bce": binary_loss,
-        "reward_nll": reward_loss, "termination_bce": termination_loss,
+        "reward_loss": reward_loss, "reward_mse": reward_mse,
+        "reward_mse_physical": reward_mse_physical,
+        "reward_variance_calibration": reward_variance_calibration,
+        "reward_nll": reward_nll, "termination_bce": termination_loss,
         "truncation_bce": truncation_loss, "event_bce": event_loss,
     }
 

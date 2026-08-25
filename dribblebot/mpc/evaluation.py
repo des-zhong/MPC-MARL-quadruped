@@ -367,10 +367,4 @@ def method_overrides(method: str) -> Optional[Dict[str, object]]:
         return None
     if method == "greedy_h1":
         return {"horizon": 1}
-    if method == "mpc_no_uncertainty":
-        return {
-            "uncertainty_penalty": 0.0,
-            "return_std_penalty": 0.0,
-            "ensemble_objective": "mean",
-        }
     raise ValueError(f"Unknown MPC evaluation method {method!r}")

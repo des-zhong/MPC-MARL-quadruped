@@ -151,9 +151,12 @@ class WorldModelTrainer:
         loss_cfg = self.config.get("loss", {})
         return one_step_member_loss(
             self.model, member_index, batch, self.feature_weights,
-            float(loss_cfg.get("reward_weight", 1.0)),
-            float(loss_cfg.get("termination_weight", 1.0)),
-            float(loss_cfg.get("event_weight", 1.0)),
+            reward_weight=float(loss_cfg.get("reward_weight", 1.0)),
+            termination_weight=float(loss_cfg.get("termination_weight", 1.0)),
+            event_weight=float(loss_cfg.get("event_weight", 1.0)),
+            reward_variance_weight=float(
+                loss_cfg.get("reward_variance_weight", 0.1)
+            ),
         )
 
     def train_epoch(self, epoch: int) -> Dict[str, float]:

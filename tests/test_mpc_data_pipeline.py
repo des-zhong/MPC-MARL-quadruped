@@ -36,7 +36,7 @@ def _teacher_arrays(length=3, episode_id=5):
         "predicted_plan": (2, 8),
         "predicted_plan_states": (3, 4),
         "predicted_plan_rewards": (2,),
-        "mpc_objective_components": (13,),
+        "mpc_objective_components": (1,),
         "state_uncertainty": (2,),
         "reward_uncertainty": (2,),
         "teacher_skill_probabilities": (2, 3),
@@ -129,3 +129,16 @@ def test_model_acceptance_gate_accepts_and_rejects_toy_metrics():
     assert not rejected["accepted"]
     assert "original_validation" in rejected["failed_criteria"]
 
+
+def test_model_acceptance_gate_can_require_reward_ordering():
+    gate = ModelAcceptanceGate(
+        ModelAcceptanceConfig(
+            minimum_recent_reward_spearman=0.2,
+            minimum_recent_reward_pairwise_accuracy=0.55,
+        )
+    )
+    old = _metrics(1.0, 1.0, rollout_reward_spearman=0.4, rollout_reward_pairwise_accuracy=0.6)
+    new = _metrics(1.0, 1.0, rollout_reward_spearman=0.1, rollout_reward_pairwise_accuracy=0.7)
+    result = gate.compare(old, new)
+    assert not result["accepted"]
+    assert "recent_reward_spearman" in result["failed_criteria"]

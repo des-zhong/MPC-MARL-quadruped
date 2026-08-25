@@ -74,6 +74,7 @@ def build_environment(args, config):
         high_level_history=int(config["world_model"].get("history_length", 1)),
         field_length=float(env_config.get("field_length", 8.0)), field_width=float(env_config.get("field_width", 5.0)),
         goal_half_width=float(env_config.get("goal_half_width", 1.0)),
+        boundary_walls=bool(env_config.get("boundary_walls", True)),
         walk_x_speed_scale=args.walk_x_speed_scale, walk_y_speed_scale=args.walk_y_speed_scale,
         walk_yaw_speed_scale=args.walk_yaw_speed_scale, walk_yaw_reward_scale=args.walk_yaw_speed_scale,
         dribble_x_speed_scale=args.dribble_x_speed_scale, dribble_y_speed_scale=args.dribble_y_speed_scale,

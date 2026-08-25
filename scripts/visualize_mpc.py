@@ -100,13 +100,10 @@ def main(args):
                 ),
                 title=(
                     f"episode {completed} step {step} | "
-                    f"R_H {plan.predicted_discounted_reward_return[env_index]:.3f} + "
-                    f"V {plan.terminal_value_contribution[env_index]:.3f} | "
-                    f"objective {plan.best_objective[env_index]:.3f} | "
-                    f"planning {plan.planning_time_seconds:.3f}s | "
-                    f"fallback {bool(plan.fallback_used[env_index])}"
+                    f"predicted return "
+                    f"{plan.predicted_discounted_reward_return[env_index]:.3f} | "
+                    f"planning {plan.planning_time_seconds:.3f}s"
                 ),
-                terminal_value=float(plan.terminal_state_value[env_index]),
                 controlled_robot_count=team_size,
             )
             tactical_rgb = figure_to_rgb(tactical)
@@ -164,7 +161,6 @@ def main(args):
             step_diagnostics.append(
                 {
                     "step": step,
-                    "fallback_used": bool(plan.fallback_used[env_index]),
                     "requested_action_modified": bool(
                         transition.requested_action_modified[env_index]
                     ),
@@ -220,10 +216,19 @@ def main(args):
                     diagnostic_path,
                 )
                 diagnostics_json = episode_dir / "diagnostics.json"
+                reward_error = np.asarray(predicted_rewards) - np.asarray(
+                    actual_rewards
+                )
+                reward_correlation = None
+                if (
+                    len(reward_error) > 1
+                    and np.std(predicted_rewards) > 0
+                    and np.std(actual_rewards) > 0
+                ):
+                    reward_correlation = float(
+                        np.corrcoef(predicted_rewards, actual_rewards)[0, 1]
+                    )
                 diagnostics = {
-                    "fallback_fraction": float(
-                        np.mean([row["fallback_used"] for row in step_diagnostics])
-                    ),
                     "requested_action_modified_fraction": float(
                         np.mean(
                             [
@@ -240,6 +245,12 @@ def main(args):
                             ]
                         )
                     ),
+                    "one_step_reward_prediction": {
+                        "bias": float(np.mean(reward_error)),
+                        "mae": float(np.mean(np.abs(reward_error))),
+                        "rmse": float(np.sqrt(np.mean(np.square(reward_error)))),
+                        "pearson_correlation": reward_correlation,
+                    },
                     "multi_step_prediction_errors": multi_step_errors,
                     "steps": step_diagnostics,
                 }
@@ -261,9 +272,11 @@ def main(args):
                         "skill_and_parameters": str(skill_path),
                         "mpc_diagnostics": str(diagnostic_path),
                         "diagnostics_json": str(diagnostics_json),
-                        "fallback_fraction": diagnostics["fallback_fraction"],
                         "requested_action_modified_fraction": diagnostics[
                             "requested_action_modified_fraction"
+                        ],
+                        "one_step_reward_prediction": diagnostics[
+                            "one_step_reward_prediction"
                         ],
                     }
                 )

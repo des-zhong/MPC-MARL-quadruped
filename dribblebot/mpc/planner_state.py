@@ -12,18 +12,14 @@ import torch
 class MPCPlannerState:
     """Final CEM distribution and execution context from the previous call.
 
-    Tensor shapes are ``skill_probabilities [B,H,2,3]``,
-    ``parameter_means/stds [B,H,2,3,3]``, ``valid [B]``,
-    ``previous_action [B,8]``, and ``previous_state [B,D]``.
+    Tensor shapes are ``skill_probabilities [B,H,N,3]``,
+    ``parameter_means/stds [B,H,N,3,3]``, and ``valid [B]``.
     """
 
     skill_probabilities: torch.Tensor
     parameter_means: torch.Tensor
     parameter_stds: torch.Tensor
     valid: torch.Tensor
-    previous_action: Optional[torch.Tensor] = None
-    previous_state: Optional[torch.Tensor] = None
-    last_plan_uncertainty: Optional[torch.Tensor] = None
 
     def to(self, device: Union[str, torch.device]) -> "MPCPlannerState":
         return MPCPlannerState(
@@ -31,9 +27,6 @@ class MPCPlannerState:
             self.parameter_means.to(device),
             self.parameter_stds.to(device),
             self.valid.to(device),
-            None if self.previous_action is None else self.previous_action.to(device),
-            None if self.previous_state is None else self.previous_state.to(device),
-            None if self.last_plan_uncertainty is None else self.last_plan_uncertainty.to(device),
         )
 
     def detach(self) -> "MPCPlannerState":
@@ -42,9 +35,6 @@ class MPCPlannerState:
             self.parameter_means.detach(),
             self.parameter_stds.detach(),
             self.valid.detach(),
-            None if self.previous_action is None else self.previous_action.detach(),
-            None if self.previous_state is None else self.previous_state.detach(),
-            None if self.last_plan_uncertainty is None else self.last_plan_uncertainty.detach(),
         )
 
     def reset(self, env_ids: Optional[torch.Tensor] = None) -> None:

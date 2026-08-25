@@ -125,25 +125,70 @@ def test_fixed_seed_planning_is_repeatable():
     assert torch.equal(first.final_skill_probabilities, second.final_skill_probabilities)
 
 
-def test_minimum_skill_duration_is_enforced_in_samples():
-    model, state = _model_and_state(1)
-    planner = HybridCEMMPC(
-        model, config=_config(horizon=4, minimum_skill_duration=3)
+def test_planner_returns_action_from_highest_reward_sequence():
+    schema = default_state_schema(max_obstacles=0, num_robots=1)
+    adapter = JointActionAdapter(
+        {
+            index: SkillBounds((-1, -1, -1), (1, 1, 1), (1, 1, 1))
+            for index in range(3)
+        },
+        num_robots=1,
     )
-    probabilities, means, stds = planner._defaults(1, state.dtype, state.device)
-    _, skills, _ = planner._sample(probabilities, means, stds)
-    assert torch.equal(skills[:, :, 0], skills[:, :, 1])
-    assert torch.equal(skills[:, :, 0], skills[:, :, 2])
+
+    class RewardModel:
+        state_adapter = object()
+        event_names = ()
+
+        def __init__(self):
+            self.schema = schema
+            self.action_adapter = adapter
+
+        def rollout(self, states, actions, **kwargs):
+            batch, candidates, horizon = actions.shape[:3]
+            rewards = actions[..., 1]
+            return {
+                "predicted_states": states[:, None, None].expand(
+                    batch, candidates, horizon + 1, -1
+                ).clone(),
+                "predicted_rewards": rewards,
+                "predicted_done_probabilities": torch.zeros_like(rewards),
+                "state_uncertainty": torch.zeros_like(rewards),
+                "reward_uncertainty": torch.zeros_like(rewards),
+            }
+
+    planner = HybridCEMMPC(
+        RewardModel(),
+        config=MPCConfig(
+            horizon=2,
+            num_candidates=4,
+            num_elites=1,
+            num_iterations=1,
+        ),
+    )
+
+    def fixed_samples(probabilities, means, stds):
+        del means, stds
+        values = torch.tensor(
+            [-1.0, 0.0, 0.5, 1.0],
+            dtype=probabilities.dtype,
+            device=probabilities.device,
+        )
+        skills = torch.zeros(1, 4, 2, 1, dtype=torch.long)
+        normalized = torch.zeros(1, 4, 2, 1, 3)
+        normalized[..., 0] = values[None, :, None, None]
+        actions = adapter.pack(
+            skills, adapter.denormalize_parameters(skills, normalized)
+        )
+        return actions, skills, normalized
+
+    planner._sample = fixed_samples
+    result = planner.plan(torch.zeros(1, schema.state_dim))
+
+    assert result.first_joint_action[0, 1] == 1.0
+    assert result.best_objective[0] == 2.0
 
 
-def test_pessimistic_member_rollout_is_available():
-    model, state = _model_and_state(1)
-    config = _config(ensemble_objective="minimum", num_iterations=1)
-    result = HybridCEMMPC(model, config=config).plan(state)
-    assert torch.isfinite(result.best_objective).all()
-
-
-def test_invalid_predictions_trigger_explicit_fallback(monkeypatch):
+def test_invalid_predictions_fail_explicitly(monkeypatch):
     model, state = _model_and_state(1)
 
     def invalid_rollout(initial, actions, **kwargs):
@@ -169,10 +214,31 @@ def test_invalid_predictions_trigger_explicit_fallback(monkeypatch):
             ),
         }
 
-    monkeypatch.setattr(model, "rollout_members", invalid_rollout)
-    result = HybridCEMMPC(model, config=_config(num_iterations=1)).plan(state)
-    skills, parameters = model.action_adapter.unpack(result.first_joint_action)
-    assert result.fallback_used.tolist() == [True]
-    assert skills.tolist() == [[0, 0]]
-    assert torch.all(parameters == 0)
-    assert torch.isfinite(result.predicted_states).all()
+    monkeypatch.setattr(model, "rollout", invalid_rollout)
+    with pytest.raises(RuntimeError, match="finite predicted-reward return"):
+        HybridCEMMPC(model, config=_config(num_iterations=1)).plan(state)
+
+
+def test_all_ood_candidates_use_finite_uncertainty_penalized_fallback(monkeypatch):
+    model, state = _model_and_state(1)
+    original_rollout = model.rollout
+
+    def all_ood_rollout(initial, actions, **kwargs):
+        rollout = original_rollout(initial, actions, **kwargs)
+        rollout["state_uncertainty"] = torch.full_like(
+            rollout["state_uncertainty"], 2.0
+        )
+        return rollout
+
+    monkeypatch.setattr(model, "rollout", all_ood_rollout)
+    result = HybridCEMMPC(
+        model,
+        config=_config(
+            num_iterations=1,
+            max_state_uncertainty=0.5,
+            uncertainty_penalty=0.1,
+        ),
+    ).plan(state)
+
+    assert torch.isfinite(result.best_objective).all()
+    assert result.uncertainty["ood_fallback_used"].tolist() == [True]

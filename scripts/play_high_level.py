@@ -77,6 +77,9 @@ def configure_eval_cfg(args):
     Cfg.env.record_video = not args.no_video
     Cfg.env.randomize_match_init = not args.fixed_init
     Cfg.env.add_field_markers = not args.no_field_markers
+    Cfg.env.add_boundary_walls = bool(
+        getattr(args, "boundary_walls", True)
+    )
     if args.camera_height is not None:
         Cfg.env.high_level_camera_height = args.camera_height
     if args.recording_fov is not None:
@@ -197,6 +200,108 @@ def load_high_level_policy(args):
     )
 
 
+def resolve_opponent_weights_path(args, high_level_policy):
+    """Resolve a frozen self-play opponent checkpoint from a path or suffix."""
+
+    checkpoint = getattr(args, "opponent_high_level_checkpoint", None)
+    if checkpoint is None:
+        return None
+
+    requested = Path(str(checkpoint)).expanduser()
+    if requested.is_file():
+        return requested.resolve()
+
+    suffix = "latest" if str(checkpoint) in ("latest", "last") else str(checkpoint)
+    filename = (
+        suffix
+        if suffix.startswith("opponent_ac_weights_") and suffix.endswith(".pt")
+        else f"opponent_ac_weights_{suffix}.pt"
+    )
+    configured_dir = getattr(args, "opponent_high_level_policy_dir", None)
+    roots = []
+    if configured_dir:
+        roots.append(Path(configured_dir).expanduser().resolve())
+    else:
+        roots.append(Path(high_level_policy["body_path"]).resolve().parent)
+        high_level_dir = getattr(args, "high_level_policy_dir", None)
+        if high_level_dir:
+            roots.append(Path(high_level_dir).expanduser().resolve())
+
+    candidate_dirs = []
+    for root in roots:
+        candidate_dirs.extend(
+            (
+                root,
+                root / "high_level",
+                root / "tmp" / "legged_data" / "high_level",
+                root / "files" / "tmp" / "legged_data" / "high_level",
+            )
+        )
+    for directory in candidate_dirs:
+        candidate = directory / filename
+        if candidate.is_file():
+            return candidate.resolve()
+
+    searched = ", ".join(str(path / filename) for path in candidate_dirs)
+    raise FileNotFoundError(
+        f"Could not find frozen opponent checkpoint {checkpoint!r}. Searched: {searched}"
+    )
+
+
+def load_opponent_high_level_policy(args, high_level_policy):
+    """Load a frozen opponent snapshot, or mirror the learning-side policy."""
+
+    weights_path = resolve_opponent_weights_path(args, high_level_policy)
+    if weights_path is None:
+        return high_level_policy
+
+    device = args.policy_device
+    adaptation_module = torch.jit.load(
+        str(high_level_policy["adaptation_module_path"]), map_location=device
+    ).eval()
+    body = torch.jit.load(str(high_level_policy["body_path"]), map_location=device).eval()
+    try:
+        state_dict = torch.load(weights_path, map_location=device, weights_only=True)
+    except TypeError:
+        state_dict = torch.load(weights_path, map_location=device)
+    if not isinstance(state_dict, dict):
+        raise TypeError(
+            f"Opponent checkpoint must contain a state dictionary, got {type(state_dict).__name__}"
+        )
+
+    adaptation_state = {
+        key[len("adaptation_module.") :]: value
+        for key, value in state_dict.items()
+        if key.startswith("adaptation_module.")
+    }
+    body_state = {
+        key[len("actor_body.") :]: value
+        for key, value in state_dict.items()
+        if key.startswith("actor_body.")
+    }
+    if not adaptation_state or not body_state:
+        raise ValueError(
+            "Opponent checkpoint is missing adaptation_module.* or actor_body.* weights: "
+            f"{weights_path}"
+        )
+    adaptation_module.load_state_dict(adaptation_state, strict=True)
+    body.load_state_dict(body_state, strict=True)
+
+    def policy(obs):
+        obs_history = obs["obs_history"].to(device)
+        latent = adaptation_module(obs_history)
+        return body(torch.cat((obs_history, latent), dim=-1))
+
+    print("opponent high-level:")
+    print(f"  frozen actor-critic weights: {weights_path}")
+    return {
+        **high_level_policy,
+        "policy": policy,
+        "ac_weights_path": weights_path,
+        "source": f"frozen opponent checkpoint {weights_path}",
+    }
+
+
 def make_env(args, skill_policies):
     from dribblebot.envs.as2.two_robot_velocity_tracking import TwoRobotVelocityTrackingEasyEnv
     from dribblebot.envs.wrappers.high_level_skill_wrapper import HighLevelSkillWrapper
@@ -286,6 +391,34 @@ def info_array(info, key, shape, default=0):
     return np.reshape(array, shape)
 
 
+def learning_team_array(info, key, num_robots, default=0.0):
+    """Return a learning-team field aligned with all physical robot slots.
+
+    Self-play exposes some coordinator telemetry for every robot in the match,
+    but ``high_level_local_role_rewards`` is intentionally computed only for
+    the learning team.  Keep the opponent slots at the neutral default when
+    exporting per-robot evaluation rows.
+    """
+    shape = (1, num_robots)
+    value = info.get(key)
+    result = np.full(shape, default, dtype=np.asarray(default).dtype)
+    if value is None:
+        return result
+
+    array = np.asarray(value)
+    if array.ndim == 1:
+        array = array[None, :]
+    if array.ndim != 2:
+        raise ValueError(
+            f"{key} must be a one- or two-dimensional array, got shape {array.shape}"
+        )
+
+    rows = min(result.shape[0], array.shape[0])
+    cols = min(result.shape[1], array.shape[1])
+    result[:rows, :cols] = array[:rows, :cols]
+    return result
+
+
 def collect_state(raw_env):
     roots = raw_env.root_states[raw_env.robot_actor_idxs_all.reshape(-1)].view(
         raw_env.num_envs,
@@ -321,6 +454,21 @@ def row_from_step(step, high_level_dt, state, action, reward, done, info):
     requested = info_array(info, "high_level_requested_skill_ids", (1, num_robots), 0).astype(np.int64)
     executed = info_array(info, "high_level_skill_ids", (1, num_robots), 0).astype(np.int64)
     invalid = info_array(info, "high_level_invalid_skill_mask", (1, num_robots), False).astype(bool)
+    avoidance = info_array(
+        info, "high_level_collision_avoidance_mask", (1, num_robots), False
+    ).astype(bool)
+    attacker = info_array(
+        info, "high_level_attacker_mask", (1, num_robots), False
+    ).astype(bool)
+    role_conflict = info_array(
+        info, "high_level_role_conflict_mask", (1, num_robots), False
+    ).astype(bool)
+    command_assist = info_array(
+        info, "high_level_attacker_command_assist_mask", (1, num_robots), False
+    ).astype(bool)
+    local_role_reward = learning_team_array(
+        info, "high_level_local_role_rewards", num_robots, 0.0
+    ).astype(np.float32)
     commands = info_array(info, "high_level_commands", (1, num_robots, 3), 0.0).astype(np.float32)
     action_np = action.detach().cpu().numpy()
     reward_np = reward.detach().cpu().numpy()
@@ -358,6 +506,15 @@ def row_from_step(step, high_level_dt, state, action, reward, done, info):
         row[f"robot{robot_idx}_executed_skill_id"] = int(executed[0, robot_idx])
         row[f"robot{robot_idx}_executed_skill"] = skill_name(executed[0, robot_idx])
         row[f"robot{robot_idx}_invalid_skill"] = int(invalid[0, robot_idx])
+        row[f"robot{robot_idx}_collision_avoidance"] = int(
+            avoidance[0, robot_idx]
+        )
+        row[f"robot{robot_idx}_attacker"] = int(attacker[0, robot_idx])
+        row[f"robot{robot_idx}_role_conflict"] = int(role_conflict[0, robot_idx])
+        row[f"robot{robot_idx}_command_assist"] = int(command_assist[0, robot_idx])
+        row[f"robot{robot_idx}_local_role_reward"] = float(
+            local_role_reward[0, robot_idx]
+        )
         row[f"robot{robot_idx}_cmd_x"] = float(commands[0, robot_idx, 0])
         row[f"robot{robot_idx}_cmd_y"] = float(commands[0, robot_idx, 1])
         row[f"robot{robot_idx}_cmd_yaw"] = float(commands[0, robot_idx, 2])
@@ -485,6 +642,21 @@ def print_summary(rows):
     invalid_requests = sum(
         row[f"robot{idx}_invalid_skill"] for row in rows for idx in range(num_robots)
     )
+    avoidance_overrides = sum(
+        row[f"robot{idx}_collision_avoidance"]
+        for row in rows
+        for idx in range(num_robots)
+    )
+    role_conflicts = sum(
+        row[f"robot{idx}_role_conflict"]
+        for row in rows
+        for idx in range(num_robots)
+    )
+    command_assists = sum(
+        row[f"robot{idx}_command_assist"]
+        for row in rows
+        for idx in range(num_robots)
+    )
     max_ball_speed = max(row["ball_speed"] for row in rows)
     final_ball_x = rows[-1]["ball_x"]
 
@@ -496,6 +668,8 @@ def print_summary(rows):
         f"obstacles: {obstacle_hits} | accidental: {accidental}"
     )
     print(f"Invalid low-level skill requests: {invalid_requests}")
+    print(f"Predictive collision-avoidance overrides: {avoidance_overrides}")
+    print(f"Role conflicts: {role_conflicts} | attacker command assists: {command_assists}")
     print(f"Final ball x: {final_ball_x:.3f} | max ball speed: {max_ball_speed:.3f}")
 
     for robot_idx in range(num_robots):
@@ -512,10 +686,14 @@ def run(args):
     set_seed(args.seed)
     high_level_policy = load_high_level_policy(args)
     validate_high_level_evaluation_contract(high_level_policy, args)
+    opponent_high_level_policy = load_opponent_high_level_policy(
+        args, high_level_policy
+    )
     skill_policies = load_skill_policies(args)
     env, raw_env = make_env(args, skill_policies)
-    env.set_opponent_callable(high_level_policy["policy"])
+    env.set_opponent_callable(opponent_high_level_policy["policy"])
     validate_high_level_obs_shape(high_level_policy, env)
+    validate_high_level_obs_shape(opponent_high_level_policy, env)
     validate_low_level_skill_shapes(skill_policies, env)
 
     output_video = Path(args.video)
@@ -554,11 +732,13 @@ def run(args):
     metrics_csv = Path(args.csv)
     plot_path = Path(args.plot)
     write_metrics_csv(metrics_csv, rows)
-    save_plot(plot_path, rows, args, args.show_plot)
+    if not args.no_plot:
+        save_plot(plot_path, rows, args, args.show_plot)
 
     if not args.no_video:
         print(f"Saved video: {output_video}")
-    print(f"Saved plot: {plot_path}")
+    if not args.no_plot:
+        print(f"Saved plot: {plot_path}")
     print(f"Saved metrics CSV: {metrics_csv}")
     print_summary(rows)
 
@@ -567,6 +747,23 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Visualize and validate a trained high-level multi-robot policy.")
     add_high_level_policy_source_args(parser)
     parser.add_argument("--high-level-checkpoint", default="latest", help="High-level checkpoint suffix, for example latest or 10000.")
+    parser.add_argument(
+        "--opponent-high-level-checkpoint",
+        default=None,
+        help=(
+            "Frozen opponent checkpoint suffix (for example 12800, resolving "
+            "opponent_ac_weights_12800.pt) or a direct .pt path. If omitted, "
+            "the opponent uses the learning-side high-level policy."
+        ),
+    )
+    parser.add_argument(
+        "--opponent-high-level-policy-dir",
+        default=None,
+        help=(
+            "Directory in which to find opponent_ac_weights_<checkpoint>.pt. "
+            "Defaults to the loaded high-level policy directory."
+        ),
+    )
     parser.add_argument("--skill-checkpoint", default="latest", help="Checkpoint suffix for walk/dribble/shoot low-level skills.")
     parser.add_argument("--walk-wandb-run", default="des_zhong/as2_walking/3a6g1def")
     parser.add_argument("--dribble-wandb-run", default="des_zhong/as2_dribbling/cp9m21ay")
@@ -585,6 +782,13 @@ def parse_args():
     parser.add_argument("--field-length", type=float, default=8.0)
     parser.add_argument("--field-width", type=float, default=5.0)
     parser.add_argument("--goal-half-width", type=float, default=1.0)
+    parser.add_argument(
+        "--no-boundary-walls",
+        dest="boundary_walls",
+        action="store_false",
+        default=True,
+        help="Disable physical rebound walls and restore legacy out-of-bounds termination.",
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--walk-x-speed-scale", type=float, default=1.5)
     parser.add_argument("--walk-y-speed-scale", type=float, default=1.5)
@@ -608,6 +812,13 @@ def parse_args():
         action="store_false",
         help="Execute invalid skill requests directly (out-of-distribution evaluation).",
     )
+    parser.add_argument(
+        "--no-role-aware-fallback",
+        dest="role_aware_fallback",
+        action="store_false",
+        default=True,
+        help="Disable nearest-attacker/support arbitration for a legacy comparison.",
+    )
     parser.add_argument("--near-ball-init-probability", type=float, default=0.6)
     parser.add_argument("--near-ball-init-min-distance", type=float, default=0.4)
     parser.add_argument("--near-ball-init-max-distance", type=float, default=0.95)
@@ -622,6 +833,7 @@ def parse_args():
 
     parser.add_argument("--video", default="outputs/high_level_eval.mp4")
     parser.add_argument("--plot", default="outputs/high_level_eval_metrics.png")
+    parser.add_argument("--no-plot", action="store_true")
     parser.add_argument("--csv", default="outputs/high_level_eval_metrics.csv")
     parser.add_argument("--fps", type=int, default=None)
     parser.add_argument("--frame-stride", type=int, default=1)

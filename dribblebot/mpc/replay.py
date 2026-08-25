@@ -8,6 +8,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, Sampler
 
+from dribblebot.world_model.dataset import REQUIRED_KEYS
+
 
 class MixedWorldModelDataset(Dataset):
     """In-memory episode dataset composed from immutable source datasets."""
@@ -35,7 +37,12 @@ class MixedWorldModelDataset(Dataset):
         episode_index, step = self.index[item]
         episode = self.episodes[episode_index]
         result = {}
-        for key, value in episode.items():
+        # Source datasets may carry additional provenance/diagnostic arrays
+        # (for example ground_truth_source on executed MPC transitions). Keep
+        # those arrays in the immutable episodes, but expose one canonical key
+        # set to DataLoader so mixed samples can always be collated together.
+        for key in REQUIRED_KEYS:
+            value = episode[key]
             selected = value[step]
             if value.dtype.kind in "USO":
                 result[key] = str(selected)
@@ -64,7 +71,8 @@ class MixedWorldModelDataset(Dataset):
         episode = self.episodes[episode_index]
         return {
             key: torch.from_numpy(value[start : start + length])
-            for key, value in episode.items()
+            for key in REQUIRED_KEYS
+            for value in (episode[key],)
             if value.dtype.kind not in "USO"
         }
 

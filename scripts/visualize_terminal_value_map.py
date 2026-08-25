@@ -44,7 +44,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", default="checkpoints/terminal_value/best.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/terminal_value_mpc/best.pt")
     parser.add_argument("--dataset", default="data/terminal_value")
     parser.add_argument("--split", default="test")
     parser.add_argument("--sample", type=int, default=0)

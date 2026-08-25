@@ -44,7 +44,7 @@ def main(args):
             runtime.controller.reset()
             initial = runtime.state_adapter.extract_state(runtime.env)["tensor"]
             # Route through the controller so joint-team plans optimize only
-            # the learning team and keep the frozen opponent forecast fixed.
+            # the learning team and keep the simple opponent forecast fixed.
             plan = runtime.controller.act(initial)
             actual_states = [initial.detach().cpu()]
             real_rewards = []
@@ -81,6 +81,47 @@ def main(args):
             actual = torch.stack(actual_states, dim=1)
             valid = torch.stack(valid_steps, dim=1)
             predicted = plan.predicted_states.detach().cpu()
+            predicted_rewards = plan.predicted_rewards.detach().cpu()
+            actual_reward_tensor = torch.stack(real_rewards, 1)
+            discount = torch.pow(
+                torch.as_tensor(runtime.mpc_config.gamma),
+                torch.arange(runtime.mpc_config.horizon),
+            )
+            valid_float = valid.to(predicted_rewards.dtype)
+            predicted_returns = (
+                predicted_rewards * valid_float * discount[None]
+            ).sum(dim=1)
+            actual_returns = (
+                actual_reward_tensor * valid_float * discount[None]
+            ).sum(dim=1)
+            selected_skills, selected_commands = (
+                runtime.model.action_adapter.unpack(plan.best_action_sequence)
+            )
+            controlled_robots = int(
+                runtime.config["environment"].get(
+                    "team_size", runtime.model.action_adapter.num_robots
+                )
+            )
+            if runtime.mpc_config.horizon > 1:
+                skill_switch_rate = float(
+                    (
+                        selected_skills[:, 1:, :controlled_robots]
+                        != selected_skills[:, :-1, :controlled_robots]
+                    )
+                    .float()
+                    .mean()
+                )
+                command_change = float(
+                    torch.linalg.vector_norm(
+                        selected_commands[:, 1:, :controlled_robots]
+                        - selected_commands[:, :-1, :controlled_robots],
+                        dim=-1,
+                    )
+                    .mean()
+                )
+            else:
+                skill_switch_rate = 0.0
+                command_change = 0.0
             state_error = (
                 predicted[:, 1:] - actual[:, 1:]
             ).square().mean(-1)
@@ -116,10 +157,20 @@ def main(args):
                 ),
                 "reward_rmse": float(
                     (
-                        plan.predicted_rewards.detach().cpu()[valid]
-                        - torch.stack(real_rewards, 1)[valid]
+                        predicted_rewards[valid]
+                        - actual_reward_tensor[valid]
                     ).square().mean().sqrt()
                 ),
+                "predicted_return_mean": float(predicted_returns.mean()),
+                "actual_return_mean": float(actual_returns.mean()),
+                "return_optimism_bias": float(
+                    (predicted_returns - actual_returns).mean()
+                ),
+                "return_mae": float(
+                    (predicted_returns - actual_returns).abs().mean()
+                ),
+                "selected_skill_switch_rate": skill_switch_rate,
+                "selected_command_change_mean": command_change,
                 "uncertainty_error_correlation": uncertainty_error_correlation(
                     uncertainty[valid], state_error[valid]
                 ),

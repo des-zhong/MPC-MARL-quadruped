@@ -72,6 +72,11 @@ def configure_high_level_cfg(Cfg, args):
     Cfg.env.field_margin = 0.35
     Cfg.env.team_goal_x = 0.5 * args.field_length
     Cfg.env.team_goal_half_width = args.goal_half_width
+    # Keep the legacy Go1 high-level entry point on the same enclosed-pitch
+    # dynamics as the AS2 coordinator.
+    Cfg.env.add_boundary_walls = bool(
+        getattr(args, "boundary_walls", True)
+    )
     Cfg.env.high_level_camera_height = 1.6 * max(args.field_length, args.field_width)
     Cfg.env.add_field_markers = True
     Cfg.env.field_marker_width = 0.05
@@ -303,6 +308,13 @@ def parse_args():
     parser.add_argument("--field-length", type=float, default=8.0)
     parser.add_argument("--field-width", type=float, default=5.0)
     parser.add_argument("--goal-half-width", type=float, default=1.0)
+    parser.add_argument(
+        "--no-boundary-walls",
+        dest="boundary_walls",
+        action="store_false",
+        default=True,
+        help="Disable physical rebound walls and restore legacy out-of-bounds termination.",
+    )
     parser.add_argument("--walk-x-speed-scale", type=float, default=1.5)
     parser.add_argument("--walk-y-speed-scale", type=float, default=1.5)
     parser.add_argument("--walk-yaw-speed-scale", type=float, default=1.0)

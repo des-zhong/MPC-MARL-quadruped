@@ -22,9 +22,12 @@ HIGH_LEVEL_REWARD_SCALES = {
     "high_level_goal": 500.0,
     "high_level_accidental_termination": -200.0,
     "high_level_ball_goal_progress": 2.0,
-    # Smooth body-clearance cost. At complete base overlap this contributes
-    # -2 reward over a default 10-step high-level interval.
-    "high_level_robot_collision": -10.0,
+    # A teammate that is not the closest attacker should spread and support,
+    # rather than receive the same implicit invitation to converge on the ball.
+    "high_level_robot_spacing": 0.75,
+    # Smooth near-contact cost. Keep this weaker than the offensive shaping:
+    # collision avoidance should not make yielding the ball the easiest policy.
+    "high_level_robot_collision": -2.0,
     "high_level_pass": 2.0,
     "high_level_invalid_skill": -3.0,
     "high_level_approach_ball": 1.0,
@@ -32,10 +35,23 @@ HIGH_LEVEL_REWARD_SCALES = {
     "high_level_face_ball_while_approaching": 0.5,
     "high_level_face_goal_while_moving": 0.75,
     "high_level_dribble_ball_control": 2.0,
+    # Emitted only when the policy transitions into a feasible, goal-directed
+    # shot, so it teaches shot selection without becoming a stationary reward.
+    "high_level_shoot_setup": 5.0,
     # A launch is a short event rather than a reward emitted throughout the
     # control interval, so it needs a larger nominal coefficient than the
     # continuously evaluated approach and dribble terms.
     "high_level_shoot_launch": 10.0,
+}
+
+# These terms are assigned to individual shared-policy samples by
+# SharedPolicySelfPlayWrapper. Keeping them out of the raw team return avoids
+# reinforcing a stationary attacker for work performed by its teammate.
+HIGH_LEVEL_LOCAL_ROLE_REWARD_SCALES = {
+    "attacker_ball_skill": 2.0,
+    "attacker_command_assist": -4.0,
+    "role_conflict": -3.0,
+    "support_ball_crowding": -3.0,
 }
 
 
@@ -93,7 +109,9 @@ def high_level_checkpoint_contract(policy_record):
         "dribble_scale": env.get("high_level_dribble_command_scale"),
         "shoot_scale": env.get("high_level_shoot_command_scale"),
         "geometric_fallback": env.get("high_level_use_geometric_skill_fallback"),
+        "role_aware_fallback": env.get("high_level_role_aware_fallback"),
         "near_ball_probability": env.get("high_level_near_ball_init_probability"),
+        "boundary_walls": env.get("add_boundary_walls"),
     }
 
 
@@ -123,7 +141,9 @@ def validate_high_level_evaluation_contract(policy_record, args):
             0.0,
         ],
         "geometric_fallback": bool(args.use_geometric_skill_fallback),
+        "role_aware_fallback": bool(getattr(args, "role_aware_fallback", True)),
         "near_ball_probability": float(args.near_ball_init_probability),
+        "boundary_walls": bool(getattr(args, "boundary_walls", True)),
     }
     mismatches = []
     for name, actual_value in actual.items():
@@ -223,6 +243,10 @@ def validate_high_level_training_args(args):
         raise ValueError("--entropy-coef must be non-negative")
     if args.skill_entropy_coef < 0.0:
         raise ValueError("--skill-entropy-coef must be non-negative")
+    if args.skill_entropy_final_coef < 0.0:
+        raise ValueError("--skill-entropy-final-coef must be non-negative")
+    if args.skill_entropy_anneal_iterations < 0:
+        raise ValueError("--skill-entropy-anneal-iterations must be non-negative")
     if args.ppo_epochs < 1:
         raise ValueError("--ppo-epochs must be at least 1")
     if args.max_kl_factor <= 1.0:
@@ -233,6 +257,20 @@ def validate_high_level_training_args(args):
         raise ValueError("--max-skill-action-clip must be positive")
     if args.self_play_update_interval < 1:
         raise ValueError("--self-play-update-interval must be at least 1")
+    if args.opponent_pool_size < 1:
+        raise ValueError("--opponent-pool-size must be at least 1")
+    if not 0.0 <= args.opponent_latest_probability <= 1.0:
+        raise ValueError("--opponent-latest-probability must be between 0 and 1")
+    if args.robot_collision_penalty < 0.0:
+        raise ValueError("--robot-collision-penalty must be non-negative")
+    if args.robot_collision_distance <= 0.0:
+        raise ValueError("--robot-collision-distance must be positive")
+    if args.collision_avoidance_distance <= 0.0:
+        raise ValueError("--collision-avoidance-distance must be positive")
+    if args.collision_avoidance_lookahead < 0.0:
+        raise ValueError("--collision-avoidance-lookahead must be non-negative")
+    if args.collision_avoidance_speed <= 0.0:
+        raise ValueError("--collision-avoidance-speed must be positive")
     if args.resume and not args.resume_checkpoint:
         raise ValueError("--resume requires --resume-checkpoint")
     if args.resume and not args.resume_run:
@@ -326,6 +364,15 @@ def configure_high_level_cfg(Cfg, args):
     Cfg.env.high_level_use_geometric_skill_fallback = bool(
         getattr(args, "use_geometric_skill_fallback", False)
     )
+    Cfg.env.high_level_role_aware_fallback = bool(
+        getattr(args, "role_aware_fallback", True)
+    )
+    # A hard action override changes the transition produced by PPO's sampled
+    # action and therefore weakens credit assignment. Keep it opt-in and, when
+    # requested for deployment, use it only as a near-contact emergency guard.
+    Cfg.env.high_level_collision_avoidance = bool(
+        getattr(args, "collision_avoidance", False)
+    )
     Cfg.env.high_level_walk_command_scale = [
         walk_x_scale,
         walk_y_scale,
@@ -364,6 +411,9 @@ def configure_high_level_cfg(Cfg, args):
     Cfg.env.field_marker_height = 0.035
     Cfg.env.add_field_texture = True
     Cfg.env.add_goalposts = True
+    Cfg.env.add_boundary_walls = bool(
+        getattr(args, "boundary_walls", True)
+    )
     Cfg.env.robot_init_x_range = [-0.5 * args.field_length + 0.6, 0.0]
     Cfg.env.robot_init_y_range = [-0.5 * args.field_width + 0.6, 0.5 * args.field_width - 0.6]
     Cfg.env.robot_yaw_init_range = [-3.14159265, 3.14159265]
@@ -494,11 +544,15 @@ def configure_high_level_cfg(Cfg, args):
             setattr(Cfg.reward_scales, key, 0.0)
     for reward_name, scale in HIGH_LEVEL_REWARD_SCALES.items():
         setattr(Cfg.reward_scales, reward_name, scale)
+    Cfg.reward_scales.high_level_robot_collision = -abs(
+        float(getattr(args, "robot_collision_penalty", 2.0))
+    )
     # A pass has no receiver and is identically zero in the single-robot task.
     # Remove it from the active objective so the saved configuration accurately
     # describes what can contribute to learning.
     if num_robots == 1:
         Cfg.reward_scales.high_level_pass = 0.0
+        Cfg.reward_scales.high_level_robot_spacing = 0.0
 
     Cfg.rewards.reward_container_name = "HighLevelRewards"
     Cfg.rewards.only_positive_rewards = False
@@ -510,14 +564,46 @@ def configure_high_level_cfg(Cfg, args):
     Cfg.rewards.high_level_border_margin = 0.0
     Cfg.rewards.high_level_min_robot_spacing = 0.65
     Cfg.rewards.high_level_target_robot_spacing = 1.5
-    Cfg.rewards.high_level_robot_collision_distance = 0.75
+    Cfg.rewards.high_level_support_min_ball_distance = 1.15
+    Cfg.rewards.high_level_support_depth = 0.5
+    Cfg.rewards.high_level_support_lateral = 1.2
+    Cfg.rewards.high_level_support_walk_speed = 0.75
+    # The AS2 base collision geometry is roughly 0.2 x 0.224 m, with a front
+    # attachment extending to about 0.33 m. A 0.65 m centre clearance catches
+    # genuine contact configurations without penalizing ordinary ball contests.
+    Cfg.rewards.high_level_robot_collision_distance = float(
+        getattr(args, "robot_collision_distance", 0.65)
+    )
+    Cfg.rewards.high_level_robot_avoidance_distance = float(
+        getattr(args, "collision_avoidance_distance", 0.55)
+    )
+    Cfg.rewards.high_level_robot_avoidance_lookahead = float(
+        getattr(args, "collision_avoidance_lookahead", 0.25)
+    )
+    Cfg.rewards.high_level_robot_avoidance_speed = float(
+        getattr(args, "collision_avoidance_speed", 0.5)
+    )
     Cfg.rewards.high_level_obstacle_safe_distance = 0.55
     Cfg.rewards.high_level_dribble_skill_distance = 1.0
     Cfg.rewards.high_level_dribble_control_distance = 0.8
     Cfg.rewards.high_level_skill_command_min_speed = 0.2
+    Cfg.rewards.high_level_skill_command_target_speed = 0.8
+    Cfg.rewards.high_level_local_attacker_ball_skill_scale = (
+        HIGH_LEVEL_LOCAL_ROLE_REWARD_SCALES["attacker_ball_skill"]
+    )
+    Cfg.rewards.high_level_local_attacker_command_assist_scale = (
+        HIGH_LEVEL_LOCAL_ROLE_REWARD_SCALES["attacker_command_assist"]
+    )
+    Cfg.rewards.high_level_local_role_conflict_scale = (
+        HIGH_LEVEL_LOCAL_ROLE_REWARD_SCALES["role_conflict"]
+    )
+    Cfg.rewards.high_level_local_support_ball_crowding_scale = (
+        HIGH_LEVEL_LOCAL_ROLE_REWARD_SCALES["support_ball_crowding"]
+    )
     Cfg.rewards.high_level_dribble_min_ball_speed = 0.1
     Cfg.rewards.high_level_dribble_target_ball_speed = 1.0
     Cfg.rewards.high_level_shoot_skill_distance = 0.75
+    Cfg.rewards.high_level_shoot_setup_min_behind_alignment = 0.3
     Cfg.rewards.high_level_shoot_min_forward = -0.1
     Cfg.rewards.high_level_shoot_lateral_reach = 0.45
     Cfg.rewards.high_level_shoot_min_ball_speed = 0.8
@@ -765,6 +851,7 @@ def train_robot(args):
     from dribblebot_learn.ppo_cse.ppo import PPO_Args
 
     RunnerArgs.resume = bool(args.resume)
+    RunnerArgs.resume_policy_only = args.resume_mode == "policy-only"
     RunnerArgs.resume_path = args.resume_run
     RunnerArgs.resume_checkpoint = args.resume_checkpoint
     RunnerArgs.save_video_interval = 500
@@ -772,6 +859,9 @@ def train_robot(args):
     # directory under wandb/run-<timestamp>-<id>/files/.
     RunnerArgs.checkpoint_dir = args.checkpoint_dir
     RunnerArgs.self_play_update_interval = args.self_play_update_interval
+    RunnerArgs.skill_entropy_initial_coef = args.skill_entropy_coef
+    RunnerArgs.skill_entropy_final_coef = args.skill_entropy_final_coef
+    RunnerArgs.skill_entropy_anneal_iterations = args.skill_entropy_anneal_iterations
     PPO_Args.learning_rate = args.learning_rate
     PPO_Args.adaptation_module_learning_rate = args.learning_rate
     # Adaptive KL control may reduce the step size, but it must not grow back
@@ -789,6 +879,9 @@ def train_robot(args):
     AC_Args.init_noise_std = args.init_noise_std
     AC_Args.max_action_std = args.max_noise_std
     AC_Args.action_mean_bound = args.action_mean_bound
+    AC_Args.hybrid_skill_policy = True
+    AC_Args.skill_action_stride = 6
+    AC_Args.num_skill_logits = 3
     AC_Args.adaptation_labels = []
     AC_Args.adaptation_dims = []
 
@@ -818,7 +911,12 @@ def train_robot(args):
                 "team_size": args.num_robots,
                 "shared_actor_parameters": True,
                 "opponent_snapshot_interval": args.self_play_update_interval,
+                "opponent_pool_size": args.opponent_pool_size,
+                "opponent_latest_probability": args.opponent_latest_probability,
                 "local_observation_dim": 34,
+                "local_role_reward_scales": dict(
+                    HIGH_LEVEL_LOCAL_ROLE_REWARD_SCALES
+                ),
             },
             "mpc_teacher": (
                 {
@@ -827,7 +925,7 @@ def train_robot(args):
                     "mpc_config": args.mpc_config,
                     "mpc_profile": args.mpc_profile,
                     "reward_coefficient": args.teacher_reward_coefficient,
-                    "opponent_forecast": "frozen policy current action held over horizon",
+                    "opponent_forecast": "slow walk-to-ball action held over horizon",
                 }
                 if getattr(args, "world_model_checkpoint", None)
                 else {"enabled": False}
@@ -849,6 +947,8 @@ def train_robot(args):
         match_env,
         team_size=args.num_robots,
         opponent_device=args.policy_device,
+        opponent_pool_size=args.opponent_pool_size,
+        opponent_latest_probability=args.opponent_latest_probability,
     )
     if getattr(args, "world_model_checkpoint", None):
         from dribblebot.envs.wrappers.mpc_teacher_guidance_wrapper import (
@@ -888,7 +988,9 @@ def train_robot(args):
                 f"World-model macro_action_steps={stored_steps} but training uses "
                 f"control_interval={args.control_interval}"
             )
-        mpc_config, _ = load_mpc_config(args.mpc_config, args.mpc_profile)
+        mpc_config, mpc_payload = load_mpc_config(
+            args.mpc_config, args.mpc_profile
+        )
         state_adapter = FootballWorldModelStateAdapter(
             match_env,
             max_obstacles=0,
@@ -909,7 +1011,6 @@ def train_robot(args):
             world_model.action_adapter,
             world_model.event_names,
             mpc_config,
-            controlled_robot_count=args.num_robots,
         )
         planner = HybridCEMMPC(
             world_model,
@@ -923,6 +1024,7 @@ def train_robot(args):
             planner,
             state_adapter,
             reward_coefficient=args.teacher_reward_coefficient,
+            opponent_config=mpc_payload.get("opponent", {}),
         )
     runner = Runner(env, device=args.device)
     runner.learn(num_learning_iterations=args.iterations, init_at_random_ep_len=True, eval_freq=100)
@@ -963,6 +1065,16 @@ def build_arg_parser():
         default="tmp/legged_data/high_level/ac_weights_latest.pt",
         help="Local checkpoint path or W&B artifact name used with --resume.",
     )
+    parser.add_argument(
+        "--resume-mode",
+        choices=("full", "policy-only"),
+        default="full",
+        help=(
+            "full restores actor, critic, exploration noise, and iteration numbering for "
+            "the same objective; policy-only warm-starts just the actor/adaptation weights "
+            "and starts a new critic at iteration zero."
+        ),
+    )
     parser.add_argument("--num-envs", type=int, default=512)
     parser.add_argument(
         "--num-robots",
@@ -973,8 +1085,20 @@ def build_arg_parser():
     parser.add_argument(
         "--self-play-update-interval",
         type=int,
-        default=500,
+        default=2000,
         help="PPO iterations between frozen opponent-policy snapshot updates.",
+    )
+    parser.add_argument(
+        "--opponent-pool-size",
+        type=int,
+        default=8,
+        help="Maximum frozen opponents; the initialization anchor is retained.",
+    )
+    parser.add_argument(
+        "--opponent-latest-probability",
+        type=float,
+        default=0.5,
+        help="Per-episode probability mass assigned to the newest opponent; the remainder is shared by history.",
     )
     parser.add_argument("--iterations", type=int, default=1_000_000)
     parser.add_argument("--episode-length", type=float, default=30.0)
@@ -989,8 +1113,20 @@ def build_arg_parser():
     parser.add_argument(
         "--skill-entropy-coef",
         type=float,
-        default=0.02,
-        help="Entropy bonus for the categorical walk/dribble/shoot choice.",
+        default=0.002,
+        help="Initial entropy bonus for the true categorical walk/dribble/shoot distribution.",
+    )
+    parser.add_argument(
+        "--skill-entropy-final-coef",
+        type=float,
+        default=0.0002,
+        help="Categorical entropy coefficient after linear annealing.",
+    )
+    parser.add_argument(
+        "--skill-entropy-anneal-iterations",
+        type=int,
+        default=4000,
+        help="PPO iterations over which to anneal the categorical entropy coefficient.",
     )
     parser.add_argument(
         "--ppo-epochs",
@@ -1017,6 +1153,26 @@ def build_arg_parser():
         help="Reject stale low-level policies trained outside this actuator-action range.",
     )
     parser.add_argument(
+        "--robot-collision-penalty",
+        type=float,
+        default=2.0,
+        help="Positive magnitude of the near-contact reward penalty (0 disables it).",
+    )
+    parser.add_argument(
+        "--robot-collision-distance",
+        type=float,
+        default=0.65,
+        help="Robot-centre distance in metres at which the smooth collision penalty begins.",
+    )
+    parser.add_argument(
+        "--collision-avoidance",
+        action="store_true",
+        help="Enable the emergency predictive action override (normally leave off for PPO training).",
+    )
+    parser.add_argument("--collision-avoidance-distance", type=float, default=0.55)
+    parser.add_argument("--collision-avoidance-lookahead", type=float, default=0.25)
+    parser.add_argument("--collision-avoidance-speed", type=float, default=0.5)
+    parser.add_argument(
         "--use-geometric-skill-fallback",
         dest="use_geometric_skill_fallback",
         action="store_true",
@@ -1029,9 +1185,26 @@ def build_arg_parser():
         action="store_false",
         help="Execute every requested skill even when the ball is out of reach.",
     )
+    parser.add_argument(
+        "--no-role-aware-fallback",
+        dest="role_aware_fallback",
+        action="store_false",
+        default=True,
+        help=(
+            "Disable nearest-attacker/support arbitration in the geometric "
+            "fallback (useful only for an intentional legacy comparison)."
+        ),
+    )
     parser.add_argument("--field-length", type=float, default=8.0)
     parser.add_argument("--field-width", type=float, default=5.0)
     parser.add_argument("--goal-half-width", type=float, default=1.0)
+    parser.add_argument(
+        "--no-boundary-walls",
+        dest="boundary_walls",
+        action="store_false",
+        default=True,
+        help="Disable the physical rebound walls and restore legacy out-of-bounds termination.",
+    )
     parser.add_argument(
         "--near-ball-init-probability",
         type=float,

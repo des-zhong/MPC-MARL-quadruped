@@ -1,3 +1,6 @@
+> Historical design document: terminal-value MPC described below is no longer
+> part of the active planner. The current MPC is intentionally reward-only.
+
 I already have a working robot-football world-model data collector, trained world model, and MPC implementation in this repository.
 
 Do NOT rewrite these systems from scratch.
@@ -1116,7 +1119,7 @@ Implement:
 
 ```bash
 python scripts/evaluate_terminal_value.py \
-    --checkpoint checkpoints/terminal_value/best.pt \
+    --checkpoint checkpoints/terminal_value_mpc/best.pt \
     --dataset data/mpc_teacher/test
 ```
 

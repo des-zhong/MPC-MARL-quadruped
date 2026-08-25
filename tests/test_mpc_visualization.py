@@ -81,13 +81,11 @@ def test_skill_and_parameter_timeline_runs_headlessly(tmp_path):
 def test_mpc_execution_diagnostics_runs_headlessly(tmp_path):
     rows = [
         {
-            "fallback_used": False,
             "requested_action_modified": False,
             "best_objective": 1.0,
             "planning_time_seconds": 0.02,
         },
         {
-            "fallback_used": True,
             "requested_action_modified": True,
             "best_objective": 0.2,
             "planning_time_seconds": 0.03,

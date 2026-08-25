@@ -1,4 +1,4 @@
-"""Evaluate MPC against valid random, scripted, greedy, and risk ablations."""
+"""Evaluate reward-only MPC against valid random and scripted baselines."""
 
 from __future__ import annotations
 
@@ -55,7 +55,6 @@ def main(args):
         "random_valid",
         "scripted",
         "greedy_h1",
-        "mpc_no_uncertainty",
         "mpc",
     ]
     results = []
@@ -104,37 +103,6 @@ def main(args):
                     {"num_iterations": int(iterations)},
                 )
             )
-        objective_specs = {
-            "reward_only": {
-                "uncertainty_penalty": 0.0,
-                "return_std_penalty": 0.0,
-                "ensemble_objective": "mean",
-                "collision_penalty": 0.0,
-                "out_of_bounds_penalty": 0.0,
-                "robot_fall_penalty": 0.0,
-                "invalid_skill_penalty": 0.0,
-                "skill_switch_penalty": 0.0,
-                "command_change_penalty": 0.0,
-            },
-            "reward_uncertainty": {
-                "collision_penalty": 0.0,
-                "out_of_bounds_penalty": 0.0,
-                "robot_fall_penalty": 0.0,
-                "invalid_skill_penalty": 0.0,
-            },
-            "reward_constraints": {
-                "uncertainty_penalty": 0.0,
-                "return_std_penalty": 0.0,
-                "ensemble_objective": "mean",
-            },
-            "reward_uncertainty_constraints": {},
-            "no_skill_switch": {"skill_switch_penalty": 0.0},
-            "no_command_smoothness": {"command_change_penalty": 0.0},
-        }
-        for name in evaluation.get(
-            "objective_ablations", tuple(objective_specs)
-        ):
-            specs.append((f"objective_{name}", objective_specs[str(name)]))
         for label, overrides in specs:
             _set_seed(args.seed)
             runtime = build_runtime(args, mpc_overrides=overrides)
@@ -151,42 +119,6 @@ def main(args):
             finally:
                 runtime.controller.close()
                 runtime.env.close()
-    if args.run_value_ablations:
-        evaluation = load_config(args.config).get("evaluation", {})
-        horizons = evaluation.get("horizons", (1, 3, 5, 8, 10))
-        modes = ("reward_only", "terminal_value_only", "reward_plus_terminal_value")
-        for horizon in horizons:
-            for mode in modes:
-                _set_seed(args.seed)
-                runtime = build_runtime(
-                    args,
-                    mpc_overrides={"horizon": int(horizon), "objective_mode": mode},
-                )
-                try:
-                    result = evaluate_method(runtime, "mpc", args.ablation_episodes, confidence=args.confidence)
-                    result["method"] = f"value_h{horizon}_{mode}"
-                    result["mpc_config"] = runtime.mpc_config.to_dict()
-                    results.append(result)
-                finally:
-                    runtime.controller.close(); runtime.env.close()
-        for coefficient in evaluation.get(
-            "terminal_value_coefficients", (0.0, 0.25, 0.5, 1.0, 2.0)
-        ):
-            _set_seed(args.seed)
-            runtime = build_runtime(
-                args,
-                mpc_overrides={
-                    "objective_mode": "reward_plus_terminal_value",
-                    "terminal_value_coefficient": float(coefficient),
-                },
-            )
-            try:
-                result = evaluate_method(runtime, "mpc", args.ablation_episodes, confidence=args.confidence)
-                result["method"] = f"terminal_value_coefficient_{coefficient:g}"
-                result["mpc_config"] = runtime.mpc_config.to_dict()
-                results.append(result)
-            finally:
-                runtime.controller.close(); runtime.env.close()
     payload = {
         "seed": args.seed,
         "identical_reset_seed_requested": True,
@@ -218,7 +150,6 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--confidence", type=float, default=0.95)
     parser.add_argument("--run-ablations", action="store_true")
-    parser.add_argument("--run-value-ablations", action="store_true")
     parser.add_argument("--ablation-episodes", type=int, default=100)
     add_simulator_arguments(parser)
     return parser.parse_args()

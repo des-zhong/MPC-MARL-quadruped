@@ -54,7 +54,6 @@ def plot_top_down(
     actual_future=None,
     output: Optional[Union[str, Path]] = None,
     title: str = "MPC tactical view",
-    terminal_value: Optional[float] = None,
     controlled_robot_count: Optional[int] = None,
 ):
     """Plot field, real history, predicted plan, and optional actual future."""
@@ -226,12 +225,10 @@ def plot_top_down(
             linewidth=2,
             label="ball predicted",
         )
-        terminal_label = "predicted terminal state"
-        if terminal_value is not None:
-            terminal_label += f"; V(s_H)={float(terminal_value):.3f}"
         axis.scatter(
             predicted_ball[-1, 0], predicted_ball[-1, 1], marker="*", s=230,
-            color="tab:orange", edgecolor="black", zorder=9, label=terminal_label,
+            color="tab:orange", edgecolor="black", zorder=9,
+            label="predicted terminal state",
         )
         if uncertainty_np is not None and len(predicted_ball) > 1:
             scaled = 30 + 170 * (
@@ -312,9 +309,6 @@ def plot_candidate_endpoints(
     objectives,
     elite_count: int,
     output: Union[str, Path],
-    predicted_returns=None,
-    terminal_values=None,
-    terminal_uncertainty=None,
 ):
     final_states = _numpy(final_states)
     objectives = _numpy(objectives)
@@ -330,9 +324,6 @@ def plot_candidate_endpoints(
     )
     elite = np.argsort(objectives)[-min(elite_count, len(objectives)) :]
     best = int(np.argmax(objectives))
-    predicted_returns = _numpy(predicted_returns)
-    terminal_values = _numpy(terminal_values)
-    terminal_uncertainty = _numpy(terminal_uncertainty)
     axes[0].scatter(
         ball[elite, 0],
         ball[elite, 1],
@@ -350,12 +341,7 @@ def plot_candidate_endpoints(
         s=180,
         label="best endpoint",
     )
-    detail = ""
-    if predicted_returns is not None and terminal_values is not None:
-        detail = f"\nbest: R_H={predicted_returns[best]:.2f}, V-term={terminal_values[best]:.2f}"
-        if terminal_uncertainty is not None:
-            detail += f", U_H={terminal_uncertainty[best]:.2f}"
-    axes[0].set(title="Candidate ball endpoints" + detail, xlabel="x (m)", ylabel="y (m)")
+    axes[0].set(title="Candidate ball endpoints", xlabel="x (m)", ylabel="y (m)")
     axes[0].legend()
     figure.colorbar(scatter, ax=axes[0], label="objective")
     marker_choices = ("^", "s", "P", "X", "D", "v", "<", ">")
@@ -389,7 +375,7 @@ def plot_cem_convergence(convergence: Mapping[str, object], output):
     parameter_std = _numpy(convergence["mean_parameter_std"])
     first_probs = _numpy(convergence["first_step_skill_probabilities"])
     iterations = np.arange(best.shape[-1])
-    figure, axes = plt.subplots(3, 2, figsize=(12, 11))
+    figure, axes = plt.subplots(2, 2, figsize=(12, 8))
     axes[0, 0].plot(iterations, best, marker="o", label="best")
     axes[0, 0].plot(iterations, elite, marker="s", linestyle="--", label="elite mean")
     axes[0, 0].fill_between(
@@ -413,49 +399,15 @@ def plot_cem_convergence(convergence: Mapping[str, object], output):
             )
     axes[1, 1].set_title("First-step skill probabilities")
     axes[1, 1].legend(fontsize=7, ncol=2)
-    timing = [
-        float(_numpy(convergence[name]))
-        for name in (
-            "sampling_time_seconds",
-            "rollout_time_seconds",
-            "update_time_seconds",
-        )
-    ]
-    axes[2, 0].bar(
-        ["sampling", "rollout", "update"],
-        timing,
-        hatch=["/", "\\", "x"],
-    )
-    axes[2, 0].set_title("Planning time decomposition")
-    axes[2, 1].axis("off")
     for axis in axes.flat:
         axis.grid(True, linestyle=":", alpha=0.25)
-        if axis.has_data() and axis is not axes[2, 0]:
+        if axis.has_data():
             axis.set_xlabel("CEM iteration")
     figure.tight_layout()
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output, dpi=160)
     plt.close(figure)
-
-
-def plot_plan_value_diagnostics(rewards, values, uncertainty, gamma, output):
-    """Plot diagnostic V(s_h) along the chosen path; only V(s_H) is optimized."""
-    rewards = _numpy(rewards)
-    values = _numpy(values)
-    uncertainty = _numpy(uncertainty)
-    discounted = rewards * np.power(float(gamma), np.arange(len(rewards)))
-    cumulative = np.cumsum(discounted)
-    figure, axes = plt.subplots(2, 1, figsize=(9, 7), sharex=True)
-    axes[0].plot(np.arange(1, len(rewards) + 1), rewards, "o-", label="predicted reward")
-    axes[0].plot(np.arange(1, len(rewards) + 1), cumulative, "s--", label="discounted cumulative reward")
-    axes[0].plot(np.arange(len(values)), values, "^-", label="diagnostic V(s_h)")
-    axes[0].legend(); axes[0].grid(True, linestyle=":", alpha=.3)
-    axes[1].plot(np.arange(1, len(uncertainty) + 1), uncertainty, "o-", color="tab:red")
-    axes[1].set(xlabel="predicted macro step", ylabel="world-model uncertainty")
-    axes[1].grid(True, linestyle=":", alpha=.3)
-    figure.tight_layout(); output = Path(output); output.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output, dpi=160); plt.close(figure)
 
 
 def plot_prediction_vs_reality(
@@ -640,10 +592,9 @@ def plot_mpc_execution_diagnostics(
     multi_step_errors,
     output: Union[str, Path] = "mpc_diagnostics.png",
 ):
-    """Plot fallback/action modification and compounding model errors."""
+    """Plot execution modifications and compounding model errors."""
 
     steps = np.arange(len(step_diagnostics))
-    fallback = np.asarray([row["fallback_used"] for row in step_diagnostics])
     modified = np.asarray(
         [row["requested_action_modified"] for row in step_diagnostics]
     )
@@ -652,14 +603,27 @@ def plot_mpc_execution_diagnostics(
         [row["planning_time_seconds"] for row in step_diagnostics]
     )
     figure, axes = plt.subplots(2, 2, figsize=(13, 9))
-    axes[0, 0].step(steps, fallback, where="post", label="fallback used")
     axes[0, 0].step(
-        steps, modified, where="post", linestyle="--", label="action modified"
+        steps, modified, where="post", label="action modified by environment"
     )
-    axes[0, 0].set(ylim=(-0.1, 1.1), title="Execution interventions")
+    axes[0, 0].set(ylim=(-0.1, 1.1), title="Execution modifications")
     axes[0, 0].legend()
     axes[0, 1].plot(steps, objective, marker="o", label="best objective")
-    axes[0, 1].set_title("Selected-plan objective")
+    component_names = sorted(
+        {
+            name
+            for row in step_diagnostics
+            for name in row.get("objective_components", {})
+        }
+    )
+    for name in component_names:
+        values = np.asarray(
+            [row.get("objective_components", {}).get(name, 0.0) for row in step_diagnostics]
+        )
+        if np.any(np.abs(values) > 1e-8):
+            axes[0, 1].plot(steps, values, linewidth=1.2, label=name)
+    axes[0, 1].set_title("Selected-plan objective decomposition")
+    axes[0, 1].legend(fontsize=7)
     axes[1, 0].plot(steps, planning, marker="s", color="tab:purple")
     axes[1, 0].set(title="Planning latency", ylabel="seconds")
     horizons = np.asarray([row["horizon"] for row in multi_step_errors])

@@ -9,6 +9,134 @@ from dribblebot.envs.base.legged_robot import LeggedRobot
 from dribblebot.envs.base.legged_robot_config import Cfg
 
 
+def boundary_wall_layout(
+    field_length,
+    field_width,
+    thickness,
+    height,
+    offset,
+    goal_half_width=1.0,
+    ball_radius=0.0889,
+    goal_opening_margin=0.0,
+):
+    """Return box dimensions and local poses for a walled soccer perimeter.
+
+    The end walls are split around the goal mouth.  This is important because
+    a solid end wall at ``x=+/-field_length/2`` would trigger the abstract goal
+    detector before the ball could reach the wall and rebound. ``offset`` must
+    stay smaller than the ball radius, ensuring the ball contacts every solid
+    end-wall segment before its centre can cross the goal line.
+    """
+
+    field_length = float(field_length)
+    field_width = float(field_width)
+    thickness = float(thickness)
+    height = float(height)
+    offset = float(offset)
+    if field_length <= 0.0 or field_width <= 0.0:
+        raise ValueError("Boundary walls require positive field length and width")
+    if thickness <= 0.0 or height <= 0.0:
+        raise ValueError("Boundary wall thickness and height must be positive")
+    if offset < 0.0:
+        raise ValueError("Boundary wall offset must be non-negative")
+    goal_half_width = float(goal_half_width)
+    ball_radius = float(ball_radius)
+    goal_opening_margin = float(goal_opening_margin)
+    if goal_half_width <= 0.0 or ball_radius <= 0.0:
+        raise ValueError("Goal half width and ball radius must be positive")
+    if goal_opening_margin < 0.0:
+        raise ValueError("Goal opening margin must be non-negative")
+    if offset >= ball_radius:
+        raise ValueError(
+            "Boundary wall offset must be smaller than the ball radius so "
+            "wall contact occurs before an out-of-bounds/goal plane crossing"
+        )
+
+    half_length = 0.5 * field_length
+    half_width = 0.5 * field_width
+    opening_half_width = goal_half_width + goal_opening_margin
+    outer_half_width = half_width + offset
+    segment_length = outer_half_width - opening_half_width
+    if segment_length <= 0.0:
+        raise ValueError(
+            "Boundary wall goal opening does not fit inside the field width: "
+            f"field_width={field_width}, opening_half_width={opening_half_width}"
+        )
+    long_dimensions = (
+        field_length + 2.0 * (offset + thickness),
+        thickness,
+        height,
+    )
+    short_dimensions = (
+        thickness,
+        segment_length,
+        height,
+    )
+    long_y = half_width + offset + 0.5 * thickness
+    short_x = half_length + offset + 0.5 * thickness
+    segment_y = opening_half_width + 0.5 * segment_length
+    center_z = 0.5 * height
+    return {
+        "long_dimensions": long_dimensions,
+        "short_dimensions": short_dimensions,
+        "goal_opening_half_width": opening_half_width,
+        "walls": (
+            ("long", (0.0, long_y, center_z)),
+            ("long", (0.0, -long_y, center_z)),
+            ("short", (short_x, segment_y, center_z)),
+            ("short", (short_x, -segment_y, center_z)),
+            ("short", (-short_x, segment_y, center_z)),
+            ("short", (-short_x, -segment_y, center_z)),
+        ),
+    }
+
+
+def high_level_outside_field(
+    field_xy, half_length, half_width, border_margin, boundary_walls
+):
+    """Classify legacy border exits, or suppress them for physical wall mode."""
+
+    if boundary_walls:
+        return torch.zeros(
+            field_xy.shape[0], dtype=torch.bool, device=field_xy.device
+        )
+    return (
+        (field_xy[:, 0] < -half_length - border_margin)
+        | (field_xy[:, 0] > half_length + border_margin)
+        | (torch.abs(field_xy[:, 1]) > half_width + border_margin)
+    )
+
+
+def high_level_match_reset_flags(
+    base_reset,
+    time_out,
+    goal,
+    opponent_goal,
+    ball_off_border,
+    obstacle_contact,
+    boundary_walls,
+):
+    """Compose match reset flags while making wall-mode border exits inert."""
+
+    border_termination = ball_off_border
+    if boundary_walls:
+        border_termination = torch.zeros_like(ball_off_border)
+    reset = (
+        base_reset
+        | goal
+        | opponent_goal
+        | border_termination
+        | obstacle_contact
+    )
+    accidental = (
+        border_termination
+        | opponent_goal
+        | obstacle_contact
+        | (base_reset & ~time_out & ~goal)
+    )
+    return reset, accidental
+
+
 class TwoRobotLeggedRobot(LeggedRobot):
     """Multi-robot soccer env with a robot-0 compatibility API.
 
@@ -262,6 +390,85 @@ class TwoRobotLeggedRobot(LeggedRobot):
             self.field_marker_short_asset = None
             self.goal_marker_asset = None
 
+        self.add_boundary_walls = bool(
+            getattr(self.cfg.env, "add_boundary_walls", False)
+        )
+        self.boundary_wall_layout = None
+        self.num_boundary_walls = 0
+        self.num_boundary_wall_bodies = 0
+        self.boundary_wall_restitution = 0.0
+        self.boundary_wall_friction = 0.0
+        self.boundary_wall_goal_opening_half_width = float(
+            getattr(self.cfg.env, "team_goal_half_width", 1.0)
+        )
+        if self.add_boundary_walls:
+            self.boundary_wall_layout = boundary_wall_layout(
+                getattr(self.cfg.env, "field_length", 8.0),
+                getattr(self.cfg.env, "field_width", 5.0),
+                getattr(self.cfg.env, "boundary_wall_thickness", 0.12),
+                getattr(self.cfg.env, "boundary_wall_height", 0.50),
+                getattr(self.cfg.env, "boundary_wall_offset", 0.05),
+                getattr(self.cfg.env, "team_goal_half_width", 1.0),
+                getattr(self.cfg.ball, "radius", 0.0889),
+                getattr(self.cfg.env, "boundary_wall_goal_opening_margin", 0.0),
+            )
+            self.boundary_wall_goal_opening_half_width = float(
+                self.boundary_wall_layout["goal_opening_half_width"]
+            )
+            wall_options = gymapi.AssetOptions()
+            wall_options.fix_base_link = True
+            wall_options.disable_gravity = True
+            wall_options.density = 1000.0
+            self.boundary_wall_long_asset = self.gym.create_box(
+                self.sim,
+                *self.boundary_wall_layout["long_dimensions"],
+                wall_options,
+            )
+            self.boundary_wall_short_asset = self.gym.create_box(
+                self.sim,
+                *self.boundary_wall_layout["short_dimensions"],
+                wall_options,
+            )
+            wall_friction = float(
+                getattr(self.cfg.env, "boundary_wall_friction", 0.35)
+            )
+            wall_restitution = float(
+                getattr(self.cfg.env, "boundary_wall_restitution", 0.85)
+            )
+            if wall_friction < 0.0:
+                raise ValueError("Boundary wall friction must be non-negative")
+            if not 0.0 <= wall_restitution <= 1.0:
+                raise ValueError("Boundary wall restitution must be between 0 and 1")
+            self.boundary_wall_friction = wall_friction
+            self.boundary_wall_restitution = wall_restitution
+            for wall_asset in (
+                self.boundary_wall_long_asset,
+                self.boundary_wall_short_asset,
+            ):
+                wall_shape_props = self.gym.get_asset_rigid_shape_properties(
+                    wall_asset
+                )
+                for shape_prop in wall_shape_props:
+                    shape_prop.friction = wall_friction
+                    shape_prop.restitution = wall_restitution
+                self.gym.set_asset_rigid_shape_properties(
+                    wall_asset, wall_shape_props
+                )
+            self.num_boundary_walls = len(self.boundary_wall_layout["walls"])
+            self.num_boundary_wall_bodies = (
+                2
+                * self.gym.get_asset_rigid_body_count(
+                    self.boundary_wall_long_asset
+                )
+                + 4
+                * self.gym.get_asset_rigid_body_count(
+                    self.boundary_wall_short_asset
+                )
+            )
+        else:
+            self.boundary_wall_long_asset = None
+            self.boundary_wall_short_asset = None
+
         self.num_robot_bodies = self.robot.get_num_bodies()
         self.num_robot_dof = self.robot.get_num_dof()
         self.num_robot_actuated_dof = self.robot.get_num_actuated_dof()
@@ -279,6 +486,7 @@ class TwoRobotLeggedRobot(LeggedRobot):
             + self.num_static_opponent_bodies
             + self.num_field_surface_bodies
             + self.num_field_marker_bodies
+            + self.num_boundary_wall_bodies
             + self.num_goalpost_bodies
         )
 
@@ -295,8 +503,12 @@ class TwoRobotLeggedRobot(LeggedRobot):
         self.field_marker_rigid_body_offset = (
             self.field_surface_rigid_body_offset + self.num_field_surface_bodies
         )
-        self.goalpost_rigid_body_offset = (
+        self.boundary_wall_rigid_body_offset = (
             self.field_marker_rigid_body_offset + self.num_field_marker_bodies
+        )
+        self.goalpost_rigid_body_offset = (
+            self.boundary_wall_rigid_body_offset
+            + self.num_boundary_wall_bodies
         )
 
         self.ball_init_pose = gymapi.Transform()
@@ -373,6 +585,8 @@ class TwoRobotLeggedRobot(LeggedRobot):
         self.field_marker_actor_idxs = []
         self.field_surface_actor_handles = []
         self.field_surface_actor_idxs = []
+        self.boundary_wall_actor_handles = []
+        self.boundary_wall_actor_idxs = []
         self.goalpost_actor_handles = []
         self.goalpost_actor_idxs = []
 
@@ -386,6 +600,13 @@ class TwoRobotLeggedRobot(LeggedRobot):
         self.default_restitution = rigid_shape_props_asset[1].restitution
         self._init_custom_buffers__()
         self._randomize_rigid_body_props(torch.arange(self.num_envs, device=self.device), self.cfg)
+        if self.add_boundary_walls and not bool(
+            getattr(self.cfg.domain_rand, "randomize_ball_restitution", False)
+        ):
+            # PhysX combines the two contacting materials. Giving the ball the
+            # same non-zero restitution as the wall makes the rebound explicit
+            # even when the robot/ground material is configured as inelastic.
+            self.ball_restitutions[:] = self.boundary_wall_restitution
         self._randomize_gravity()
         self._randomize_ball_drag()
 
@@ -603,6 +824,37 @@ class TwoRobotLeggedRobot(LeggedRobot):
             self.field_marker_actor_handles.append(field_marker_handles)
             self.field_marker_actor_idxs.append(field_marker_actor_idxs)
 
+            boundary_wall_handles = []
+            boundary_wall_actor_idxs = []
+            if self.add_boundary_walls:
+                for wall_idx, (asset, pose) in enumerate(
+                    self._get_boundary_wall_specs(i)
+                ):
+                    wall_handle = self.gym.create_actor(
+                        env_handle,
+                        asset,
+                        pose,
+                        f"boundary_wall_{wall_idx}",
+                        i,
+                        0,
+                        0,
+                    )
+                    self.gym.set_rigid_body_color(
+                        env_handle,
+                        wall_handle,
+                        0,
+                        gymapi.MESH_VISUAL_AND_COLLISION,
+                        gymapi.Vec3(0.92, 0.92, 0.88),
+                    )
+                    boundary_wall_handles.append(wall_handle)
+                    boundary_wall_actor_idxs.append(
+                        self.gym.get_actor_index(
+                            env_handle, wall_handle, gymapi.DOMAIN_SIM
+                        )
+                    )
+            self.boundary_wall_actor_handles.append(boundary_wall_handles)
+            self.boundary_wall_actor_idxs.append(boundary_wall_actor_idxs)
+
             if self.add_goalposts:
                 goalpost_pose = gymapi.Transform()
                 goalpost_pose.p = gymapi.Vec3(
@@ -654,6 +906,11 @@ class TwoRobotLeggedRobot(LeggedRobot):
             device=self.device,
             dtype=torch.long,
         ).view(self.num_envs, int(self.add_field_texture))
+        self.boundary_wall_actor_idxs = torch.as_tensor(
+            self.boundary_wall_actor_idxs,
+            device=self.device,
+            dtype=torch.long,
+        ).view(self.num_envs, self.num_boundary_walls)
         self.goalpost_actor_idxs = torch.as_tensor(
             self.goalpost_actor_idxs,
             device=self.device,
@@ -767,6 +1024,27 @@ class TwoRobotLeggedRobot(LeggedRobot):
                 f"{local.detach().cpu().tolist()}"
             )
         return local
+
+    def _get_boundary_wall_specs(self, env_id):
+        """Build world-space actor poses for one environment's wall segments."""
+
+        if not self.add_boundary_walls or self.boundary_wall_layout is None:
+            return []
+        origin = self.env_origins[env_id]
+        assets = {
+            "long": self.boundary_wall_long_asset,
+            "short": self.boundary_wall_short_asset,
+        }
+        specs = []
+        for asset_kind, local_position in self.boundary_wall_layout["walls"]:
+            pose = gymapi.Transform()
+            pose.p = gymapi.Vec3(
+                float(origin[0].item()) + local_position[0],
+                float(origin[1].item()) + local_position[1],
+                float(origin[2].item()) + local_position[2],
+            )
+            specs.append((assets[asset_kind], pose))
+        return specs
 
     def _get_field_marker_specs(self, env_id):
         origin_x = float(self.env_origins[env_id, 0].item())
@@ -1104,8 +1382,6 @@ class TwoRobotLeggedRobot(LeggedRobot):
 
     def check_termination(self):
         super().check_termination()
-        base_reset_buf = self.reset_buf.clone()
-
         if int(self.termination_contact_indices.numel()) > 0:
             any_robot_contact_reset = torch.any(
                 torch.norm(
@@ -1169,29 +1445,32 @@ class TwoRobotLeggedRobot(LeggedRobot):
             self.high_level_opponent_goal_buf[:] = (field_xy[:, 0] <= -goal_x) & (
                 torch.abs(field_xy[:, 1]) <= goal_half_width
             )
-            outside_field = (
-                (field_xy[:, 0] < -half_length - border_margin)
-                | (field_xy[:, 0] > half_length + border_margin)
-                | (torch.abs(field_xy[:, 1]) > half_width + border_margin)
+            # With a physical perimeter the ball is kept in the scene by
+            # collision geometry. It is intentionally not an episode-ending
+            # event: a rebound should extend the match instead of producing an
+            # out-of-bounds penalty. The goal checks above remain active.
+            outside_field = high_level_outside_field(
+                field_xy,
+                half_length,
+                half_width,
+                border_margin,
+                self.add_boundary_walls,
             )
             self.high_level_ball_off_border_buf[:] = (
                 outside_field & ~self.high_level_goal_buf & ~self.high_level_opponent_goal_buf
             )
             self.high_level_obstacle_contact_buf[:] = self._ball_touches_static_opponent()
 
-            self.high_level_accidental_termination_buf[:] = (
-                self.high_level_ball_off_border_buf
-                | self.high_level_opponent_goal_buf
-                | self.high_level_obstacle_contact_buf
-                | (self.reset_buf & ~self.time_out_buf & ~self.high_level_goal_buf)
-            )
-            self.reset_buf = torch.logical_or(self.reset_buf, self.high_level_goal_buf)
-            self.reset_buf = torch.logical_or(self.reset_buf, self.high_level_opponent_goal_buf)
-            self.reset_buf = torch.logical_or(self.reset_buf, self.high_level_ball_off_border_buf)
-            self.reset_buf = torch.logical_or(self.reset_buf, self.high_level_obstacle_contact_buf)
-            self.high_level_accidental_termination_buf[:] = (
-                self.high_level_accidental_termination_buf
-                | (base_reset_buf & ~self.time_out_buf & ~self.high_level_goal_buf)
+            self.reset_buf, self.high_level_accidental_termination_buf[:] = (
+                high_level_match_reset_flags(
+                    self.reset_buf,
+                    self.time_out_buf,
+                    self.high_level_goal_buf,
+                    self.high_level_opponent_goal_buf,
+                    self.high_level_ball_off_border_buf,
+                    self.high_level_obstacle_contact_buf,
+                    self.add_boundary_walls,
+                )
             )
 
     def _ball_touches_static_opponent(self):
@@ -1226,6 +1505,7 @@ class TwoRobotLeggedRobot(LeggedRobot):
             self.last_high_level_obstacle_contact_buf[env_ids] = self.high_level_obstacle_contact_buf[env_ids]
             self.last_high_level_accidental_termination_buf[env_ids] = self.high_level_accidental_termination_buf[env_ids]
         super().reset_idx(env_ids)
+        self._refresh_reset_state_views(env_ids)
         if len(env_ids) == 0 or not hasattr(self, "high_level_goal_buf"):
             return
 
@@ -1243,6 +1523,46 @@ class TwoRobotLeggedRobot(LeggedRobot):
             self.prev_object_lin_vel[env_ids] = self.object_lin_vel[env_ids]
             self.prev_high_level_robot_ball_distances[env_ids] = self._high_level_robot_ball_distances()[env_ids]
 
+    def _refresh_reset_state_views(self, env_ids):
+        """Synchronize cached observations with root states written during reset."""
+
+        required = (
+            "robot_actor_idxs",
+            "robot_actor_idxs_all",
+            "base_pos",
+            "base_quat",
+            "base_lin_vel",
+            "base_ang_vel",
+            "projected_gravity",
+        )
+        if len(env_ids) == 0 or not all(hasattr(self, name) for name in required):
+            return
+        primary_roots = self.root_states[self.robot_actor_idxs[env_ids]]
+        self.base_pos[env_ids] = primary_roots[:, 0:3]
+        self.base_quat[env_ids] = primary_roots[:, 3:7]
+        self.base_lin_vel[env_ids] = quat_rotate_inverse(
+            self.base_quat[env_ids], primary_roots[:, 7:10]
+        )
+        self.base_ang_vel[env_ids] = quat_rotate_inverse(
+            self.base_quat[env_ids], primary_roots[:, 10:13]
+        )
+        self.projected_gravity[env_ids] = quat_rotate_inverse(
+            self.base_quat[env_ids], self.gravity_vec[env_ids]
+        )
+
+        if self.cfg.env.add_balls and hasattr(self, "object_pos_world_frame"):
+            object_roots = self.root_states[self.object_actor_idxs[env_ids]]
+            self.object_pos_world_frame[env_ids] = object_roots[:, 0:3]
+            self.object_lin_vel[env_ids] = object_roots[:, 7:10]
+            self.object_ang_vel[env_ids] = object_roots[:, 10:13]
+            object_local = quat_rotate_inverse(
+                self.base_quat[env_ids],
+                self.object_pos_world_frame[env_ids] - self.base_pos[env_ids],
+            )
+            object_local[:, 2] = 0.0
+            self.object_local_pos[env_ids] = object_local
+        self._refresh_two_robot_views()
+
     def _apply_drag_force(self, force_tensor):
         if self.cfg.domain_rand.randomize_ball_drag:
             force_tensor[:, self.object_rigid_body_offset, :2] = (
@@ -1250,12 +1570,15 @@ class TwoRobotLeggedRobot(LeggedRobot):
             )
 
     def _reset_dofs(self, env_ids, cfg):
-        self.dof_pos[env_ids] = self.default_dof_pos * torch_rand_float(
-            0.5,
-            1.5,
-            (len(env_ids), self.num_dof),
-            device=self.device,
-        )
+        if bool(getattr(cfg.env, "deterministic_match_init", False)):
+            self.dof_pos[env_ids] = self.default_dof_pos
+        else:
+            self.dof_pos[env_ids] = self.default_dof_pos * torch_rand_float(
+                0.5,
+                1.5,
+                (len(env_ids), self.num_dof),
+                device=self.device,
+            )
         self.dof_vel[env_ids] = 0.0
 
         all_subject_env_ids = self.robot_actor_idxs_all[env_ids].reshape(-1).to(device=self.device)
@@ -1459,6 +1782,9 @@ class TwoRobotLeggedRobot(LeggedRobot):
     def _reset_root_states(self, env_ids, cfg):
         robot_actor_ids = self.robot_actor_idxs_all[env_ids].to(device=self.device)
         randomize_match_init = bool(getattr(cfg.env, "randomize_match_init", False))
+        deterministic_match_init = bool(
+            getattr(cfg.env, "deterministic_match_init", False)
+        )
         protected_xy = []
         min_clearance = float(getattr(cfg.env, "match_init_min_clearance", 0.75))
         team_size = int(getattr(cfg.env, "num_team_robots", self.num_robots))
@@ -1505,12 +1831,16 @@ class TwoRobotLeggedRobot(LeggedRobot):
                 offset[1] += 0.6 * max(robot_slot - 1, 0)
                 self.root_states[actor_ids, :3] = self.env_origins[env_ids] + offset
                 if robot_slot == 0:
-                    yaw = 2 * (
-                        torch.rand(len(env_ids), device=self.device) - 0.5
-                    ) * float(cfg.terrain.yaw_init_range)
-                    self.root_states[actor_ids, 7:13] = torch_rand_float(
-                        -0.5, 0.5, (len(env_ids), 6), device=self.device
-                    )
+                    if deterministic_match_init:
+                        yaw = torch.zeros(len(env_ids), device=self.device)
+                        self.root_states[actor_ids, 7:13] = 0.0
+                    else:
+                        yaw = 2 * (
+                            torch.rand(len(env_ids), device=self.device) - 0.5
+                        ) * float(cfg.terrain.yaw_init_range)
+                        self.root_states[actor_ids, 7:13] = torch_rand_float(
+                            -0.5, 0.5, (len(env_ids), 6), device=self.device
+                        )
                 else:
                     base_yaw = float(
                         getattr(
@@ -1526,9 +1856,14 @@ class TwoRobotLeggedRobot(LeggedRobot):
                             getattr(cfg.env, "opponent_yaw_init_range", 0.0),
                         )
                     )
-                    yaw = base_yaw + 2 * (
-                        torch.rand(len(env_ids), device=self.device) - 0.5
-                    ) * yaw_range
+                    if deterministic_match_init:
+                        yaw = torch.full(
+                            (len(env_ids),), base_yaw, device=self.device
+                        )
+                    else:
+                        yaw = base_yaw + 2 * (
+                            torch.rand(len(env_ids), device=self.device) - 0.5
+                        ) * yaw_range
                     self.root_states[actor_ids, 7:13] = 0.0
             self.root_states[actor_ids, 3:7] = quat_from_euler_xyz(
                 torch.zeros_like(yaw), torch.zeros_like(yaw), yaw
@@ -1553,12 +1888,13 @@ class TwoRobotLeggedRobot(LeggedRobot):
                 self.root_states[object_env_ids, 2] = self.env_origins[env_ids, 2] + self.object_init_state[2]
                 self.root_states[object_env_ids, 7:13] = 0.0
             else:
-                self.root_states[object_env_ids, 0:3] += 2 * (
-                    torch.rand(len(env_ids), 3, dtype=torch.float, device=self.device, requires_grad=False) - 0.5
-                ) * torch.tensor(cfg.ball.init_pos_range, device=self.device, requires_grad=False)
-                self.root_states[object_env_ids, 7:10] += 2 * (
-                    torch.rand(len(env_ids), 3, dtype=torch.float, device=self.device, requires_grad=False) - 0.5
-                ) * torch.tensor(cfg.ball.init_vel_range, device=self.device, requires_grad=False)
+                if not deterministic_match_init:
+                    self.root_states[object_env_ids, 0:3] += 2 * (
+                        torch.rand(len(env_ids), 3, dtype=torch.float, device=self.device, requires_grad=False) - 0.5
+                    ) * torch.tensor(cfg.ball.init_pos_range, device=self.device, requires_grad=False)
+                    self.root_states[object_env_ids, 7:10] += 2 * (
+                        torch.rand(len(env_ids), 3, dtype=torch.float, device=self.device, requires_grad=False) - 0.5
+                    ) * torch.tensor(cfg.ball.init_vel_range, device=self.device, requires_grad=False)
 
         static_opponent_env_ids = self._reset_static_opponent_states(env_ids, cfg)
 

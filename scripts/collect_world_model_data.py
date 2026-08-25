@@ -30,6 +30,11 @@ from scripts.targeted_collection import (
 )
 import torch
 
+from dribblebot.mpc.opponent_forecast import (
+    SlowWalkToBallOpponentForecaster,
+    ZeroOpponentForecaster,
+)
+
 class TerminalStateCapture:
     """Capture terminal simulator state immediately before the env's automatic reset."""
 
@@ -95,6 +100,7 @@ def build_environment(args, config):
         high_level_history=int(config["world_model"].get("history_length", 1)),
         field_length=float(env_config.get("field_length", 8.0)), field_width=float(env_config.get("field_width", 5.0)),
         goal_half_width=float(env_config.get("goal_half_width", 1.0)),
+        boundary_walls=bool(env_config.get("boundary_walls", True)),
         near_ball_init_probability=float(env_config.get("near_ball_init_probability", 0.4)),
         near_ball_init_min_distance=float(env_config.get("near_ball_init_min_distance", 0.4)),
         near_ball_init_max_distance=float(env_config.get("near_ball_init_max_distance", 0.95)),
@@ -112,6 +118,15 @@ def build_environment(args, config):
         shoot_policy_dir=getattr(args, "shoot_policy_dir", None),
     )
     configure_high_level_cfg(Cfg, high_args)
+    if bool(env_config.get("fixed_initial_state", False)):
+        Cfg.env.randomize_match_init = False
+        Cfg.env.deterministic_match_init = True
+    if bool(env_config.get("disable_domain_randomization", False)):
+        for name in dir(Cfg.domain_rand):
+            if name.startswith("randomize_") or name == "push_robots":
+                value = getattr(Cfg.domain_rand, name)
+                if isinstance(value, bool):
+                    setattr(Cfg.domain_rand, name, False)
     policies = load_skill_policies(high_args)
     raw = TwoRobotVelocityTrackingEasyEnv(sim_device=args.device, headless=True, cfg=Cfg)
     return HighLevelSkillWrapper(raw, policies, control_interval=high_args.control_interval, history_length=high_args.high_level_history)
@@ -199,6 +214,7 @@ def collect(args) -> None:
     config = load_config(args.config)
     torch.manual_seed(int(config.get("seed", 42)))
     np.random.seed(int(config.get("seed", 42)))
+    joint_teams = "team_size" in config["environment"]
     env = build_environment(args, config)
     num_robots = int(env.num_robots)
     team_size = int(getattr(env.env.cfg.env, "num_team_robots", num_robots // 2))
@@ -209,6 +225,25 @@ def collect(args) -> None:
         env, 0, num_robots=num_robots
     )
     action_adapter = adapter.action_adapter
+    opponent = None
+    opponent_mode = None
+    if joint_teams:
+        opponent_cfg = dict(config.get("opponent", {}))
+        opponent_mode = str(opponent_cfg.get("mode", "slow_walk_to_ball"))
+        if opponent_mode == "slow_walk_to_ball":
+            opponent = SlowWalkToBallOpponentForecaster(
+                env,
+                team_size,
+                action_adapter,
+                speed_mps=float(opponent_cfg.get("walk_speed_mps", 0.35)),
+                stop_distance_m=float(opponent_cfg.get("stop_distance_m", 0.25)),
+                slow_distance_m=float(opponent_cfg.get("slow_distance_m", 1.0)),
+                yaw_gain=float(opponent_cfg.get("yaw_gain", 1.0)),
+            )
+        elif opponent_mode == "stationary":
+            opponent = ZeroOpponentForecaster(env, team_size, action_adapter)
+        else:
+            raise ValueError(f"Unknown opponent mode {opponent_mode!r}")
     behavior_cfg = config["data_collection"]
     minimum_counts = {} if getattr(args, "no_coverage_quota", False) else configured_minimum_counts(behavior_cfg)
     unknown_coverage_events = sorted(set(minimum_counts) - set(EVENT_NAMES))
@@ -224,7 +259,15 @@ def collect(args) -> None:
         },
         "team_behavior": {
             "learning": "shared configured behavior mixture; attacks +x",
-            "opponent": "same behavior mixture; attacks -x",
+            "opponent": (
+                "deterministic slow walk toward ball"
+                if opponent_mode == "slow_walk_to_ball"
+                else (
+                    "stationary zero-command walk"
+                    if opponent_mode == "stationary"
+                    else "not applicable"
+                )
+            ),
         },
         "num_obstacles": env.env.num_static_opponents,
         "state_schema": adapter.schema.to_dict(), "action_schema": action_adapter.to_dict(),
@@ -280,6 +323,17 @@ def collect(args) -> None:
                 targeted_scenarios=targeted_scenarios,
                 previous_action_valid=previous_action_valid,
             )
+            # Keep collection on the deployment distribution: the learning
+            # team explores, while the opponent uses exactly the same simple
+            # controller used by MPC execution and forecasting.
+            if opponent is not None:
+                action_rows = actions.reshape(env.num_envs, num_robots, 4).clone()
+                opponent_rows = opponent.current_joint_action().reshape(
+                    env.num_envs, num_robots, 4
+                )
+                action_rows[:, team_size:] = opponent_rows[:, team_size:]
+                actions = action_rows.flatten(1)
+                action_adapter.assert_within_bounds(actions)
             capture.clear()
             _, reward, done, info = env.step(action_adapter.to_wrapper_action(actions))
             executed_actions = _executed_actions(action_adapter, info, state.device)
@@ -331,7 +385,9 @@ def collect(args) -> None:
                     episode_ids[env_index] = next_episode_id
                     next_episode_id += 1
             scenario_manager.observe(events, EVENT_NAMES)
-            previous_actions = actions.detach().clone()
+            # Repeat what actually reached the low-level controllers, not a
+            # request that an affordance or safety projection may have changed.
+            previous_actions = executed_actions.detach().clone()
             previous_action_valid = ~done.bool()
             if done_ids and completed < total_cap and (
                 completed < target or coverage_deficits(event_counts, minimum_counts)

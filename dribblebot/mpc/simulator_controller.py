@@ -217,25 +217,6 @@ class MPCSimulatorController:
         reset = dones.bool().clone()
         if requested_action_modified is not None:
             reset |= requested_action_modified.bool()
-        if event_labels is not None:
-            event_indices = {
-                name: index
-                for index, name in enumerate(
-                    getattr(self.planner.world_model, "event_names", ())
-                )
-            }
-            for name in ("goal", "own_goal", "possession_acquired", "possession_lost"):
-                index = event_indices.get(name)
-                if index is not None:
-                    reset |= event_labels[:, index] > 0.5
-        for robot in range(self.action_adapter.num_robots):
-            reset |= (
-                next_states[
-                    :, self.planner.world_model.schema.slice(f"robot_{robot}.fallen")
-                ].squeeze(-1)
-                > 0.5
-            )
-        self.planner_state.previous_action = actions.detach()
         if bool(reset.any().item()):
             self.planner_state.reset(reset.nonzero(as_tuple=False).flatten())
 

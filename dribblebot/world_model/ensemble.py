@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Mapping, Sequence
+from typing import Callable, Dict, Mapping, Optional, Sequence
 
 import torch
 from torch import nn
@@ -119,6 +119,7 @@ class WorldModelEnsemble(nn.Module):
         action_sequences: torch.Tensor,
         deterministic: bool = True,
         stop_on_done: bool = True,
+        action_transform: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
         """Vectorized rollout over [batch, candidates, horizon, action_dim]."""
 
@@ -129,10 +130,13 @@ class WorldModelEnsemble(nn.Module):
             raise ValueError("Initial state or action sequence dimensions do not match the model schema")
         current = initial_states[:, None, :].expand(-1, candidates, -1).reshape(batch * candidates, -1)
         states = [current.reshape(batch, candidates, -1)]
-        rewards, dones, state_uncertainty, reward_uncertainty, events = [], [], [], [], []
+        rewards, dones, state_uncertainty, reward_uncertainty, events, executed_actions = [], [], [], [], [], []
         alive = torch.ones(batch * candidates, dtype=torch.bool, device=current.device)
         for step in range(horizon):
             action = action_sequences[:, :, step].reshape(batch * candidates, action_dim)
+            if action_transform is not None:
+                action = action_transform(current, action)
+            executed_actions.append(action.reshape(batch, candidates, action_dim))
             next_state, reward, done, event, uncertainty = self.predict_next(current, action, deterministic)
             if stop_on_done:
                 reward = reward * alive.to(reward.dtype)
@@ -153,6 +157,7 @@ class WorldModelEnsemble(nn.Module):
             "state_uncertainty": torch.stack(state_uncertainty, dim=2),
             "reward_uncertainty": torch.stack(reward_uncertainty, dim=2),
             "event_probabilities": torch.stack(events, dim=2),
+            "executed_actions": torch.stack(executed_actions, dim=2),
         }
 
     def _vmap_member_forward(
@@ -191,6 +196,7 @@ class WorldModelEnsemble(nn.Module):
         action_sequences: torch.Tensor,
         deterministic: bool = True,
         stop_on_done: bool = True,
+        action_transform: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
         """Propagate every ensemble member's own trajectory.
 
@@ -213,13 +219,16 @@ class WorldModelEnsemble(nn.Module):
         current = initial_flat.unsqueeze(0).expand(members, -1, -1).clone()
         mean_states = [initial_flat.reshape(batch, candidates, -1)]
         member_rewards, member_dones = [], []
-        mean_events, state_uncertainties, reward_uncertainties = [], [], []
+        mean_events, state_uncertainties, reward_uncertainties, executed_actions = [], [], [], []
         alive = torch.ones(
             members, flat_count, dtype=torch.bool, device=initial_states.device
         )
         dynamic = self.schema.continuous_dynamic_indices
         for step in range(horizon):
             action = action_sequences[:, :, step].reshape(flat_count, action_dim)
+            if action_transform is not None:
+                action = action_transform(current.mean(0), action)
+            executed_actions.append(action.reshape(batch, candidates, action_dim))
             member_action = action.unsqueeze(0).expand(members, -1, -1)
             normalized = self.normalizer.normalize_state(current)
             outputs = self._vmap_member_forward(normalized, member_action)
@@ -283,6 +292,7 @@ class WorldModelEnsemble(nn.Module):
             "event_probabilities": torch.stack(mean_events, dim=2),
             "member_predicted_rewards": member_reward_tensor,
             "member_predicted_done_probabilities": member_done_tensor,
+            "executed_actions": torch.stack(executed_actions, dim=2),
         }
 
     def evaluate_action_sequences(

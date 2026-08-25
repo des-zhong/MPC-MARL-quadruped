@@ -60,7 +60,8 @@ class HighLevelRewardTests(unittest.TestCase):
             "high_level_goal": 500.0,
             "high_level_accidental_termination": -200.0,
             "high_level_ball_goal_progress": 2.0,
-            "high_level_robot_collision": -10.0,
+            "high_level_robot_spacing": 0.75,
+            "high_level_robot_collision": -2.0,
             "high_level_pass": 2.0,
             "high_level_invalid_skill": -3.0,
             "high_level_approach_ball": 1.0,
@@ -68,6 +69,7 @@ class HighLevelRewardTests(unittest.TestCase):
             "high_level_face_ball_while_approaching": 0.5,
             "high_level_face_goal_while_moving": 0.75,
             "high_level_dribble_ball_control": 2.0,
+            "high_level_shoot_setup": 5.0,
             "high_level_shoot_launch": 10.0,
         }
         self.assertEqual(HIGH_LEVEL_REWARD_SCALES, expected)
@@ -106,13 +108,27 @@ class HighLevelRewardTests(unittest.TestCase):
         env.root_states[2, 0] = -2.0
         self.assertEqual(float(reward._reward_high_level_robot_collision()), 1.0)
 
+    def test_robot_spacing_rewards_support_and_penalizes_ball_crowding(self):
+        env = _fake_env(2)
+        env.prev_high_level_robot_ball_distances = torch.tensor(
+            [[0.5, 2.0], [0.5, 0.7]]
+        )
+        # One teammate is at the useful 1.5 m support distance; the other is
+        # inside the attacker's control bubble.
+        env.root_states[env.robot_actor_idxs, 0] = torch.tensor([0.0, 0.0])
+        env.root_states[env.other_robot_actor_idxs, 0] = torch.tensor([-1.5, -0.7])
+        reward = HighLevelRewards(env)._reward_high_level_robot_spacing()
+        self.assertGreater(float(reward[0]), float(reward[1]))
+        self.assertLess(float(reward[1]), 0.0)
+
     def test_dribble_reward_requires_valid_controlled_ball_motion(self):
-        env = _fake_env(5)
-        env.high_level_skill_ids[:, 0] = torch.tensor([1, 1, 0, 1, 1])
-        env.high_level_requested_skill_ids[:, 0] = torch.tensor([1, 1, 0, 2, 1])
+        env = _fake_env(6)
+        env.high_level_skill_ids[:, 0] = torch.tensor([1, 1, 0, 1, 1, 1])
+        env.high_level_requested_skill_ids[:, 0] = torch.tensor([1, 1, 0, 2, 1, 1])
         env.high_level_invalid_skill_mask[3, 0] = True
         env.high_level_commands[:, 0, 0] = 1.0
         env.high_level_commands[4, 0, :2] = torch.tensor([0.0, 1.0])
+        env.high_level_commands[5, 0, 0] = -1.0
         env.object_lin_vel[:, :2] = torch.tensor(
             [
                 [1.0, 0.0],  # valid goal-directed dribble
@@ -120,13 +136,15 @@ class HighLevelRewardTests(unittest.TestCase):
                 [1.0, 0.0],  # identical motion under walk
                 [1.0, 0.0],  # invalid shoot request fell back to dribble
                 [0.0, 1.0],  # controlled lateral dribble
+                [-1.0, 0.0],  # controlled dribble away from goal
             ]
         )
 
         reward = HighLevelRewards(env)._reward_high_level_dribble_ball_control()
 
         self.assertGreater(float(reward[0]), float(reward[4]))
-        self.assertGreater(float(reward[4]), 0.0)
+        self.assertEqual(float(reward[4]), 0.0)
+        self.assertLess(float(reward[5]), 0.0)
         self.assertEqual(float(reward[1]), 0.0)
         self.assertEqual(float(reward[2]), 0.0)
         self.assertEqual(float(reward[3]), 0.0)
@@ -153,6 +171,22 @@ class HighLevelRewardTests(unittest.TestCase):
 
         self.assertGreater(float(reward[0]), 0.0)
         self.assertTrue(torch.equal(reward[1:], torch.zeros(5)))
+
+    def test_shoot_setup_is_signed_and_only_emitted_on_skill_transition(self):
+        env = _fake_env(4)
+        env.high_level_skill_ids[:, 0] = 2
+        env.high_level_requested_skill_ids[:, 0] = 2
+        env.high_level_skill_transition_mask = torch.zeros(4, 2, dtype=torch.bool)
+        env.high_level_skill_transition_mask[[0, 1, 3], 0] = True
+        env.high_level_commands[:, 0, 0] = torch.tensor([2.0, -2.0, 2.0, 2.0])
+        env.high_level_invalid_skill_mask[3, 0] = True
+
+        reward = HighLevelRewards(env)._reward_high_level_shoot_setup()
+
+        self.assertGreater(float(reward[0]), 0.0)
+        self.assertLess(float(reward[1]), 0.0)
+        self.assertEqual(float(reward[2]), 0.0)
+        self.assertEqual(float(reward[3]), 0.0)
 
     def test_approach_uses_signed_progress_of_previously_closest_walking_robot(self):
         env = _fake_env(4)

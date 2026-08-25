@@ -26,9 +26,8 @@ def _print_plan(runtime, transition):
         plan.first_joint_action
     )
     print(
-        f"objective={float(plan.best_objective[0]):.4f} "
-        f"planning={plan.planning_time_seconds:.4f}s "
-        f"fallback={bool(plan.fallback_used[0])}"
+        f"predicted_return={float(plan.best_objective[0]):.4f} "
+        f"planning={plan.planning_time_seconds:.4f}s"
     )
     print(f"skills={skills[0].tolist()} parameters={parameters[0].tolist()}")
     print(
@@ -57,7 +56,7 @@ def main(args):
         while True:
             if args.non_interactive_steps is None:
                 command = input(
-                    "[enter/n] next, r reset, h N horizon, u X uncertainty, "
+                    "[enter/n] next, r reset, h N horizon, "
                     "w toggle warm-start, s save-next, q quit > "
                 ).strip()
             else:
@@ -74,15 +73,6 @@ def main(args):
                 runtime.planner.config.validate()
                 runtime.controller.planner_state = None
                 print(f"horizon={runtime.planner.config.horizon}")
-                continue
-            if command.startswith("u "):
-                runtime.planner.config.uncertainty_penalty = float(
-                    command.split()[1]
-                )
-                runtime.planner.config.validate()
-                print(
-                    f"uncertainty_penalty={runtime.planner.config.uncertainty_penalty}"
-                )
                 continue
             if command == "w":
                 runtime.planner.config.warm_start = not runtime.planner.config.warm_start

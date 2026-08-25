@@ -91,10 +91,18 @@ def test_high_level_defaults_protect_discrete_skill_exploration():
     assert not args.resume
     assert args.resume_run is None
     assert args.resume_checkpoint == "tmp/legged_data/high_level/ac_weights_latest.pt"
-    assert args.skill_entropy_coef > 0.0
+    assert args.skill_entropy_coef == 0.002
+    assert args.skill_entropy_final_coef < args.skill_entropy_coef
+    assert args.skill_entropy_anneal_iterations == 4000
     assert args.ppo_epochs == 2
     assert args.max_kl_factor > 1.0
     assert args.use_geometric_skill_fallback
+    assert args.self_play_update_interval == 2000
+    assert args.opponent_pool_size == 8
+    assert args.opponent_latest_probability == 0.5
+    assert args.robot_collision_penalty == 2.0
+    assert args.robot_collision_distance == 0.65
+    assert not args.collision_avoidance
 
 
 def test_high_level_resume_accepts_explicit_checkpoint():
@@ -105,6 +113,15 @@ def test_high_level_resume_accepts_explicit_checkpoint():
 
     assert args.resume
     assert args.resume_checkpoint == checkpoint
+
+
+def test_high_level_policy_only_warm_start_is_explicit():
+    args = build_high_level_parser().parse_args(
+        ["--resume", "--resume-mode", "policy-only"]
+    )
+
+    assert args.resume
+    assert args.resume_mode == "policy-only"
 
 
 def test_numbered_high_level_resume_continues_iteration_numbering():

@@ -6,7 +6,6 @@ import argparse
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Optional
 
 from dribblebot.world_model.state_adapter import FootballWorldModelStateAdapter
@@ -39,13 +38,20 @@ class MPCRuntime:
     value_model: object = None
     value_checkpoint: object = None
     opponent_forecaster: object = None
-    opponent_policy: object = None
 
 
 def add_simulator_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--policy-device", default="cpu")
     parser.add_argument("--num-envs", type=int, default=None)
+    parser.add_argument(
+        "--fixed-initial-state", action="store_true",
+        help="Disable randomized match initialization (for branched evaluations).",
+    )
+    parser.add_argument(
+        "--disable-domain-randomization", action="store_true",
+        help="Disable simulator domain randomization for controlled evaluations.",
+    )
     parser.add_argument(
         "--num-robots",
         type=int,
@@ -59,7 +65,7 @@ def add_simulator_arguments(parser: argparse.ArgumentParser) -> argparse.Argumen
     parser.add_argument(
         "--terminal-value-checkpoint",
         default=None,
-        help="Override mpc.terminal_value.checkpoint; omitted checkpoints fall back to reward-only.",
+        help="Override mpc.terminal_value.checkpoint.",
     )
     parser.add_argument(
         "--objective-mode",
@@ -67,6 +73,8 @@ def add_simulator_arguments(parser: argparse.ArgumentParser) -> argparse.Argumen
         default=None,
     )
     parser.add_argument("--terminal-value-coefficient", type=float, default=None)
+    parser.add_argument("--uncertainty-penalty", type=float, default=None)
+    parser.add_argument("--return-uncertainty-penalty", type=float, default=None)
     parser.add_argument("--walk-wandb-run", default="des_zhong/as2_walking/3a6g1def")
     parser.add_argument("--dribble-wandb-run", default="des_zhong/as2_dribbling/cp9m21ay")
     parser.add_argument("--shoot-wandb-run", default="des_zhong/as2_shooting/bve3isir")
@@ -79,20 +87,15 @@ def add_simulator_arguments(parser: argparse.ArgumentParser) -> argparse.Argumen
     parser.add_argument("--dribble-policy-dir", default=None)
     parser.add_argument("--shoot-policy-dir", default=None)
     parser.add_argument(
-        "--opponent-policy-source",
-        choices=("local", "wandb", "none"),
-        default="local",
-        help=(
-            "Frozen high-level opponent used by joint-team MPC. 'none' holds "
-            "opponent robots on zero-command reposition actions."
-        ),
+        "--opponent-mode",
+        choices=("slow_walk_to_ball", "stationary"),
+        default=None,
+        help="Override the simple opponent mode configured in the MPC YAML.",
     )
-    parser.add_argument(
-        "--opponent-policy-dir",
-        default="checkpoints/reproduction/high_level",
-    )
-    parser.add_argument("--opponent-wandb-run", default=None)
-    parser.add_argument("--opponent-policy-checkpoint", default="latest")
+    parser.add_argument("--opponent-walk-speed", type=float, default=None)
+    parser.add_argument("--opponent-stop-distance", type=float, default=None)
+    parser.add_argument("--opponent-slow-distance", type=float, default=None)
+    parser.add_argument("--opponent-yaw-gain", type=float, default=None)
     parser.add_argument("--walk-x-speed-scale", type=float, default=1.5)
     parser.add_argument("--walk-y-speed-scale", type=float, default=1.5)
     parser.add_argument("--walk-yaw-speed-scale", type=float, default=1.0)
@@ -116,60 +119,73 @@ def build_runtime(
     if getattr(args, "objective_mode", None) is not None:
         cli_overrides["objective_mode"] = args.objective_mode
         cli_overrides["use_terminal_value"] = args.objective_mode != "reward_only"
-    if getattr(args, "terminal_value_coefficient", None) is not None:
-        cli_overrides["terminal_value_coefficient"] = args.terminal_value_coefficient
-    effective_overrides = dict(mpc_overrides or {})
-    if "objective_mode" in effective_overrides:
-        effective_overrides.setdefault(
-            "use_terminal_value", effective_overrides["objective_mode"] != "reward_only"
-        )
+    for argument, field in (
+        ("terminal_value_coefficient", "terminal_value_coefficient"),
+        ("uncertainty_penalty", "uncertainty_penalty"),
+        ("return_uncertainty_penalty", "return_uncertainty_penalty"),
+    ):
+        value = getattr(args, argument, None)
+        if value is not None:
+            cli_overrides[field] = value
     if mpc_overrides or cli_overrides:
         from .config import MPCConfig
         from dribblebot.world_model.config import deep_update
 
         mpc_config = MPCConfig.from_mapping(
-            deep_update(deep_update(mpc_config.to_dict(), effective_overrides), cli_overrides)
+            deep_update(
+                deep_update(mpc_config.to_dict(), dict(mpc_overrides or {})),
+                cli_overrides,
+            )
         )
     if max_candidate_diagnostics is not None:
         mpc_config.max_candidate_diagnostics = int(max_candidate_diagnostics)
         mpc_config.validate()
     if args.num_envs is not None:
         config["environment"]["num_envs"] = int(args.num_envs)
+    if getattr(args, "fixed_initial_state", False):
+        config["environment"]["fixed_initial_state"] = True
+    if getattr(args, "disable_domain_randomization", False):
+        config["environment"]["disable_domain_randomization"] = True
     model, checkpoint = load_checkpoint(args.world_model_checkpoint, args.device)
     model.eval()
     value_model = value_checkpoint = None
-    requested_value = getattr(args, "terminal_value_checkpoint", None) or mpc_config.terminal_value_checkpoint
+    requested_value = (
+        getattr(args, "terminal_value_checkpoint", None)
+        or mpc_config.terminal_value_checkpoint
+    )
     needs_value = mpc_config.objective_mode in {
-        "terminal_value_only", "reward_plus_terminal_value"
+        "terminal_value_only",
+        "reward_plus_terminal_value",
     }
     if needs_value and requested_value:
         try:
-            mpc_config.terminal_value_checkpoint = str(requested_value)
-            value_model, value_checkpoint = load_value_checkpoint(requested_value, args.device)
+            value_model, value_checkpoint = load_value_checkpoint(
+                requested_value, args.device
+            )
             if value_model.schema.to_dict() != model.schema.to_dict():
                 raise ValueError("terminal-value and world-model state schemas differ")
             value_gamma = float(value_checkpoint["gamma"])
-            if abs(value_gamma - mpc_config.gamma) > 1.0e-9:
+            if abs(value_gamma - mpc_config.gamma) > 1e-9:
                 raise ValueError(
-                    f"terminal value gamma {value_gamma} differs from MPC gamma {mpc_config.gamma}"
+                    f"terminal value gamma {value_gamma} differs from MPC gamma "
+                    f"{mpc_config.gamma}"
                 )
-            if mpc_config.terminal_value_clip:
-                percentiles = value_checkpoint.get("return_statistics", {}).get("percentiles", {})
-                if mpc_config.terminal_value_clip_min is None and "1" in percentiles:
-                    mpc_config.terminal_value_clip_min = float(percentiles["1"])
-                if mpc_config.terminal_value_clip_max is None and "99" in percentiles:
-                    mpc_config.terminal_value_clip_max = float(percentiles["99"])
+            mpc_config.terminal_value_checkpoint = str(requested_value)
         except (FileNotFoundError, OSError, RuntimeError, ValueError) as error:
             if mpc_config.terminal_value_required:
                 raise
-            warnings.warn(f"Terminal value unavailable ({error}); using reward-only MPC")
+            warnings.warn(
+                f"Terminal value unavailable ({error}); continuing without it"
+            )
             value_model = value_checkpoint = None
             mpc_config.objective_mode = "reward_only"
             mpc_config.use_terminal_value = False
     elif needs_value:
         if mpc_config.terminal_value_required:
-            raise FileNotFoundError("Terminal-value MPC requires mpc.terminal_value.checkpoint")
-        warnings.warn("No terminal value checkpoint configured; using reward-only MPC")
+            raise FileNotFoundError(
+                "Terminal-value MPC requires mpc.terminal_value.checkpoint"
+            )
+        warnings.warn("No terminal value checkpoint configured; continuing without it")
         mpc_config.objective_mode = "reward_only"
         mpc_config.use_terminal_value = False
     checkpoint_num_robots = model.action_adapter.num_robots
@@ -234,12 +250,15 @@ def build_runtime(
     )
     local_adapter = LocalObservationAdapter(model.schema)
     controlled_robot_count = team_size if joint_teams else checkpoint_num_robots
+    terminal_value_fn = None if value_model is None else value_model.predict
+    if value_model is not None and hasattr(value_model, "predict_with_uncertainty"):
+        terminal_value_fn = value_model.predict_with_uncertainty
     objective = MPCObjective(
         model.schema,
         model.action_adapter,
         model.event_names,
         mpc_config,
-        terminal_value=None if value_model is None else value_model.predict,
+        terminal_value=terminal_value_fn,
         controlled_robot_count=controlled_robot_count,
     )
     planner = HybridCEMMPC(
@@ -248,40 +267,45 @@ def build_runtime(
         model.action_adapter,
         objective=objective,
         config=mpc_config,
-        terminal_value=None if value_model is None else value_model.predict,
     )
-    opponent_forecaster = opponent_policy = None
+    opponent_forecaster = None
     if joint_teams:
         from .opponent_forecast import (
-            FrozenPolicyOpponentForecaster,
+            SlowWalkToBallOpponentForecaster,
             ZeroOpponentForecaster,
         )
 
-        opponent_source = str(getattr(args, "opponent_policy_source", "local"))
-        if opponent_source == "none":
+        opponent_config = dict(config.get("opponent", {}))
+        opponent_mode = str(
+            getattr(args, "opponent_mode", None)
+            or opponent_config.get("mode", "slow_walk_to_ball")
+        )
+        if opponent_mode == "stationary":
             opponent_forecaster = ZeroOpponentForecaster(
                 env, team_size, model.action_adapter
             )
-        else:
-            from scripts.play_high_level import load_high_level_policy
+        elif opponent_mode == "slow_walk_to_ball":
+            def setting(argument_name, config_name, default):
+                value = getattr(args, argument_name, None)
+                if value is not None:
+                    return value
+                return opponent_config.get(config_name, default)
 
-            opponent_args = SimpleNamespace(
-                high_level_policy_source=opponent_source,
-                high_level_policy_dir=getattr(args, "opponent_policy_dir", None),
-                high_level_wandb_run=getattr(args, "opponent_wandb_run", None),
-                high_level_checkpoint=getattr(
-                    args, "opponent_policy_checkpoint", "latest"
-                ),
-                policy_device=args.policy_device,
-            )
-            opponent_policy = load_high_level_policy(opponent_args)
-            opponent_forecaster = FrozenPolicyOpponentForecaster(
+            opponent_forecaster = SlowWalkToBallOpponentForecaster(
                 env,
                 team_size,
                 model.action_adapter,
-                opponent_policy,
-                opponent_device=args.policy_device,
+                speed_mps=setting("opponent_walk_speed", "walk_speed_mps", 0.35),
+                stop_distance_m=setting(
+                    "opponent_stop_distance", "stop_distance_m", 0.25
+                ),
+                slow_distance_m=setting(
+                    "opponent_slow_distance", "slow_distance_m", 1.0
+                ),
+                yaw_gain=setting("opponent_yaw_gain", "yaw_gain", 1.0),
             )
+        else:
+            raise ValueError(f"Unknown opponent mode {opponent_mode!r}")
     controller = MPCSimulatorController(
         env,
         planner,
@@ -305,5 +329,4 @@ def build_runtime(
         value_model,
         value_checkpoint,
         opponent_forecaster,
-        opponent_policy,
     )

@@ -65,8 +65,17 @@ class HighLevelSkillWrapper(gym.Wrapper):
         self.last_low_level_actions = torch.zeros_like(self.low_level_actions)
         self.skill_ids = torch.zeros(self.num_envs, self.num_robots, dtype=torch.long, device=self.device)
         self.requested_skill_ids = torch.zeros_like(self.skill_ids)
+        self.skill_transition_mask = torch.zeros_like(
+            self.skill_ids, dtype=torch.bool
+        )
         self.invalid_skill_mask = torch.zeros(self.num_envs, self.num_robots, dtype=torch.bool, device=self.device)
+        self.collision_avoidance_mask = torch.zeros_like(self.invalid_skill_mask)
+        self.attacker_command_assist_mask = torch.zeros_like(self.invalid_skill_mask)
+        self.role_conflict_mask = torch.zeros_like(self.invalid_skill_mask)
         self.skill_commands = torch.zeros(self.num_envs, self.num_robots, 3, dtype=torch.float, device=self.device)
+        self.decision_robot_ball_distances = torch.zeros(
+            self.num_envs, self.num_robots, dtype=torch.float, device=self.device
+        )
         configured_raw_clip = float(getattr(self.env.cfg.normalization, "clip_actions", 1.0))
         self.policy_action_clips = {}
         for skill_name in SKILL_NAMES:
@@ -235,6 +244,326 @@ class HighLevelSkillWrapper(gym.Wrapper):
         commands[:, :, 2] = torch.clamp(1.5 * yaw_to_ball, -walk_scale[2], walk_scale[2])
         return commands
 
+    def _team_groups(self):
+        """Return the physical robot slots belonging to each attacking team.
+
+        A normal cooperative rollout has one group containing every robot.  A
+        self-play rollout stores two equal teams contiguously, so role
+        assignment must never compare a learning robot with the opponent when
+        deciding who should attack the ball.
+        """
+
+        configured_team_size = int(
+            getattr(self.env.cfg.env, "num_team_robots", self.num_robots)
+        )
+        if (
+            configured_team_size > 0
+            and self.num_robots == 2 * configured_team_size
+        ):
+            return [
+                list(range(0, configured_team_size)),
+                list(range(configured_team_size, self.num_robots)),
+            ]
+        return [list(range(self.num_robots))]
+
+    def _attacker_mask(self, affordances):
+        """Mark the closest robot to the ball once per team."""
+
+        mask = torch.zeros(
+            self.num_envs,
+            self.num_robots,
+            dtype=torch.bool,
+            device=self.device,
+        )
+        distances = affordances["distance"]
+        for group in self._team_groups():
+            if not group:
+                continue
+            group_distances = distances[:, group]
+            nearest = torch.argmin(group_distances, dim=1)
+            rows = torch.arange(self.num_envs, device=self.device)
+            mask[rows, torch.as_tensor(group, device=self.device)[nearest]] = True
+        return mask
+
+    def _walk_support_commands(self, roots=None):
+        """Generate a spread-out support walk for non-attacking teammates.
+
+        The support target is lateral to, and slightly behind, the ball from
+        the team's goal.  Commands for walking are body-frame commands, hence
+        the world target is rotated through each robot's current base pose.
+        Keeping this deterministic makes the invalid-skill safety fallback
+        useful even for older coordinator checkpoints that have no learned
+        role representation.
+        """
+
+        if roots is None:
+            roots = self._robot_roots()
+        position = roots[:, :, :2]
+        commands = torch.zeros(
+            self.num_envs,
+            self.num_robots,
+            3,
+            dtype=torch.float,
+            device=self.device,
+        )
+        walk_scale = self._cfg_command_scale(
+            "high_level_walk_command_scale", [1.2, 0.6, 0.0]
+        )
+        field_length = float(getattr(self.env.cfg.env, "field_length", 8.0))
+        field_width = float(getattr(self.env.cfg.env, "field_width", 5.0))
+        goal_x = float(getattr(self.env.cfg.env, "team_goal_x", 0.5 * field_length))
+        support_depth = max(
+            float(getattr(self.env.cfg.rewards, "high_level_support_depth", 0.5)),
+            0.0,
+        )
+        support_lateral = max(
+            float(getattr(self.env.cfg.rewards, "high_level_support_lateral", 1.2)),
+            0.0,
+        )
+        support_margin = max(
+            float(getattr(self.env.cfg.env, "field_margin", 0.35)),
+            0.0,
+        )
+
+        for team_index, group in enumerate(self._team_groups()):
+            if len(group) < 2:
+                continue
+            # Team zero attacks +x and team one attacks -x.  This is the same
+            # canonicalization used by SharedPolicySelfPlayWrapper.
+            sign = 1.0 if team_index == 0 else -1.0
+            goal = torch.zeros(self.num_envs, 2, dtype=torch.float, device=self.device)
+            goal[:, 0] = self.env.env_origins[:, 0] + sign * goal_x
+            goal[:, 1] = self.env.env_origins[:, 1]
+            ball_xy = self.env.object_pos_world_frame[:, :2]
+            goal_direction = goal - ball_xy
+            goal_direction = goal_direction / torch.norm(
+                goal_direction, dim=-1, keepdim=True
+            ).clamp(min=1e-6)
+            lateral = torch.stack((-goal_direction[:, 1], goal_direction[:, 0]), dim=-1)
+
+            group_distances = torch.norm(
+                position[:, group] - ball_xy[:, None, :], dim=-1
+            )
+            attacker_local = torch.argmin(group_distances, dim=1)
+            rows = torch.arange(self.num_envs, device=self.device)
+            attacker_slot = torch.as_tensor(group, device=self.device)[attacker_local]
+            for local_index, slot in enumerate(group):
+                is_attacker = attacker_slot == slot
+                # Use the robot's current lateral side to avoid swapping sides
+                # as it approaches the support target.  A deterministic slot
+                # fallback handles an exact centre-line tie.
+                relative = position[:, slot] - ball_xy
+                side_value = torch.sum(relative * lateral, dim=-1)
+                default_side = 1.0 if (local_index % 2 == 0) else -1.0
+                side = torch.where(
+                    torch.abs(side_value) > 0.1,
+                    torch.sign(side_value),
+                    torch.full_like(side_value, default_side),
+                )
+                target = (
+                    ball_xy
+                    - support_depth * goal_direction
+                    + side[:, None] * support_lateral * lateral
+                )
+                # Keep support targets inside the playable rectangle.  The
+                # margin is intentionally conservative because the field
+                # texture/goal geometry is inset from the simulator bounds.
+                lower = self.env.env_origins[:, :2] + position.new_tensor(
+                    [-0.5 * field_length + support_margin, -0.5 * field_width + support_margin]
+                )
+                upper = self.env.env_origins[:, :2] + position.new_tensor(
+                    [0.5 * field_length - support_margin, 0.5 * field_width - support_margin]
+                )
+                target = torch.minimum(torch.maximum(target, lower), upper)
+                world_delta = target - position[:, slot]
+                delta_3d = torch.cat((world_delta, torch.zeros_like(world_delta[:, :1])), dim=-1)
+                body_delta = quat_rotate_inverse(
+                    roots[:, slot, 3:7], delta_3d
+                )[:, :2]
+                speed = torch.norm(body_delta, dim=-1, keepdim=True).clamp(min=1e-6)
+                direction = body_delta / speed
+                support_speed = float(
+                    getattr(self.env.cfg.rewards, "high_level_support_walk_speed", 0.75)
+                )
+                commands[:, slot, 0] = torch.clamp(
+                    direction[:, 0] * torch.minimum(speed[:, 0], torch.full_like(speed[:, 0], support_speed)),
+                    -walk_scale[0], walk_scale[0],
+                )
+                commands[:, slot, 1] = torch.clamp(
+                    direction[:, 1] * torch.minimum(speed[:, 0], torch.full_like(speed[:, 0], support_speed)),
+                    -walk_scale[1], walk_scale[1],
+                )
+                ball_delta = ball_xy - position[:, slot]
+                ball_delta_3d = torch.cat((ball_delta, torch.zeros_like(ball_delta[:, :1])), dim=-1)
+                ball_body = quat_rotate_inverse(roots[:, slot, 3:7], ball_delta_3d)[:, :2]
+                yaw_to_ball = torch.atan2(ball_body[:, 1], ball_body[:, 0])
+                commands[:, slot, 2] = torch.clamp(
+                    1.5 * yaw_to_ball, -walk_scale[2], walk_scale[2]
+                )
+                commands[is_attacker, slot] = 0.0
+        return commands
+
+    def _goalward_attacker_commands(self, skill_ids, attacker_mask):
+        """Safe field-frame dribble/shoot commands for a static attacker."""
+
+        ball = self.env.object_pos_world_frame[:, :2]
+        field_length = float(getattr(self.env.cfg.env, "field_length", 8.0))
+        goal_x = float(getattr(self.env.cfg.env, "team_goal_x", 0.5 * field_length))
+        dribble_scale = self._cfg_command_scale(
+            "high_level_dribble_command_scale", [1.5, 1.5, 1.0]
+        )
+        shoot_scale = self._cfg_command_scale(
+            "high_level_shoot_command_scale", [1.5, 1.5, 0.0]
+        )
+        commands = torch.zeros(
+            self.num_envs, self.num_robots, 3, dtype=torch.float, device=self.device
+        )
+        for team_index, group in enumerate(self._team_groups()):
+            if not group:
+                continue
+            sign = 1.0 if team_index == 0 else -1.0
+            goal = torch.zeros(self.num_envs, 2, dtype=torch.float, device=self.device)
+            goal[:, 0] = self.env.env_origins[:, 0] + sign * goal_x
+            goal[:, 1] = self.env.env_origins[:, 1]
+            direction = goal - ball
+            direction = direction / torch.norm(direction, dim=-1, keepdim=True).clamp(min=1e-6)
+            for slot in group:
+                mask = attacker_mask[:, slot]
+                if not bool(torch.any(mask).detach().cpu().item()):
+                    continue
+                scale = torch.where(
+                    (skill_ids[:, slot] == SKILL_TO_ID["shoot"]).unsqueeze(-1),
+                    shoot_scale[:2].view(1, 2),
+                    dribble_scale[:2].view(1, 2),
+                )
+                commands[mask, slot, :2] = direction[mask] * scale[mask]
+        return commands
+
+    def _apply_collision_avoidance(self, skill_ids, commands, roots=None):
+        """Replace unsafe skills with a short body-frame escape walk.
+
+        Predict closest separation over a short horizon and override both
+        members of an imminent near-contact pair. This is intended as an
+        opt-in deployment guard: training normally leaves it disabled so PPO
+        receives transitions caused by its own sampled actions.
+        """
+
+        enabled = bool(
+            getattr(
+                self.env.cfg.env,
+                "high_level_collision_avoidance",
+                False,
+            )
+        )
+        avoidance_mask = torch.zeros_like(skill_ids, dtype=torch.bool)
+        if not enabled or self.num_robots < 2:
+            return skill_ids, commands, avoidance_mask
+
+        if roots is None:
+            roots = self._robot_roots()
+        position = roots[:, :, :2]
+        velocity = roots[:, :, 7:9]
+        relative_position = position[:, :, None, :] - position[:, None, :, :]
+        relative_velocity = velocity[:, :, None, :] - velocity[:, None, :, :]
+
+        lookahead = max(
+            float(
+                getattr(
+                    self.env.cfg.rewards,
+                    "high_level_robot_avoidance_lookahead",
+                    0.25,
+                )
+            ),
+            0.0,
+        )
+        clearance = float(
+            getattr(
+                self.env.cfg.rewards,
+                "high_level_robot_avoidance_distance",
+                0.55,
+            )
+        )
+        escape_speed = float(
+            getattr(
+                self.env.cfg.rewards,
+                "high_level_robot_avoidance_speed",
+                0.5,
+            )
+        )
+        if clearance <= 0.0 or escape_speed <= 0.0:
+            raise ValueError(
+                "high-level robot avoidance distance and speed must be positive, "
+                f"got distance={clearance}, speed={escape_speed}"
+            )
+
+        relative_speed_sq = torch.sum(relative_velocity.square(), dim=-1)
+        closest_time = -torch.sum(
+            relative_position * relative_velocity, dim=-1
+        ) / relative_speed_sq.clamp(min=1e-6)
+        closest_time = closest_time.clamp(min=0.0, max=lookahead)
+        closest_delta = relative_position + closest_time.unsqueeze(-1) * relative_velocity
+        closest_distance = torch.norm(closest_delta, dim=-1)
+        diagonal = torch.eye(
+            self.num_robots, dtype=torch.bool, device=self.device
+        ).unsqueeze(0)
+        closest_distance = closest_distance.masked_fill(diagonal, float("inf"))
+
+        nearest_distance, nearest_robot = torch.min(closest_distance, dim=2)
+        avoidance_mask = nearest_distance < clearance
+        if not bool(torch.any(avoidance_mask).detach().cpu().item()):
+            return skill_ids, commands, avoidance_mask
+
+        gather_index = nearest_robot[..., None, None].expand(-1, -1, 1, 2)
+        escape_delta_world = torch.gather(
+            relative_position, 2, gather_index
+        ).squeeze(2)
+        # Exact overlap has no stable current direction; use the predicted
+        # relative displacement as a deterministic fallback.
+        predicted_delta = torch.gather(
+            closest_delta, 2, gather_index
+        ).squeeze(2)
+        current_norm = torch.norm(escape_delta_world, dim=-1, keepdim=True)
+        escape_delta_world = torch.where(
+            current_norm > 1e-5,
+            escape_delta_world,
+            predicted_delta,
+        )
+        escape_direction_world = escape_delta_world / torch.norm(
+            escape_delta_world, dim=-1, keepdim=True
+        ).clamp(min=1e-6)
+
+        # Stronger motion is used for deeper predicted incursions. Keep a
+        # nonzero floor so a just-detected collision course is acted on rather
+        # than rounded into a near-stationary command.
+        danger = (clearance - nearest_distance).clamp(min=0.0) / clearance
+        commanded_speed = escape_speed * (0.5 + 0.5 * danger)
+        escape_world = escape_direction_world * commanded_speed.unsqueeze(-1)
+        escape_world_3d = torch.cat(
+            (escape_world, torch.zeros_like(escape_world[:, :, :1])), dim=-1
+        )
+        escape_body = quat_rotate_inverse(
+            roots[:, :, 3:7].reshape(-1, 4),
+            escape_world_3d.reshape(-1, 3),
+        ).view(self.num_envs, self.num_robots, 3)
+
+        walk_scale = self._cfg_command_scale(
+            "high_level_walk_command_scale", [1.2, 0.6, 0.0]
+        )
+        escape_commands = torch.zeros_like(commands)
+        escape_commands[:, :, 0] = escape_body[:, :, 0].clamp(
+            -walk_scale[0], walk_scale[0]
+        )
+        escape_commands[:, :, 1] = escape_body[:, :, 1].clamp(
+            -walk_scale[1], walk_scale[1]
+        )
+        escape_commands[:, :, 2] = 0.0
+
+        skill_ids = skill_ids.clone()
+        commands = commands.clone()
+        skill_ids[avoidance_mask] = SKILL_TO_ID["walk"]
+        commands[avoidance_mask] = escape_commands[avoidance_mask]
+        return skill_ids, commands, avoidance_mask
+
     def _decode_action(self, action):
         action = self._sanitize_tensor(action.to(self.device), self._high_level_action_clip()).view(
             self.num_envs,
@@ -242,9 +571,15 @@ class HighLevelSkillWrapper(gym.Wrapper):
             6,
         )
         requested_skill_ids = torch.argmax(action[:, :, :3], dim=-1)
+        self.skill_transition_mask[:] = requested_skill_ids != self.requested_skill_ids
         affordances = self._skill_affordances()
+        self.decision_robot_ball_distances[:] = affordances["distance"]
+        attacker_mask = self._attacker_mask(affordances)
+        self.env.high_level_attacker_mask = attacker_mask
 
         skill_ids = requested_skill_ids.clone()
+        role_conflict = torch.zeros_like(requested_skill_ids, dtype=torch.bool)
+        support_override = torch.zeros_like(requested_skill_ids, dtype=torch.bool)
         use_geometric_fallback = bool(
             getattr(
                 self.env.cfg.env,
@@ -255,11 +590,50 @@ class HighLevelSkillWrapper(gym.Wrapper):
         if use_geometric_fallback:
             dribble_invalid = (requested_skill_ids == 1) & ~affordances["can_dribble"]
             shoot_invalid = (requested_skill_ids == 2) & ~affordances["can_shoot"]
-            shoot_to_dribble = shoot_invalid & affordances["can_dribble"]
-            force_walk = dribble_invalid | (shoot_invalid & ~affordances["can_dribble"])
+            role_aware = bool(
+                getattr(
+                    self.env.cfg.env,
+                    "high_level_role_aware_fallback",
+                    True,
+                )
+            )
+            support_role_conflict = (
+                (requested_skill_ids != SKILL_TO_ID["walk"])
+                & ~attacker_mask
+                if role_aware
+                else torch.zeros_like(requested_skill_ids, dtype=torch.bool)
+            )
+            attacker_walk_conflict = (
+                (requested_skill_ids == SKILL_TO_ID["walk"])
+                & attacker_mask
+                & affordances["can_dribble"]
+                if role_aware
+                else torch.zeros_like(requested_skill_ids, dtype=torch.bool)
+            )
+            role_conflict = support_role_conflict | attacker_walk_conflict
+            shoot_to_dribble = (
+                shoot_invalid
+                & affordances["can_dribble"]
+                & attacker_mask
+            )
+            force_walk = (
+                dribble_invalid
+                | (shoot_invalid & ~affordances["can_dribble"])
+                | support_role_conflict
+            )
+            # A support robot is never sent to the ball by the generic walk
+            # skill either.  Its walk command is replaced below with the
+            # lateral support target, regardless of which walk parameters the
+            # old coordinator sampled.
+            support_override = ~attacker_mask if role_aware else support_override
+            force_walk = force_walk | support_override
+            # Role arbitration is a coordination override, not a physically
+            # invalid request.  Keep the geometric-invalid diagnostic separate
+            # so the coordinator is not charged twice for yielding the ball.
             invalid_skill_mask = dribble_invalid | shoot_invalid
             skill_ids[shoot_to_dribble] = 1
             skill_ids[force_walk] = 0
+            skill_ids[attacker_walk_conflict] = SKILL_TO_ID["dribble"]
         else:
             # Do not silently replace the coordinator's decision. This keeps
             # exploration and credit assignment faithful when no affordance
@@ -272,17 +646,67 @@ class HighLevelSkillWrapper(gym.Wrapper):
         commands = torch.maximum(torch.minimum(commands, final_scales), -final_scales)
         if use_geometric_fallback:
             walk_to_ball_commands = self._walk_to_ball_commands(affordances)
-            commands[force_walk] = walk_to_ball_commands[force_walk]
+            support_commands = self._walk_support_commands()
+            role_aware = bool(
+                getattr(self.env.cfg.env, "high_level_role_aware_fallback", True)
+            )
+            support_fallback = (
+                force_walk & ~attacker_mask if role_aware else torch.zeros_like(force_walk)
+            )
+            attacker_fallback = force_walk & attacker_mask if role_aware else force_walk
+            commands[attacker_fallback] = walk_to_ball_commands[attacker_fallback]
+            commands[support_fallback] = support_commands[support_fallback]
+            if bool(torch.any(attacker_walk_conflict).detach().cpu().item()):
+                goalward_commands = self._goalward_attacker_commands(
+                    skill_ids, attacker_mask
+                )
+                commands[attacker_walk_conflict] = goalward_commands[
+                    attacker_walk_conflict
+                ]
+
+        command_assist_mask = torch.zeros_like(attacker_mask)
+        role_aware = bool(
+            getattr(self.env.cfg.env, "high_level_role_aware_fallback", True)
+        )
+        if use_geometric_fallback and role_aware:
+            # Ball skills with a zero planar command make a physically capable
+            # attacker stand still. Supply a conservative goalward command for
+            # that transition, while exposing a separate penalty mask so PPO
+            # learns to produce the command itself instead of exploiting the
+            # assist indefinitely.
+            min_command_speed = float(
+                getattr(self.env.cfg.rewards, "high_level_skill_command_min_speed", 0.2)
+            )
+            command_assist_mask = (
+                attacker_mask
+                & (skill_ids != SKILL_TO_ID["walk"])
+                & (torch.norm(commands[:, :, :2], dim=-1) < min_command_speed)
+            )
+            if bool(torch.any(command_assist_mask).detach().cpu().item()):
+                assisted_commands = self._goalward_attacker_commands(
+                    skill_ids, attacker_mask
+                )
+                commands[command_assist_mask] = assisted_commands[command_assist_mask]
         commands[:, :, 2] = torch.where(skill_ids == 2, torch.zeros_like(commands[:, :, 2]), commands[:, :, 2])
+        skill_ids, commands, collision_avoidance_mask = self._apply_collision_avoidance(
+            skill_ids,
+            commands,
+        )
         command_clip = float(torch.max(self._command_obs_scale()).detach().cpu().item())
         commands = self._sanitize_tensor(commands, max(command_clip, 1.0))
         self.requested_skill_ids[:] = requested_skill_ids
         self.skill_ids[:] = skill_ids
         self.invalid_skill_mask[:] = invalid_skill_mask
+        self.collision_avoidance_mask[:] = collision_avoidance_mask
+        self.attacker_command_assist_mask[:] = command_assist_mask
+        self.role_conflict_mask[:] = role_conflict
         self.env.high_level_requested_skill_ids[:] = requested_skill_ids
+        self.env.high_level_skill_transition_mask = self.skill_transition_mask
         self.skill_commands[:] = commands
         self.env.high_level_skill_ids[:] = skill_ids
         self.env.high_level_invalid_skill_mask[:] = invalid_skill_mask
+        self.env.high_level_attacker_command_assist_mask = self.attacker_command_assist_mask
+        self.env.high_level_role_conflict_mask = self.role_conflict_mask
         self.env.high_level_commands[:] = commands
 
     def _full_command(self, skill_id, command):
@@ -520,10 +944,17 @@ class HighLevelSkillWrapper(gym.Wrapper):
         self.high_level_obs_history[env_ids] = 0.0
         self.skill_ids[env_ids] = 0
         self.requested_skill_ids[env_ids] = 0
+        self.skill_transition_mask[env_ids] = False
         self.invalid_skill_mask[env_ids] = False
+        self.collision_avoidance_mask[env_ids] = False
+        self.attacker_command_assist_mask[env_ids] = False
+        self.role_conflict_mask[env_ids] = False
         self.skill_commands[env_ids] = 0.0
+        self.decision_robot_ball_distances[env_ids] = 0.0
         self.env.high_level_skill_ids[env_ids] = 0
         self.env.high_level_requested_skill_ids[env_ids] = 0
+        if hasattr(self.env, "high_level_skill_transition_mask"):
+            self.env.high_level_skill_transition_mask[env_ids] = False
         self.env.high_level_invalid_skill_mask[env_ids] = False
         self.env.high_level_commands[env_ids] = 0.0
 
@@ -536,11 +967,19 @@ class HighLevelSkillWrapper(gym.Wrapper):
         self.last_low_level_actions.zero_()
         self.skill_ids.zero_()
         self.requested_skill_ids.zero_()
+        self.skill_transition_mask.zero_()
         self.invalid_skill_mask.zero_()
+        self.collision_avoidance_mask.zero_()
+        self.attacker_command_assist_mask.zero_()
+        self.role_conflict_mask.zero_()
         self.skill_commands.zero_()
+        self.decision_robot_ball_distances.zero_()
         self.env.high_level_skill_ids.zero_()
         self.env.high_level_requested_skill_ids.zero_()
+        self.env.high_level_skill_transition_mask = self.skill_transition_mask
         self.env.high_level_invalid_skill_mask.zero_()
+        self.env.high_level_attacker_command_assist_mask = self.attacker_command_assist_mask
+        self.env.high_level_role_conflict_mask = self.role_conflict_mask
         self.env.high_level_commands.zero_()
         self._update_high_level_obs()
         return self.cached_obs
@@ -569,7 +1008,7 @@ class HighLevelSkillWrapper(gym.Wrapper):
             "time_outs": "time_out_buf",
         }
 
-        for _ in range(self.control_interval):
+        for low_level_step in range(self.control_interval):
             active = ~done_total
             elapsed_low_level_steps += active.long()
             self.last_low_level_actions[:] = self.low_level_actions
@@ -577,6 +1016,11 @@ class HighLevelSkillWrapper(gym.Wrapper):
             joint_actions = self.low_level_actions.reshape(self.num_envs, -1)
             joint_actions[~active] = 0.0
             _, low_reward, done, info = self.env.step(joint_actions)
+            if low_level_step == 0:
+                # Setup shaping is a decision event, not a reward that can be
+                # collected by holding the same skill for an entire interval.
+                self.skill_transition_mask.zero_()
+                self.env.high_level_skill_transition_mask = self.skill_transition_mask
             bad_envs = self._reset_bad_envs()
             low_reward = self._sanitize_tensor(low_reward, 1.0e4)
             done = torch.logical_or(done.bool(), bad_envs)
@@ -596,7 +1040,16 @@ class HighLevelSkillWrapper(gym.Wrapper):
         executed_skill_ids = self.skill_ids.detach().cpu().numpy().copy()
         requested_skill_ids = self.requested_skill_ids.detach().cpu().numpy().copy()
         invalid_skill_mask = self.invalid_skill_mask.detach().cpu().numpy().copy()
+        collision_avoidance_mask = self.collision_avoidance_mask.detach().cpu().numpy().copy()
+        attacker_mask = self.env.high_level_attacker_mask.detach().cpu().numpy().copy()
+        attacker_command_assist_mask = (
+            self.attacker_command_assist_mask.detach().cpu().numpy().copy()
+        )
+        role_conflict_mask = self.role_conflict_mask.detach().cpu().numpy().copy()
         executed_commands = self.skill_commands.detach().cpu().numpy().copy()
+        decision_robot_ball_distances = (
+            self.decision_robot_ball_distances.detach().cpu().numpy().copy()
+        )
         if bool(torch.any(done_total).detach().cpu().item()):
             self._clear_high_level_state(done_total)
         self._update_high_level_obs()
@@ -606,7 +1059,12 @@ class HighLevelSkillWrapper(gym.Wrapper):
         info["high_level_skill_ids"] = executed_skill_ids
         info["high_level_requested_skill_ids"] = requested_skill_ids
         info["high_level_invalid_skill_mask"] = invalid_skill_mask
+        info["high_level_collision_avoidance_mask"] = collision_avoidance_mask
+        info["high_level_attacker_mask"] = attacker_mask
+        info["high_level_attacker_command_assist_mask"] = attacker_command_assist_mask
+        info["high_level_role_conflict_mask"] = role_conflict_mask
         info["high_level_commands"] = executed_commands
+        info["high_level_decision_robot_ball_distances"] = decision_robot_ball_distances
         info["high_level_robot_ball_distances"] = (
             self.env._high_level_robot_ball_distances().detach().cpu().numpy()
         )

@@ -68,7 +68,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", default="data/mpc_teacher")
-    parser.add_argument("--checkpoint", default="checkpoints/terminal_value/best.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/terminal_value_mpc/best.pt")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output", default="outputs/terminal_value_error_decomposition.json")
     main(parser.parse_args())

@@ -122,9 +122,15 @@ class FootballWorldModelStateAdapter:
         goal_half_width = float(getattr(raw.cfg.env, "team_goal_half_width", 1.0))
         in_opponent_goal = (field_ball[:, 0] >= goal_x) & (field_ball[:, 1].abs() <= goal_half_width)
         in_own_goal = (field_ball[:, 0] <= -half_length) & (field_ball[:, 1].abs() <= goal_half_width)
-        out_of_bounds = (
-            (field_ball[:, 0].abs() > half_length) | (field_ball[:, 1].abs() > half_width)
-        ) & ~in_opponent_goal & ~in_own_goal
+        if bool(getattr(raw.cfg.env, "add_boundary_walls", False)):
+            # A wall rebound is an ordinary in-episode transition. Keep the
+            # event channel mutually consistent with the simulator's match
+            # termination logic when physical walls are enabled.
+            out_of_bounds = torch.zeros(raw.num_envs, dtype=torch.bool, device=device)
+        else:
+            out_of_bounds = (
+                (field_ball[:, 0].abs() > half_length) | (field_ball[:, 1].abs() > half_width)
+            ) & ~in_opponent_goal & ~in_own_goal
 
         state = torch.zeros(raw.num_envs, self.state_dim, device=device)
         skill_ids = getattr(wrapper, "skill_ids", getattr(raw, "high_level_skill_ids"))

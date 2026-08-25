@@ -444,6 +444,13 @@ def parse_args():
     parser.add_argument("--field-length", type=float, default=8.0)
     parser.add_argument("--field-width", type=float, default=5.0)
     parser.add_argument("--goal-half-width", type=float, default=1.0)
+    parser.add_argument(
+        "--no-boundary-walls",
+        dest="boundary_walls",
+        action="store_false",
+        default=True,
+        help="Disable physical rebound walls and restore legacy out-of-bounds termination.",
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--walk-x-speed-scale", type=float, default=1.5)
     parser.add_argument("--walk-y-speed-scale", type=float, default=1.5)

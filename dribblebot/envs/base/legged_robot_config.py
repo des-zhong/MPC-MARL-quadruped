@@ -40,6 +40,7 @@ class Cfg(PrefixProto, cli=False):
         # invalid dribble/shoot requests replaced by another skill.  The
         # coordinator executes its requested skill directly by default.
         high_level_use_geometric_skill_fallback = False
+        high_level_role_aware_fallback = True
         num_robots = 1
         # Competitive high-level tasks set num_robots to twice this value and
         # assign the second contiguous half to the opposing team.
@@ -61,6 +62,17 @@ class Cfg(PrefixProto, cli=False):
         field_length = 8.0
         field_width = 5.0
         field_margin = 0.4
+        # Optional physical perimeter. High-level soccer configurations enable
+        # this so the ball rebounds instead of ending the match at the painted
+        # boundary. End walls are split around the goal mouths so a wall hit
+        # cannot cross a goal/out-of-bounds plane before physical contact.
+        add_boundary_walls = False
+        boundary_wall_thickness = 0.12
+        boundary_wall_height = 0.50
+        boundary_wall_offset = 0.05
+        boundary_wall_goal_opening_margin = 0.0
+        boundary_wall_friction = 0.35
+        boundary_wall_restitution = 0.85
         robot_init_x_range = [-3.2, -0.8]
         robot_init_y_range = [-1.8, 1.8]
         robot_yaw_init_range = [-3.14159265, 3.14159265]
@@ -413,16 +425,29 @@ class Cfg(PrefixProto, cli=False):
         high_level_border_margin = 0.0
         high_level_min_robot_spacing = 0.65
         high_level_target_robot_spacing = 1.5
-        high_level_robot_collision_distance = 0.75
+        high_level_support_min_ball_distance = 1.15
+        high_level_support_depth = 0.5
+        high_level_support_lateral = 1.2
+        high_level_support_walk_speed = 0.75
+        high_level_robot_collision_distance = 0.65
+        high_level_robot_avoidance_distance = 0.55
+        high_level_robot_avoidance_lookahead = 0.25
+        high_level_robot_avoidance_speed = 0.5
         high_level_obstacle_safe_distance = 0.55
         high_level_dribble_skill_distance = 1.0
         high_level_dribble_control_distance = 0.8
         high_level_skill_command_min_speed = 0.2
+        high_level_skill_command_target_speed = 0.8
+        high_level_local_attacker_ball_skill_scale = 2.0
+        high_level_local_attacker_command_assist_scale = -4.0
+        high_level_local_role_conflict_scale = -3.0
+        high_level_local_support_ball_crowding_scale = -3.0
         high_level_dribble_min_ball_speed = 0.1
         high_level_dribble_target_ball_speed = 1.0
         high_level_shoot_skill_distance = 0.75
         high_level_shoot_min_forward = -0.1
         high_level_shoot_lateral_reach = 0.45
+        high_level_shoot_setup_min_behind_alignment = 0.3
         high_level_shoot_min_ball_speed = 0.8
         high_level_shoot_min_delta_speed = 0.25
         high_level_shoot_target_delta_speed = 1.5
@@ -514,6 +539,7 @@ class Cfg(PrefixProto, cli=False):
         high_level_face_ball_while_approaching = 0.0
         high_level_face_goal_while_moving = 0.0
         high_level_dribble_ball_control = 0.0
+        high_level_shoot_setup = 0.0
         high_level_shoot_launch = 0.0
 
     class normalization(PrefixProto, cli=False):
