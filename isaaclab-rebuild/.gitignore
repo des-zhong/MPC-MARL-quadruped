@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+logs/
+outputs/
+*.egg-info/
+.venv/
+# IsaacLab is installed from the pinned runtime package.  The local vendor
+# tree is an installation cache and is intentionally not part of this repo.
+vendor/
