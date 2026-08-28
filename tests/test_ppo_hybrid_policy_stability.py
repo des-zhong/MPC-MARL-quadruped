@@ -1,6 +1,7 @@
 """Regression tests for high-level hybrid PPO safeguards."""
 
 import math
+from types import SimpleNamespace
 
 import torch
 
@@ -8,7 +9,10 @@ from dribblebot_learn.ppo_cse.ppo import (
     gaussian_kl_mean,
     hybrid_policy_kl_mean,
 )
-from dribblebot_learn.ppo_cse.actor_critic import HybridSkillDistribution
+from dribblebot_learn.ppo_cse.actor_critic import (
+    ActorCritic,
+    HybridSkillDistribution,
+)
 
 
 def test_gaussian_kl_is_zero_for_identical_policies_and_never_negative():
@@ -61,6 +65,21 @@ def test_hybrid_distribution_samples_one_hot_skill_and_exact_log_prob():
     torch.testing.assert_close(actions[:, :3].sum(dim=-1), torch.ones(1))
     assert torch.all((actions[:, :3] == 0.0) | (actions[:, :3] == 1.0))
     assert distribution.log_prob(actions).shape == (1,)
+
+
+def test_actor_critic_keeps_one_hybrid_log_probability_per_sample():
+    parameters = torch.randn(7, 6)
+    distribution = HybridSkillDistribution(parameters, torch.full((6,), 0.2))
+    policy = SimpleNamespace(
+        distribution=distribution,
+        hybrid_skill_policy=True,
+    )
+    actions = distribution.sample()
+
+    log_prob = ActorCritic.get_actions_log_prob(policy, actions)
+
+    assert log_prob.shape == (7,)
+    torch.testing.assert_close(log_prob, distribution.log_prob(actions))
 
 
 def test_hybrid_kl_includes_categorical_and_continuous_changes():

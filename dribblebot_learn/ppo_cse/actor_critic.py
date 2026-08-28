@@ -276,7 +276,14 @@ class ActorCritic(nn.Module):
         return self.distribution.sample()
 
     def get_actions_log_prob(self, actions):
-        return self.distribution.log_prob(actions).sum(dim=-1)
+        log_prob = self.distribution.log_prob(actions)
+        # Normal.log_prob returns one value per action coordinate.  The hybrid
+        # distribution has already reduced its categorical and command terms
+        # to one joint value per sample, so summing it again would incorrectly
+        # reduce the entire minibatch to a scalar.
+        if self.hybrid_skill_policy:
+            return log_prob
+        return log_prob.sum(dim=-1)
 
     def act_expert(self, ob, policy_info={}):
         return self.act_teacher(ob["obs_history"], ob["privileged_obs"])

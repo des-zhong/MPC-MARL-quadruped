@@ -55,6 +55,22 @@ HIGH_LEVEL_LOCAL_ROLE_REWARD_SCALES = {
 }
 
 
+def set_training_seed(seed):
+    """Seed Python, NumPy, Torch, and CUDA after Isaac Gym is imported."""
+
+    import random
+
+    import numpy as np
+    import torch
+
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def resolve_high_level_checkpoint_dir(configured, wandb_run_dir):
     """Resolve an optional override or create the standard per-run W&B path."""
 
@@ -661,7 +677,20 @@ def load_skill_policies(args):
                 "--skill-policy-source local requires " + ", ".join(missing)
             )
 
-    from scripts.play_walk_dribble_shoot import load_policy_record, resolve_wandb_policy_files
+    try:
+        from scripts.play_walk_dribble_shoot import (
+            load_policy_record,
+            resolve_wandb_policy_files,
+        )
+    except ModuleNotFoundError as error:
+        if error.name != "scripts.play_walk_dribble_shoot":
+            raise
+        # Some lightweight checkouts move the legacy playback entry point to
+        # discard/.  Keep training usable without changing the policy loader.
+        from discard.play_walk_dribble_shoot import (
+            load_policy_record,
+            resolve_wandb_policy_files,
+        )
     from scripts.playback_utils import (
         build_policy_metadata,
         find_policy_config_path,
@@ -833,6 +862,8 @@ def train_robot(args):
     import isaacgym
     assert isaacgym
 
+    set_training_seed(args.seed)
+
     from dribblebot.envs.base.legged_robot_config import Cfg
 
     configure_high_level_cfg(Cfg, args)
@@ -906,6 +937,7 @@ def train_robot(args):
             "skill_policy_metadata": {
                 skill: record["policy_metadata"] for skill, record in skill_policies.items()
             },
+            "training_seed": int(args.seed),
             "self_play": {
                 "enabled": True,
                 "team_size": args.num_robots,
@@ -1026,6 +1058,10 @@ def train_robot(args):
             reward_coefficient=args.teacher_reward_coefficient,
             opponent_config=mpc_payload.get("opponent", {}),
         )
+    # Policy initialization must depend only on --seed. Loading an auxiliary
+    # world/value model can otherwise advance Torch's RNG and give nominally
+    # matched ablation runs different starting actors.
+    set_training_seed(args.seed)
     runner = Runner(env, device=args.device)
     runner.learn(num_learning_iterations=args.iterations, init_at_random_ep_len=True, eval_freq=100)
 
@@ -1034,6 +1070,7 @@ def build_arg_parser():
     parser = argparse.ArgumentParser(description="Train an AS2 multi-robot high-level soccer coordinator.")
     parser.add_argument("--device", default="cuda:3")
     parser.add_argument("--policy-device", default="cpu")
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--project", default=None)
     parser.add_argument(

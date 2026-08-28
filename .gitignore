@@ -7,7 +7,7 @@ __pycache__/
 .ruff_cache/
 .coverage
 htmlcov/
-
+discard/
 # Packaging and native-extension build products
 *.egg-info/
 build/

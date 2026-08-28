@@ -107,6 +107,9 @@ class PPO_Args(PrefixProto):
     num_skill_logits = 3
     stop_on_excessive_kl = False
     max_kl_factor = 4.0
+    # Prevent an extreme likelihood-ratio exponent from overflowing before
+    # the KL-based minibatch guard has a chance to reject the update.
+    max_log_ratio = 20.0
 
     selective_adaptation_module_loss = False
 
@@ -259,8 +262,17 @@ class PPO:
                     # argmax-selected skill.
                     continue
 
-            # Surrogate loss
-            ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+            # Surrogate loss.  A very stale minibatch can produce a large
+            # finite log-ratio even when the KL guard is disabled or delayed;
+            # clamping keeps exp() finite and avoids turning one bad sample
+            # into NaN actor gradients.
+            log_ratio = actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch)
+            if self.actor_critic.hybrid_skill_policy:
+                log_ratio = log_ratio.clamp(
+                    min=-float(PPO_Args.max_log_ratio),
+                    max=float(PPO_Args.max_log_ratio),
+                )
+            ratio = torch.exp(log_ratio)
             surrogate = -torch.squeeze(advantages_batch) * ratio
             surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(ratio, 1.0 - PPO_Args.clip_param,
                                                                                1.0 + PPO_Args.clip_param)
@@ -294,12 +306,44 @@ class PPO:
                 + PPO_Args.value_loss_coef * value_loss
                 - entropy_bonus
             )
+            if not bool(torch.isfinite(loss)):
+                continue
 
-            # Gradient step
+            # Gradient step.  Never pass non-finite gradients or parameters to
+            # Adam: its running moments would otherwise permanently poison a
+            # resumed high-level policy checkpoint.
             self.optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(self.actor_critic.parameters(), PPO_Args.max_grad_norm)
+            grad_norm = nn.utils.clip_grad_norm_(
+                self.actor_critic.parameters(), PPO_Args.max_grad_norm
+            )
+            if not bool(torch.isfinite(grad_norm)):
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
+            parameter_backup = None
+            if self.actor_critic.hybrid_skill_policy:
+                parameter_backup = [
+                    parameter.detach().clone()
+                    for parameter in self.actor_critic.parameters()
+                ]
             self.optimizer.step()
+            if (
+                parameter_backup is not None
+                and not all(
+                    bool(torch.isfinite(parameter).all())
+                    for parameter in self.actor_critic.parameters()
+                )
+            ):
+                with torch.no_grad():
+                    for parameter, backup in zip(
+                        self.actor_critic.parameters(), parameter_backup
+                    ):
+                        parameter.copy_(backup)
+                        state = self.optimizer.state.get(parameter)
+                        if state is not None:
+                            state.clear()
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
             performed_updates += 1
             with torch.no_grad():
                 self.actor_critic.std.clamp_(
