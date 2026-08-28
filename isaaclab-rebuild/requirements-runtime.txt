@@ -1,0 +1,13 @@
+# Runtime pins for the dedicated IsaacLab/Isaac Sim 5.1 training environment.
+# Install with the NVIDIA extra index documented in README.md.
+setuptools==81.0.0
+wheel==0.42.0
+numpy==1.26.0
+torch==2.7.0
+torchvision==0.22.0
+gymnasium==1.2.1
+fastapi==0.115.7
+starlette==0.45.3
+flatdict==4.0.1
+transformers==4.57.6
+isaaclab[isaacsim,all]==2.3.2.post1

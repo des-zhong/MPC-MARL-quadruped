@@ -1,0 +1,19 @@
+[package]
+version = "0.1.0"
+category = "isaaclab"
+readme = "README.md"
+title = "DribbleBot Isaac Lab"
+author = "MPC-MARL-quadruped contributors"
+maintainer = "MPC-MARL-quadruped contributors"
+description = "Manager-based Isaac Lab rebuild of the DribbleBot quadruped soccer environments"
+repository = ""
+keywords = ["isaaclab", "quadruped", "football", "reinforcement-learning"]
+
+[dependencies]
+"isaaclab" = {}
+"isaaclab_assets" = {}
+"isaaclab_rl" = {}
+"isaaclab_tasks" = {}
+
+[[python.module]]
+name = "dribblebot_isaaclab"
