@@ -37,5 +37,6 @@ exec "${PYTHON_BIN}" scripts/train_high_level.py \
   --resume \
   --resume-mode policy-only \
   --resume-checkpoint "${RESUME_CHECKPOINT}" \
+  --device cuda:5 \
   "${OUTPUT_ARGS[@]}" \
   "$@"

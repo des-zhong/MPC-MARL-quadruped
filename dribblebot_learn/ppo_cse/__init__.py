@@ -104,11 +104,15 @@ class RunnerArgs(PrefixProto, cli=False):
 
 class Runner:
 
-    def __init__(self, env, device='cpu'):
+    def __init__(self, env, device='cpu', training_extension=None):
         from .ppo import PPO
 
         self.device = device
         self.env = env
+        # Optional, opt-in hooks for training pipelines which need to learn
+        # auxiliary models from the same rollout.  The ordinary locomotion and
+        # high-level runners pass no extension and retain their exact behavior.
+        self.training_extension = training_extension
 
         actor_critic = ActorCritic(self.env.num_obs,
                                       self.env.num_privileged_obs,
@@ -275,6 +279,9 @@ class Runner:
                     )
                     print(f"Loaded frozen opponent weights from {opponent_path}.")
 
+        if self.training_extension is not None:
+            self.training_extension.bind_runner(self)
+
     def learn(self, num_learning_iterations, init_at_random_ep_len=False, eval_freq=100, curriculum_dump_freq=500, eval_expert=False):
         from .ppo import PPO_Args
 
@@ -328,6 +335,16 @@ class Runner:
                 for i in range(self.num_steps_per_env):
                     actions = self.alg.act(obs[:num_train_envs], privileged_obs[:num_train_envs],
                                                  obs_history[:num_train_envs])
+                    if self.training_extension is not None:
+                        self.training_extension.before_env_step(
+                            it,
+                            obs_before={
+                                "obs": obs[:num_train_envs],
+                                "privileged_obs": privileged_obs[:num_train_envs],
+                                "obs_history": obs_history[:num_train_envs],
+                            },
+                            actions=actions,
+                        )
                     
                     ret = self.env.step(actions)
                     obs_dict, rewards, dones, infos = ret
@@ -336,6 +353,15 @@ class Runner:
 
                     obs, privileged_obs, obs_history, rewards, dones = obs.to(self.device), privileged_obs.to(
                         self.device), obs_history.to(self.device), rewards.to(self.device), dones.to(self.device)
+                    if self.training_extension is not None:
+                        self.training_extension.process_env_step(
+                            it,
+                            obs=obs_dict,
+                            actions=actions,
+                            rewards=rewards,
+                            dones=dones,
+                            infos=infos,
+                        )
                     self.alg.process_env_step(rewards[:num_train_envs], dones[:num_train_envs], infos)
 
                     if 'train/episode' in infos:
@@ -411,7 +437,14 @@ class Runner:
 
                 self.alg.compute_returns(obs_history[:num_train_envs], privileged_obs[:num_train_envs])
 
+            if self.training_extension is not None:
+                self.training_extension.after_rollout(it)
             mean_value_loss, mean_surrogate_loss, mean_adaptation_module_loss, mean_decoder_loss, mean_decoder_loss_student, mean_adaptation_module_test_loss, mean_decoder_test_loss, mean_decoder_test_loss_student, mean_adaptation_losses_dict = self.alg.update()
+            extension_metrics = {}
+            if self.training_extension is not None:
+                extension_metrics = dict(
+                    self.training_extension.after_policy_update(it) or {}
+                )
             if (
                 RunnerArgs.self_play_update_interval > 0
                 and hasattr(self.env, "update_opponent_policy")
@@ -458,6 +491,7 @@ class Runner:
                 "policy/action_abs_max": self.alg.last_action_abs_max,
                 "policy/action_clip_fraction": action_clip_fraction,
             }
+            training_metrics.update(extension_metrics)
             if high_level_selection_count > 0:
                 skill_names = ("walk", "dribble", "shoot")
                 for skill_id, skill_name in enumerate(skill_names):
@@ -610,6 +644,11 @@ class Runner:
                     + opponent_pool_paths
                     + config_paths
                 )
+                if self.training_extension is not None:
+                    extension_paths = self.training_extension.save_checkpoint(
+                        path, it
+                    )
+                    artifact_paths += list(extension_paths or [])
                 for artifact_path in artifact_paths:
                     wandb.save(artifact_path, base_path=wandb_base_path)
                     

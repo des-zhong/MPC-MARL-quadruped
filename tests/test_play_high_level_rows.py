@@ -39,6 +39,46 @@ class HighLevelRowTests(unittest.TestCase):
         self.assertEqual(row["robot2_local_role_reward"], 0.0)
         self.assertEqual(row["robot3_local_role_reward"], 0.0)
 
+    def test_parallel_match_row_selects_matching_state_action_and_events(self):
+        state = {
+            "robot_xy": np.zeros((2, 4, 2), dtype=np.float32),
+            "robot_vel": np.zeros((2, 4, 2), dtype=np.float32),
+            "ball_xy": np.array([[1.0, 0.0], [2.0, 0.5]], dtype=np.float32),
+            "ball_vel": np.zeros((2, 2), dtype=np.float32),
+            "robot_ball_dist": np.zeros((2, 4), dtype=np.float32),
+            "obstacle_xy": None,
+        }
+        info = {
+            "high_level_goal": np.array([False, True]),
+            "high_level_skill_ids": np.array(
+                [[0, 0, 0, 0], [1, 2, 0, 0]], dtype=np.int64
+            ),
+        }
+        actions = torch.zeros((4, 6))
+        actions[2] = 2.0
+        rewards = torch.tensor([0.0, 0.0, 3.5, 3.5])
+        dones = torch.tensor([False, False, True, True])
+
+        row = row_from_step(
+            step=7,
+            high_level_dt=0.2,
+            state=state,
+            action=actions,
+            reward=rewards,
+            done=dones,
+            info=info,
+            env_index=1,
+        )
+
+        self.assertEqual(row["env_id"], 1)
+        self.assertEqual(row["ball_x"], 2.0)
+        self.assertEqual(row["reward"], 3.5)
+        self.assertEqual(row["done"], 1)
+        self.assertEqual(row["high_level_goal"], 1)
+        self.assertEqual(row["robot0_executed_skill"], "dribble")
+        self.assertEqual(row["robot1_executed_skill"], "shoot")
+        self.assertAlmostEqual(row["action_norm"], np.sqrt(24.0), places=5)
+
 
 if __name__ == "__main__":
     unittest.main()

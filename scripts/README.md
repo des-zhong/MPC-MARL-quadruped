@@ -92,6 +92,104 @@ combine the analytical short-horizon reward with a conservatively weighted
 terminal value; world-model and value uncertainty are used as risk gates. MPC
 is used only during training and is not required when evaluating the learned
 policy.
+
+### Terminal-value ablation table
+
+Run every numbered policy checkpoint on one fixed benchmark, then generate a
+LaTeX table and explicit checks of the terminal-value claim:
+
+```bash
+./run_ablation_study.bash \
+  /path/to/mappo_fsp/checkpoints \
+  /path/to/ours_without_terminal_value/checkpoints \
+  /path/to/ours/checkpoints \
+  --cuda 6
+```
+
+`--cuda 6` selects simulator GPU 6 (equivalently, use `--cuda-device 6` or
+`--device cuda:6`).
+The same device option is forwarded to every rollout subprocess. If that GPU
+still cannot hold `--eval-num-envs 16` matches, reduce the parallel count, for
+example with `--eval-num-envs 4`.
+
+The paper-facing table contains only `MAPPO-FSP`, `Ours w/o Terminal Value`,
+and `Ours`. The controlled terminal-value comparison is the last two rows:
+they keep planner guidance, PPO, fictitious self-play, KL distillation,
+hyperparameters, initialization, and training budget fixed. `MAPPO-FSP` is a
+reference baseline; its comparison with `Ours` measures the overall method and
+must not be presented as evidence for one individual component. Use repeated
+training seeds for every condition.
+
+Produce the three policy directories with:
+
+```bash
+ABLATION_TRAINING_SEED=0 ./train_ablation_method.bash mappo_fsp
+ABLATION_TRAINING_SEED=0 ./train_ablation_method.bash no_terminal
+ABLATION_TRAINING_SEED=0 ./train_ablation_method.bash ours
+```
+
+This writes:
+
+```text
+checkpoints/ablation/MAPPO-FSP/seed_0
+checkpoints/ablation/Ours-no-terminal/seed_0
+checkpoints/ablation/Ours/seed_0
+```
+
+`no_terminal` and `ours` both retain the same positive guidance and
+distillation coefficients; only terminal continuation value use changes.
+Override `WORLD_MODEL_CHECKPOINT`, `TERMINAL_VALUE_CHECKPOINT`,
+`ABLATION_ITERATIONS`, and the low-level policy directories through
+environment variables. The controlled default trains all three high-level
+policies from random initialization while sharing the same pretrained
+low-level skills. `ABLATION_INITIAL_POLICY` may warm-start all three conditions
+from one neutral high-level initialization, but it must not be a policy already
+trained by one of the compared methods.
+
+The launcher evaluates all methods against the same early/middle/final frozen
+MAPPO-FSP opponents and initialization seeds. It writes raw rollouts,
+`evaluations.csv`, `learning_curve.csv`, and `learning_curves.png`, followed by:
+
+- `ablation_table.tex` and `ablation_table.csv`;
+- `ablation_results.json` with machine-readable paired deltas;
+- `claim_report.md` with verdicts for the overall baseline comparison and the
+  controlled terminal-value comparison.
+
+The table uses final expected match score, mean curve score (normalized area
+under the learning curve), and steps to a pre-declared expected-score target.
+Expected score counts a win as 1 and a draw as 0.5. Elo is omitted because,
+against a single fixed reference population, it is only a log-odds transform
+of the same score. Set the target before examining results, for example:
+
+```bash
+ABLATION_TARGET_SCORE=65 ABLATION_EVAL_SEEDS=0,1,2,3,4 \
+  ./run_ablation_study.bash FSP_DIR NO_TERMINAL_DIR OURS_DIR
+```
+
+If evaluations already exist, rebuild only the statistics and table with:
+
+```bash
+python scripts/analyze_ablation_study.py \
+  --evaluations outputs/ablation_study/evaluations.csv \
+  --target-score 65
+```
+
+Bootstrap intervals resample paired opponent/initialization-seed blocks. They
+do not establish training-seed robustness when each condition contains only
+one trained run; paper claims should include multiple independently trained
+runs per condition. To combine repeated exports, concatenate the three-method
+evaluation CSVs with a `training_run` column, or pass repeated labeled inputs
+such as `--evaluations seed0=results_seed0/evaluations.csv
+--evaluations seed1=results_seed1/evaluations.csv`.
+
+Sample efficiency means real agent-environment transitions, not wall-clock
+planner cost. If a method is warm-started or uses method-specific real data to
+train its world/value model, include those transitions with repeated
+`--step-offset 'LABEL=N'` options to the launcher. The evaluator already
+infers the rollout batch size of each policy run, so methods trained with
+different numbers of parallel environments remain on the same transition
+axis. Use `--fail-on-unsupported` with the analysis script in automated checks.
+
 ### MPC reward-ranking and terminal-value evaluation
 
 `scripts/evaluate_mpc_candidate_ranking.py` evaluates candidate ordering, not

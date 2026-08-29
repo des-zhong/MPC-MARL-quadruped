@@ -19,7 +19,19 @@ import torch
 from tqdm import trange
 
 from dribblebot.envs.base.legged_robot_config import Cfg
-from scripts.play_walk_dribble_shoot import load_policy_record, resolve_wandb_policy_files
+try:
+    from scripts.play_walk_dribble_shoot import (
+        load_policy_record,
+        resolve_wandb_policy_files,
+    )
+except ModuleNotFoundError as error:
+    if error.name != "scripts.play_walk_dribble_shoot":
+        raise
+    # Support lightweight checkouts where the legacy loader lives in discard/.
+    from discard.play_walk_dribble_shoot import (
+        load_policy_record,
+        resolve_wandb_policy_files,
+    )
 from scripts.train_high_level import (
     add_skill_policy_source_args,
     configure_high_level_cfg,
@@ -377,21 +389,26 @@ def skill_name(skill_id):
     return f"unknown_{skill_id}"
 
 
-def info_array(info, key, shape, default=0):
+def info_array(info, key, shape, default=0, env_index=0):
     value = info.get(key)
     if value is None:
         return np.full(shape, default)
     array = np.asarray(value)
-    if array.shape == shape:
+    if array.shape == shape and env_index == 0:
         return array
     if len(shape) > 0 and shape[0] == 1 and array.shape[:1] != ():
-        sliced = array[:1]
+        if env_index >= array.shape[0]:
+            raise IndexError(
+                f"{key} has {array.shape[0]} environment rows; "
+                f"cannot select env_index={env_index}"
+            )
+        sliced = array[env_index : env_index + 1]
         if sliced.shape == shape:
             return sliced
     return np.reshape(array, shape)
 
 
-def learning_team_array(info, key, num_robots, default=0.0):
+def learning_team_array(info, key, num_robots, default=0.0, env_index=0):
     """Return a learning-team field aligned with all physical robot slots.
 
     Self-play exposes some coordinator telemetry for every robot in the match,
@@ -413,6 +430,12 @@ def learning_team_array(info, key, num_robots, default=0.0):
             f"{key} must be a one- or two-dimensional array, got shape {array.shape}"
         )
 
+    if env_index >= array.shape[0]:
+        raise IndexError(
+            f"{key} has {array.shape[0]} environment rows; "
+            f"cannot select env_index={env_index}"
+        )
+    array = array[env_index : env_index + 1]
     rows = min(result.shape[0], array.shape[0])
     cols = min(result.shape[1], array.shape[1])
     result[:rows, :cols] = array[:rows, :cols]
@@ -449,43 +472,75 @@ def collect_state(raw_env):
     }
 
 
-def row_from_step(step, high_level_dt, state, action, reward, done, info):
+def row_from_step(
+    step,
+    high_level_dt,
+    state,
+    action,
+    reward,
+    done,
+    info,
+    env_index=0,
+):
     num_robots = state["robot_xy"].shape[1]
-    requested = info_array(info, "high_level_requested_skill_ids", (1, num_robots), 0).astype(np.int64)
-    executed = info_array(info, "high_level_skill_ids", (1, num_robots), 0).astype(np.int64)
-    invalid = info_array(info, "high_level_invalid_skill_mask", (1, num_robots), False).astype(bool)
+    requested = info_array(
+        info,
+        "high_level_requested_skill_ids",
+        (1, num_robots),
+        0,
+        env_index,
+    ).astype(np.int64)
+    executed = info_array(
+        info, "high_level_skill_ids", (1, num_robots), 0, env_index
+    ).astype(np.int64)
+    invalid = info_array(
+        info, "high_level_invalid_skill_mask", (1, num_robots), False, env_index
+    ).astype(bool)
     avoidance = info_array(
-        info, "high_level_collision_avoidance_mask", (1, num_robots), False
+        info,
+        "high_level_collision_avoidance_mask",
+        (1, num_robots),
+        False,
+        env_index,
     ).astype(bool)
     attacker = info_array(
-        info, "high_level_attacker_mask", (1, num_robots), False
+        info, "high_level_attacker_mask", (1, num_robots), False, env_index
     ).astype(bool)
     role_conflict = info_array(
-        info, "high_level_role_conflict_mask", (1, num_robots), False
+        info, "high_level_role_conflict_mask", (1, num_robots), False, env_index
     ).astype(bool)
     command_assist = info_array(
-        info, "high_level_attacker_command_assist_mask", (1, num_robots), False
+        info,
+        "high_level_attacker_command_assist_mask",
+        (1, num_robots),
+        False,
+        env_index,
     ).astype(bool)
     local_role_reward = learning_team_array(
-        info, "high_level_local_role_rewards", num_robots, 0.0
+        info, "high_level_local_role_rewards", num_robots, 0.0, env_index
     ).astype(np.float32)
-    commands = info_array(info, "high_level_commands", (1, num_robots, 3), 0.0).astype(np.float32)
+    commands = info_array(
+        info, "high_level_commands", (1, num_robots, 3), 0.0, env_index
+    ).astype(np.float32)
     action_np = action.detach().cpu().numpy()
     reward_np = reward.detach().cpu().numpy()
     done_np = done.detach().cpu().numpy().astype(bool)
 
-    ball_xy = state["ball_xy"][0]
-    ball_vel = state["ball_vel"][0]
-    robot_xy = state["robot_xy"][0]
-    robot_vel = state["robot_vel"][0]
-    robot_ball_dist = state["robot_ball_dist"][0]
+    team_size = max(1, num_robots // 2)
+    learner_index = env_index * team_size
+    ball_xy = state["ball_xy"][env_index]
+    ball_vel = state["ball_vel"][env_index]
+    robot_xy = state["robot_xy"][env_index]
+    robot_vel = state["robot_vel"][env_index]
+    robot_ball_dist = state["robot_ball_dist"][env_index]
     obstacle_xy = state["obstacle_xy"]
     row = {
         "step": step,
+        "env_id": env_index,
         "time_s": step * high_level_dt,
-        "reward": float(reward_np[0]),
-        "done": int(done_np[0]),
-        "action_norm": float(np.linalg.norm(action_np[0])),
+        "reward": float(reward_np[learner_index]),
+        "done": int(done_np[learner_index]),
+        "action_norm": float(np.linalg.norm(action_np[learner_index])),
         "ball_x": float(ball_xy[0]),
         "ball_y": float(ball_xy[1]),
         "ball_vx": float(ball_vel[0]),
@@ -522,12 +577,18 @@ def row_from_step(step, high_level_dt, state, action, reward, done, info):
             "body" if executed[0, robot_idx] == 0 else "field"
         )
 
-        obstacle = missing_xy if obstacle_xy is None else obstacle_xy[0, robot_idx]
+        obstacle = (
+            missing_xy
+            if obstacle_xy is None
+            else obstacle_xy[env_index, robot_idx]
+        )
         row[f"obstacle{robot_idx}_x"] = float(obstacle[0])
         row[f"obstacle{robot_idx}_y"] = float(obstacle[1])
 
     for key in TERMINAL_KEYS:
-        row[key] = int(bool(info_array(info, key, (1,), False)[0]))
+        row[key] = int(
+            bool(info_array(info, key, (1,), False, env_index)[0])
+        )
 
     return row
 
@@ -545,6 +606,10 @@ def write_metrics_csv(path, rows):
 def save_plot(path, rows, args, show):
     if not rows:
         return
+
+    # Multi-environment metric export is intended for statistical evaluation.
+    # Keep the diagnostic time-series readable by plotting the first match.
+    rows = [row for row in rows if int(row.get("env_id", 0)) == 0]
 
     from matplotlib import pyplot as plt
 
@@ -718,7 +783,20 @@ def run(args):
             with torch.no_grad():
                 action = high_level_policy["policy"](obs).to(raw_env.device)
             obs, reward, done, info = env.step(action)
-            rows.append(row_from_step(step, high_level_dt, state, action, reward, done, info))
+            export_count = args.num_envs if args.export_all_envs else 1
+            rows.extend(
+                row_from_step(
+                    step,
+                    high_level_dt,
+                    state,
+                    action,
+                    reward,
+                    done,
+                    info,
+                    env_index=env_index,
+                )
+                for env_index in range(export_count)
+            )
 
             if writer is not None and step % max(args.frame_stride, 1) == 0:
                 writer.append_data(raw_env.render(mode="rgb_array"))
@@ -770,10 +848,31 @@ def parse_args():
     parser.add_argument("--shoot-wandb-run", default="des_zhong/as2_shooting/bve3isir")
     add_skill_policy_source_args(parser)
 
-    parser.add_argument("--device", default="cuda:0")
+    device_group = parser.add_mutually_exclusive_group()
+    device_group.add_argument(
+        "--device",
+        default="cuda:0",
+        help="Simulator device string, for example cuda:6 or cpu.",
+    )
+    device_group.add_argument(
+        "--cuda",
+        "--cuda-device",
+        dest="cuda_index",
+        type=int,
+        metavar="N",
+        help="Use CUDA device N (equivalent to --device cuda:N).",
+    )
     parser.add_argument("--policy-device", default="cpu")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--num-envs", type=int, default=1)
+    parser.add_argument(
+        "--export-all-envs",
+        action="store_true",
+        help=(
+            "Write one CSV row per parallel match and high-level step. "
+            "Without this flag only match zero is exported."
+        ),
+    )
     parser.add_argument("--num-robots", type=int, default=2, help="Number of shared-policy AS2 actors per team.")
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--episode-length", type=float, default=30.0)
@@ -844,7 +943,12 @@ def parse_args():
     parser.add_argument("--no-field-markers", action="store_true")
     parser.add_argument("--camera-height", type=float, default=None)
     parser.add_argument("--recording-fov", type=float, default=None)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.cuda_index is not None:
+        if args.cuda_index < 0:
+            parser.error("--cuda must be a non-negative device index")
+        args.device = f"cuda:{args.cuda_index}"
+    return args
 
 
 if __name__ == "__main__":

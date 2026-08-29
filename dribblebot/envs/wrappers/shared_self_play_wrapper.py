@@ -643,6 +643,10 @@ class SharedPolicySelfPlayWrapper(gym.Wrapper):
         agent_rewards = agent_rewards + local_role_rewards.reshape(-1)
         agent_dones = dones.repeat_interleave(self.team_size)
         info = dict(info)
+        # Preserve the cooperative match reward before adding decentralized
+        # role shaping. Online dynamics/value learning consumes this reward,
+        # while PPO continues to receive the per-agent shaped reward below.
+        info["high_level_match_rewards"] = rewards.detach()
         info["high_level_local_role_rewards"] = local_role_rewards.detach().cpu().numpy()
         for key in ("env_bins", "time_outs"):
             if key in info:
