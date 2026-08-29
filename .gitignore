@@ -52,3 +52,5 @@ checkpoints/reproduction/world_model/best.pt
 # OS metadata
 .DS_Store
 Thumbs.db
+
+docs/REPO_SUMMARY.md
