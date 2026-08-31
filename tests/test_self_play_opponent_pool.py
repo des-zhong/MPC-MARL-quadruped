@@ -83,6 +83,15 @@ def test_opponent_pool_checkpoint_round_trip():
             torch.testing.assert_close(tensor, actual.state_dict()[key])
 
 
+def test_external_opponent_action_provider_is_executable_without_policy_mirroring():
+    env = SharedPolicySelfPlayWrapper(_FakeMatchEnv(), team_size=2)
+    expected = torch.zeros(32, 2, 6)
+    expected[..., 3] = -0.7
+    env.set_opponent_action_provider(lambda: expected)
+
+    torch.testing.assert_close(env._opponent_actions(), expected)
+
+
 def test_local_role_reward_penalizes_passive_attacker_and_crowding_support():
     wrapper = SharedPolicySelfPlayWrapper.__new__(SharedPolicySelfPlayWrapper)
     wrapper.match_count = 1

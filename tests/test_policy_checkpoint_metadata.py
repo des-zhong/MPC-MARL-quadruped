@@ -309,8 +309,13 @@ def test_wrapper_clears_high_level_state_only_for_reset_rows(monkeypatch):
     wrapper.high_level_obs_history = torch.ones(3, 8)
     wrapper.skill_ids = torch.ones(3, 2, dtype=torch.long)
     wrapper.requested_skill_ids = torch.ones(3, 2, dtype=torch.long)
+    wrapper.skill_transition_mask = torch.ones(3, 2, dtype=torch.bool)
     wrapper.invalid_skill_mask = torch.ones(3, 2, dtype=torch.bool)
+    wrapper.collision_avoidance_mask = torch.ones(3, 2, dtype=torch.bool)
+    wrapper.attacker_command_assist_mask = torch.ones(3, 2, dtype=torch.bool)
+    wrapper.role_conflict_mask = torch.ones(3, 2, dtype=torch.bool)
     wrapper.skill_commands = torch.ones(3, 2, 3)
+    wrapper.decision_robot_ball_distances = torch.ones(3, 2)
     wrapper.env = types.SimpleNamespace(
         high_level_skill_ids=torch.ones(3, 2, dtype=torch.long),
         high_level_requested_skill_ids=torch.ones(3, 2, dtype=torch.long),
@@ -427,9 +432,13 @@ def test_decode_executes_requested_skills_when_geometric_fallback_is_disabled(mo
     wrapper.num_robots = 2
     wrapper.requested_skill_ids = torch.zeros(1, 2, dtype=torch.long)
     wrapper.skill_ids = torch.zeros(1, 2, dtype=torch.long)
+    wrapper.skill_transition_mask = torch.zeros(1, 2, dtype=torch.bool)
     wrapper.invalid_skill_mask = torch.ones(1, 2, dtype=torch.bool)
     wrapper.collision_avoidance_mask = torch.zeros(1, 2, dtype=torch.bool)
+    wrapper.attacker_command_assist_mask = torch.zeros(1, 2, dtype=torch.bool)
+    wrapper.role_conflict_mask = torch.zeros(1, 2, dtype=torch.bool)
     wrapper.skill_commands = torch.zeros(1, 2, 3)
+    wrapper.decision_robot_ball_distances = torch.zeros(1, 2)
     wrapper.env = types.SimpleNamespace(
         cfg=types.SimpleNamespace(
             env=types.SimpleNamespace(
@@ -450,6 +459,7 @@ def test_decode_executes_requested_skills_when_geometric_fallback_is_disabled(mo
         "can_dribble": torch.zeros(1, 2, dtype=torch.bool),
         "can_shoot": torch.zeros(1, 2, dtype=torch.bool),
     }
+    wrapper._attacker_mask = lambda affordances: torch.tensor([[True, False]])
 
     # Robot 0 requests dribble and robot 1 requests shoot even though the
     # geometric helper marks both unavailable.
@@ -497,6 +507,27 @@ def test_predictive_collision_avoidance_overrides_closing_pair(monkeypatch):
     assert safe_commands[0, 0, 0] < 0.0
     assert safe_commands[0, 1, 0] > 0.0
     assert torch.all(safe_commands[:, :, 2] == 0.0)
+
+
+def test_attacker_assignment_uses_hysteresis_and_resets(monkeypatch):
+    module, torch = _load_wrapper_module(monkeypatch)
+    wrapper = module.HighLevelSkillWrapper.__new__(module.HighLevelSkillWrapper)
+    wrapper.device = torch.device("cpu")
+    wrapper.num_envs = 1
+    wrapper.num_robots = 2
+    wrapper._team_groups_cache = [[0, 1]]
+    wrapper.attacker_slots = torch.full((1, 1), -1, dtype=torch.long)
+    wrapper.attacker_switch_margin = 0.15
+
+    first = wrapper._attacker_mask({"distance": torch.tensor([[1.0, 1.1]])})
+    close_lead = wrapper._attacker_mask({"distance": torch.tensor([[1.1, 1.0]])})
+    clear_lead = wrapper._attacker_mask({"distance": torch.tensor([[1.3, 0.8]])})
+
+    assert torch.equal(first, torch.tensor([[True, False]]))
+    assert torch.equal(close_lead, first)
+    assert torch.equal(clear_lead, torch.tensor([[False, True]]))
+    wrapper._clear_attacker_assignments(torch.tensor([True]))
+    assert torch.equal(wrapper.attacker_slots, torch.tensor([[-1]]))
 
 
 def test_predictive_collision_avoidance_leaves_separating_pair_unchanged(monkeypatch):

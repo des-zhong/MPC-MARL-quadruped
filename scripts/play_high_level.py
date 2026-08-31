@@ -751,14 +751,35 @@ def run(args):
     set_seed(args.seed)
     high_level_policy = load_high_level_policy(args)
     validate_high_level_evaluation_contract(high_level_policy, args)
-    opponent_high_level_policy = load_opponent_high_level_policy(
-        args, high_level_policy
-    )
+    opponent_high_level_policy = None
+    if not getattr(args, "opponent_rule_based", False):
+        opponent_high_level_policy = load_opponent_high_level_policy(
+            args, high_level_policy
+        )
     skill_policies = load_skill_policies(args)
     env, raw_env = make_env(args, skill_policies)
-    env.set_opponent_callable(opponent_high_level_policy["policy"])
+    if getattr(args, "opponent_rule_based", False):
+        from dribblebot.envs.wrappers.rule_based_opponent import RuleBasedOpponent
+
+        rule_opponent = RuleBasedOpponent(
+            env,
+            shoot_distance=getattr(args, "rule_opponent_shoot_distance", 0.75),
+            dribble_distance=getattr(args, "rule_opponent_dribble_distance", 1.0),
+            walk_speed=getattr(args, "rule_opponent_walk_speed", 0.9),
+            dribble_speed=getattr(args, "rule_opponent_dribble_speed", 1.0),
+            shoot_speed=getattr(args, "rule_opponent_shoot_speed", 1.5),
+            block_distance=getattr(args, "rule_opponent_block_distance", 0.75),
+            collision_distance=getattr(args, "rule_opponent_collision_distance", 0.65),
+            collision_strength=getattr(args, "rule_opponent_collision_strength", 1.5),
+        )
+        env.set_opponent_action_provider(rule_opponent)
+        print("opponent high-level:")
+        print("  deterministic rule-based attacker/blocker")
+    else:
+        env.set_opponent_callable(opponent_high_level_policy["policy"])
     validate_high_level_obs_shape(high_level_policy, env)
-    validate_high_level_obs_shape(opponent_high_level_policy, env)
+    if opponent_high_level_policy is not None:
+        validate_high_level_obs_shape(opponent_high_level_policy, env)
     validate_low_level_skill_shapes(skill_policies, env)
 
     output_video = Path(args.video)
@@ -842,6 +863,23 @@ def parse_args():
             "Defaults to the loaded high-level policy directory."
         ),
     )
+    parser.add_argument(
+        "--opponent-rule-based",
+        action="store_true",
+        help=(
+            "Use a deterministic rule-based opponent instead of loading an "
+            "opponent high-level checkpoint. The nearest opponent attacks; "
+            "the other marks the nearest learning robot."
+        ),
+    )
+    parser.add_argument("--rule-opponent-shoot-distance", type=float, default=0.75)
+    parser.add_argument("--rule-opponent-dribble-distance", type=float, default=1.0)
+    parser.add_argument("--rule-opponent-walk-speed", type=float, default=0.9)
+    parser.add_argument("--rule-opponent-dribble-speed", type=float, default=1.0)
+    parser.add_argument("--rule-opponent-shoot-speed", type=float, default=1.5)
+    parser.add_argument("--rule-opponent-block-distance", type=float, default=0.75)
+    parser.add_argument("--rule-opponent-collision-distance", type=float, default=0.65)
+    parser.add_argument("--rule-opponent-collision-strength", type=float, default=1.5)
     parser.add_argument("--skill-checkpoint", default="latest", help="Checkpoint suffix for walk/dribble/shoot low-level skills.")
     parser.add_argument("--walk-wandb-run", default="des_zhong/as2_walking/3a6g1def")
     parser.add_argument("--dribble-wandb-run", default="des_zhong/as2_dribbling/cp9m21ay")
@@ -916,8 +954,28 @@ def parse_args():
         dest="role_aware_fallback",
         action="store_false",
         default=True,
-        help="Disable nearest-attacker/support arbitration for a legacy comparison.",
+        help="Disable attacker/support arbitration for a legacy comparison.",
     )
+    parser.add_argument(
+        "--attacker-switch-margin",
+        type=float,
+        default=0.15,
+        help="Metres by which a teammate must be closer before taking the attacker role.",
+    )
+    parser.add_argument(
+        "--support-command-deadband",
+        type=float,
+        default=0.08,
+        help="Set support Walk commands to zero inside this target-distance deadband.",
+    )
+    parser.add_argument(
+        "--collision-avoidance",
+        action="store_true",
+        help="Enable the short-horizon emergency escape override during playback.",
+    )
+    parser.add_argument("--collision-avoidance-distance", type=float, default=0.55)
+    parser.add_argument("--collision-avoidance-lookahead", type=float, default=0.25)
+    parser.add_argument("--collision-avoidance-speed", type=float, default=0.5)
     parser.add_argument("--near-ball-init-probability", type=float, default=0.6)
     parser.add_argument("--near-ball-init-min-distance", type=float, default=0.4)
     parser.add_argument("--near-ball-init-max-distance", type=float, default=0.95)

@@ -6,8 +6,8 @@ cd "${PROJECT_ROOT}"
 PYTHON_BIN="${DRIBBLEBOT_PYTHON:-/home/zhz/anaconda3/envs/legged_env/bin/python}"
 
 # ===== Paths to edit for a new run =====
-HIGH_LEVEL_POLICY_DIR="wandb/run-20260825_101144-zpkeqtxq/files/tmp/legged_data/high_level"
-# HIGH_LEVEL_POLICY_DIR="wandb/run-20260825_211452-008kqv9p/files/tmp/legged_data/high_level_online_mpc"
+# HIGH_LEVEL_POLICY_DIR="wandb/run-20260830_153222-1viubo0h/files/tmp/legged_data/high_level_mpc_replay"
+HIGH_LEVEL_POLICY_DIR="wandb/run-20260830_153204-xjhoe0b9/files/tmp/legged_data/high_level"
 OPPONENT_HIGH_LEVEL_POLICY_DIR="${HIGH_LEVEL_POLICY_DIR}"
 WALK_POLICY_DIR="checkpoints/reproduction/walk"
 DRIBBLE_POLICY_DIR="checkpoints/reproduction/dribble"
@@ -15,11 +15,24 @@ SHOOT_POLICY_DIR="checkpoints/reproduction/shoot"
 VIDEO_PATH="outputs/high_level_eval.mp4"
 PLOT_PATH="outputs/high_level_eval_metrics.png"
 CSV_PATH="outputs/high_level_eval_metrics.csv"
-SEED="${SEED:-0}"
+SEED="${SEED:-5}"
+# Deployment-only emergency guard. Set ENABLE_COLLISION_AVOIDANCE=0 to
+# evaluate the raw learned policy; the CSV records every enabled override.
+ENABLE_COLLISION_AVOIDANCE="${ENABLE_COLLISION_AVOIDANCE:-1}"
 # =======================================
 
 HIGH_LEVEL_CHECKPOINT="latest"
-OPPONENT_HIGH_LEVEL_CHECKPOINT="0"
+OPPONENT_HIGH_LEVEL_CHECKPOINT="latest"
+
+COLLISION_ARGS=()
+if [[ "${ENABLE_COLLISION_AVOIDANCE}" == "1" ]]; then
+  COLLISION_ARGS=(
+    --collision-avoidance
+    --collision-avoidance-distance "${COLLISION_AVOIDANCE_DISTANCE:-0.55}"
+    --collision-avoidance-lookahead "${COLLISION_AVOIDANCE_LOOKAHEAD:-0.25}"
+    --collision-avoidance-speed "${COLLISION_AVOIDANCE_SPEED:-0.5}"
+  )
+fi
 
 "${PYTHON_BIN}" scripts/play_high_level.py \
   --num-robots 2 \
@@ -32,9 +45,12 @@ OPPONENT_HIGH_LEVEL_CHECKPOINT="0"
   --walk-policy-dir "${WALK_POLICY_DIR}" \
   --dribble-policy-dir "${DRIBBLE_POLICY_DIR}" \
   --shoot-policy-dir "${SHOOT_POLICY_DIR}" \
+  --device cuda:4 \
+  --policy-device cuda:4 \
   --video "${VIDEO_PATH}" \
   --plot "${PLOT_PATH}" \
   --csv "${CSV_PATH}" \
   --seed "${SEED}" \
+  "${COLLISION_ARGS[@]}" \
   --headless \
   "$@"

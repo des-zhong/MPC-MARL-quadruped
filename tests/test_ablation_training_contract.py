@@ -10,6 +10,7 @@ from scripts.train_high_level_online_mpc import (
     mpc_action_agreement_reward,
 )
 from scripts.train_high_level_online_mpc_full import parse_args as parse_full
+from scripts.train_high_level_online_mpc_no_kl import parse_args as parse_no_kl
 from scripts.train_high_level_online_mpc_no_terminal import (
     parse_args as parse_no_terminal,
 )
@@ -65,17 +66,30 @@ class AblationTrainingContractTests(unittest.TestCase):
             self.assertEqual(config.seed, 9)
 
     def test_controlled_entry_points_enforce_component_matrix(self):
+        with mock.patch.object(sys, "argv", ["no_kl"]):
+            no_kl = parse_no_kl()
         with mock.patch.object(sys, "argv", ["no_terminal"]):
             no_terminal = parse_no_terminal()
         with mock.patch.object(sys, "argv", ["full"]):
             full = parse_full()
 
+        self.assertEqual(no_kl.mpc_terminal_value, "enabled")
+        self.assertEqual(no_kl.mpc_kl_coefficient, 0.0)
         self.assertEqual(no_terminal.mpc_terminal_value, "disabled")
         self.assertGreater(no_terminal.mpc_kl_coefficient, 0.0)
         self.assertEqual(full.mpc_terminal_value, "enabled")
         self.assertGreater(full.mpc_kl_coefficient, 0.0)
-        for args in (no_terminal, full):
+        for args in (no_kl, no_terminal, full):
             self.assertEqual(args.mpc_guidance_reward_coefficient, 1.0)
+
+    def test_no_kl_rejects_nonzero_distillation_coefficient(self):
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["no_kl", "--mpc-kl-coefficient", "0.05"],
+        ):
+            with self.assertRaisesRegex(ValueError, "coefficient=0"):
+                parse_no_kl()
 
     def test_no_terminal_rejects_enabling_terminal_value(self):
         with mock.patch.object(
@@ -87,7 +101,7 @@ class AblationTrainingContractTests(unittest.TestCase):
                 parse_no_terminal()
 
     def test_mpc_stages_preserve_one_shared_guidance_coefficient(self):
-        parsers = (parse_no_terminal, parse_full)
+        parsers = (parse_no_kl, parse_no_terminal, parse_full)
         for parser in parsers:
             with self.subTest(parser=parser.__module__), mock.patch.object(
                 sys,

@@ -15,6 +15,11 @@ class Cfg(PrefixProto, cli=False):
         send_timeouts = True  # send time out information to the algorithm
         episode_length_s = 20  # episode length in seconds
         record_video = True
+        # Legacy locomotion/playback consumers expose detailed NumPy arrays in
+        # every step's info dictionary. High-level GPU training does not use
+        # those arrays and disables this to avoid a GPU synchronization and
+        # device-to-host copy on every low-level control step.
+        export_step_telemetry = True
         recording_width_px = 360
         recording_height_px = 240
         recording_mode = "COLOR"
@@ -429,7 +434,10 @@ class Cfg(PrefixProto, cli=False):
         high_level_support_depth = 0.5
         high_level_support_lateral = 1.2
         high_level_support_walk_speed = 0.75
+        high_level_support_command_deadband = 0.08
+        high_level_attacker_switch_margin = 0.15
         high_level_robot_collision_distance = 0.65
+        high_level_robot_collision_lookahead = 0.25
         high_level_robot_avoidance_distance = 0.55
         high_level_robot_avoidance_lookahead = 0.25
         high_level_robot_avoidance_speed = 0.5
