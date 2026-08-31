@@ -49,6 +49,22 @@ class HighLevelRewards:
         ball_xy = self.env.object_pos_world_frame[:, None, :2]
         return torch.norm(robot_xy - ball_xy, dim=-1)
 
+    def _attacker_indices(self, fallback_distances):
+        """Return the decision-time role selected by the skill wrapper.
+
+        Older fixtures and non-role-aware environments have no stored mask, so
+        nearest-to-ball remains the compatibility fallback.
+        """
+
+        fallback = torch.argmin(fallback_distances, dim=1)
+        stored = getattr(self.env, "high_level_attacker_mask", None)
+        if stored is None:
+            return fallback
+        stored = stored[:, : self._team_size()].bool()
+        valid = torch.sum(stored.long(), dim=1) == 1
+        selected = torch.argmax(stored.long(), dim=1)
+        return torch.where(valid, selected, fallback)
+
     def _skill_ids(self, attr_name, default=0):
         values = getattr(
             self.env,
@@ -148,10 +164,10 @@ class HighLevelRewards:
         """Reward a useful support distance and penalize ball crowding.
 
         ``high_level_approach_ball`` intentionally gives progress credit only
-        to the closest robot.  Without a complementary support term, however,
+        to the assigned attacker. Without a complementary support term, however,
         every teammate can still converge on the ball and receive no immediate
-        cost for doing so.  The closest robot at the start of the physics step
-        is treated as the attacker; the other teammates are rewarded for
+        cost for doing so. The wrapper's hysteretic role selection determines
+        the attacker; the other teammates are rewarded for
         maintaining space and are penalized when they enter the attacker's
         control bubble.
         """
@@ -169,7 +185,7 @@ class HighLevelRewards:
             "prev_high_level_robot_ball_distances",
             distances,
         )[:, :robot_count]
-        attacker = torch.argmin(previous_distances, dim=1)
+        attacker = self._attacker_indices(previous_distances)
         rows = torch.arange(self.env.num_envs, device=self.env.device)
         attacker_distance = previous_distances[rows, attacker]
 
@@ -274,14 +290,51 @@ class HighLevelRewards:
         pair_indices = pair_indices[
             :, pair_indices[0] < min(self._team_size(), robot_count)
         ]
-        pair_distances = torch.norm(
-            robot_xy[:, pair_indices[0]] - robot_xy[:, pair_indices[1]], dim=-1
+        relative_position = (
+            robot_xy[:, pair_indices[0]] - robot_xy[:, pair_indices[1]]
         )
+        pair_distances = torch.norm(relative_position, dim=-1)
         overlap_fraction = torch.clamp(
             (collision_distance - pair_distances) / collision_distance,
             min=0.0,
             max=1.0,
         )
+
+        # Give the policy a short warning before contact.  The simulator
+        # reward is evaluated after each low-level step, so current-distance
+        # shaping alone arrives too late for two robots moving toward one
+        # another.  Use the same constant-velocity closest-approach estimate
+        # as the deployment guard, but retain the current overlap term so a
+        # stationary pair receives exactly the legacy penalty.
+        lookahead = max(
+            float(
+                getattr(
+                    self.env.cfg.rewards,
+                    "high_level_robot_collision_lookahead",
+                    0.25,
+                )
+            ),
+            0.0,
+        )
+        if lookahead > 0.0:
+            all_states = self._all_robot_states()
+            relative_velocity = (
+                all_states[:, pair_indices[0], 7:9]
+                - all_states[:, pair_indices[1], 7:9]
+            )
+            speed_sq = torch.sum(relative_velocity.square(), dim=-1)
+            closest_time = -torch.sum(
+                relative_position * relative_velocity, dim=-1
+            ) / speed_sq.clamp(min=1e-6)
+            closest_time = closest_time.clamp(min=0.0, max=lookahead)
+            closest_position = relative_position + closest_time.unsqueeze(-1) * relative_velocity
+            closest_distance = torch.norm(closest_position, dim=-1)
+            predicted_overlap = torch.clamp(
+                (collision_distance - closest_distance) / collision_distance,
+                min=0.0,
+                max=1.0,
+            )
+            overlap_fraction = torch.maximum(overlap_fraction, predicted_overlap)
         return overlap_fraction.square().amax(dim=1)
 
     def _reward_high_level_obstacle_clearance(self):
@@ -534,11 +587,10 @@ class HighLevelRewards:
             & (invalid_skill_mask == 0)
         )
 
-        # Assign the approach objective to the robot that was closest at the
-        # beginning of the physics step. Selecting before measuring progress
-        # prevents the policy from switching the rewarded robot after seeing
-        # which one happened to move closer.
-        attacker = torch.argmin(prev_distances, dim=1, keepdim=True)
+        # Use the same decision-time role as observation construction and
+        # geometric fallback. This avoids rewarding a different teammate when
+        # distances cross by only a few centimetres during the control window.
+        attacker = self._attacker_indices(prev_distances).unsqueeze(1)
         attacker_progress = torch.gather(progress, 1, attacker).squeeze(1)
         attacker_far = torch.gather(far_from_ball, 1, attacker).squeeze(1)
         attacker_walking = torch.gather(valid_requested_walk, 1, attacker).squeeze(1)
@@ -595,7 +647,7 @@ class HighLevelRewards:
             getattr(self.env.cfg.rewards, "high_level_dribble_skill_distance", 1.0)
         )
         far_from_ball = prev_distances > dribble_distance
-        attacker = torch.argmin(prev_distances, dim=1, keepdim=True)
+        attacker = self._attacker_indices(prev_distances).unsqueeze(1)
         per_robot = (
             alignment
             * speed_fraction
@@ -609,8 +661,8 @@ class HighLevelRewards:
 
         The command-speed gate prevents a stationary robot from accumulating
         this dense orientation reward merely by looking at the ball.  As with
-        the approach reward, only the robot that was closest at the beginning
-        of the step receives credit, which is also the sole robot in the
+        the approach reward, only the assigned attacker receives credit, which
+        is also the sole robot in the
         single-robot task.
         """
 
@@ -659,7 +711,7 @@ class HighLevelRewards:
         )
         far_from_ball = prev_distances > dribble_distance
 
-        attacker = torch.argmin(prev_distances, dim=1, keepdim=True)
+        attacker = self._attacker_indices(prev_distances).unsqueeze(1)
         per_robot = (
             facing_alignment
             * approach_activity
@@ -713,7 +765,7 @@ class HighLevelRewards:
             self._robot_ball_distances(),
         )
         previous_distances = previous_distances[:, : self._team_size()]
-        attacker = torch.argmin(previous_distances, dim=1, keepdim=True)
+        attacker = self._attacker_indices(previous_distances).unsqueeze(1)
         # Both conditions must hold. Taking the minimum makes either walking
         # backward or moving away from goal a signed penalty; the previous
         # unsigned speed gate rewarded backward motion while facing the goal.

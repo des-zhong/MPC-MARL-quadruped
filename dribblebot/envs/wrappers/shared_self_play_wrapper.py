@@ -396,6 +396,12 @@ class SharedPolicySelfPlayWrapper(gym.Wrapper):
 
     def reset(self):
         self.env.reset()
+        self.env.preserve_external_high_level_actions = torch.zeros(
+            self.match_count,
+            2 * self.team_size,
+            dtype=torch.bool,
+            device=self.device,
+        )
         self._history.zero_()
         self._update_observations()
         return self._cached
@@ -409,6 +415,11 @@ class SharedPolicySelfPlayWrapper(gym.Wrapper):
                     "Opponent action provider must return executable actions "
                     f"with shape {expected}, got {tuple(actions.shape)}"
                 )
+            # Action providers (for example a deterministic rules controller
+            # or an MPC forecaster) operate in physical world semantics and
+            # therefore already account for the opponent's -x attack
+            # direction. Learned opponent policies below emit canonical +x
+            # actions and are mirrored at the end of this method.
             return actions
         if not self.opponent_pool and self.opponent_policy_callable is None:
             return torch.zeros(
@@ -629,6 +640,24 @@ class SharedPolicySelfPlayWrapper(gym.Wrapper):
         joint_actions = torch.cat((team_actions, opponent_actions), dim=1).reshape(
             self.match_count, -1
         )
+        # A direct provider has already made its own role and safety choices.
+        # Preserve those opponent commands while retaining the normal
+        # geometric fallback for learned learning-team actions.
+        preserve_external = torch.zeros(
+            self.match_count,
+            2 * self.team_size,
+            dtype=torch.bool,
+            device=self.device,
+        )
+        if self.opponent_action_provider is not None and bool(
+            getattr(
+                self.opponent_action_provider,
+                "preserve_high_level_actions",
+                False,
+            )
+        ):
+            preserve_external[:, self.team_size :] = True
+        self.env.preserve_external_high_level_actions = preserve_external
         _, rewards, dones, info = self.env.step(joint_actions)
         dones = dones.bool()
         self._sample_opponent_assignments(dones)

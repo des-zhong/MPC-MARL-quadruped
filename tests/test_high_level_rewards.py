@@ -108,6 +108,22 @@ class HighLevelRewardTests(unittest.TestCase):
         env.root_states[2, 0] = -2.0
         self.assertEqual(float(reward._reward_high_level_robot_collision()), 1.0)
 
+    def test_robot_collision_warns_for_closing_but_not_separating_pair(self):
+        env = _fake_env(2)
+        env.cfg.rewards.high_level_robot_collision_distance = 0.75
+        env.cfg.rewards.high_level_robot_collision_lookahead = 0.25
+        env.root_states[env.robot_actor_idxs, 0] = -0.7
+        env.root_states[env.other_robot_actor_idxs, 0] = 0.7
+        # Both rows start safely outside the clearance. Row zero is closing at
+        # 4 m/s relative speed; row one has the same speed while separating.
+        env.root_states[env.robot_actor_idxs, 7] = torch.tensor([2.0, -2.0])
+        env.root_states[env.other_robot_actor_idxs, 7] = torch.tensor([-2.0, 2.0])
+
+        penalty = HighLevelRewards(env)._reward_high_level_robot_collision()
+
+        self.assertGreater(float(penalty[0]), 0.0)
+        self.assertEqual(float(penalty[1]), 0.0)
+
     def test_robot_spacing_rewards_support_and_penalizes_ball_crowding(self):
         env = _fake_env(2)
         env.prev_high_level_robot_ball_distances = torch.tensor(

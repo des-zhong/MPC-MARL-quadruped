@@ -40,7 +40,7 @@ shift 3
   --method "Ours w/o Terminal Value=${NO_TERMINAL_DIR}" \
   --method "Ours=${OURS_DIR}" \
   --opponent-dir "${MAPPO_FSP_DIR}" \
-  --opponent-checkpoints suite \
+  --opponent-checkpoints auto \
   --seeds "${ABLATION_EVAL_SEEDS:-0}" \
   --steps "${ABLATION_ROLLOUT_STEPS:-300}" \
   --eval-num-envs "${ABLATION_EVAL_ENVS:-4}" \

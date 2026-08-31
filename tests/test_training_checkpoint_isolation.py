@@ -102,7 +102,29 @@ def test_high_level_defaults_protect_discrete_skill_exploration():
     assert args.opponent_latest_probability == 0.5
     assert args.robot_collision_penalty == 2.0
     assert args.robot_collision_distance == 0.65
+    assert args.robot_collision_lookahead == 0.25
+    assert args.attacker_switch_margin == 0.15
+    assert args.support_command_deadband == 0.08
     assert not args.collision_avoidance
+    assert args.physx_num_threads == 10
+    assert args.save_video_interval == 500
+    assert not args.export_step_telemetry
+
+
+def test_high_level_cpu_and_recording_controls_are_configurable():
+    args = build_high_level_parser().parse_args(
+        [
+            "--physx-num-threads",
+            "3",
+            "--save-video-interval",
+            "0",
+            "--export-step-telemetry",
+        ]
+    )
+
+    assert args.physx_num_threads == 3
+    assert args.save_video_interval == 0
+    assert args.export_step_telemetry
 
 
 def test_high_level_resume_accepts_explicit_checkpoint():

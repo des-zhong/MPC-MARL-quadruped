@@ -34,6 +34,30 @@ class HighLevelSkillWrapper(gym.Wrapper):
             raise ValueError(
                 f"high_level_num_observations must be 25*num_robots+6={25 * self.num_robots + 6}, got {self.num_obs}"
             )
+        # Role arbitration is stateful.  Selecting the nearest robot afresh at
+        # every high-level tick makes two robots swap attacker/support roles
+        # whenever their distances differ by only a few centimetres.  Keep one
+        # slot per team and reset it with the environment instead.
+        self._team_groups_cache = self._compute_team_groups()
+        self.attacker_slots = torch.full(
+            (self.num_envs, len(self._team_groups_cache)),
+            -1,
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.attacker_switch_margin = max(
+            float(
+                getattr(
+                    getattr(env.cfg, "rewards", object()),
+                    "high_level_attacker_switch_margin",
+                    0.15,
+                )
+            ),
+            0.0,
+        )
+        self.env.high_level_attacker_mask = torch.zeros(
+            self.num_envs, self.num_robots, dtype=torch.bool, device=self.device
+        )
         self.num_privileged_obs = self.num_obs
         self.history_length = int(
             history_length if history_length is not None else getattr(env.cfg.env, "high_level_history_length", 4)
@@ -128,6 +152,7 @@ class HighLevelSkillWrapper(gym.Wrapper):
             self.env.high_level_accidental_termination_buf[env_ids] = True
         self.env.reset_buf[env_ids] = True
         self.env.reset_idx(env_ids)
+        self._clear_attacker_assignments(env_ids)
         self.low_level_obs_history_full[env_ids] = 0.0
         self.low_level_actions[env_ids] = 0.0
         self.last_low_level_actions[env_ids] = 0.0
@@ -244,7 +269,7 @@ class HighLevelSkillWrapper(gym.Wrapper):
         commands[:, :, 2] = torch.clamp(1.5 * yaw_to_ball, -walk_scale[2], walk_scale[2])
         return commands
 
-    def _team_groups(self):
+    def _compute_team_groups(self):
         """Return the physical robot slots belonging to each attacking team.
 
         A normal cooperative rollout has one group containing every robot.  A
@@ -266,8 +291,31 @@ class HighLevelSkillWrapper(gym.Wrapper):
             ]
         return [list(range(self.num_robots))]
 
+    def _team_groups(self):
+        # Keep the grouping fixed for the lifetime of a wrapper.  The physical
+        # robot layout cannot change during a rollout, and caching also makes
+        # the role state indexing explicit.
+        groups = getattr(self, "_team_groups_cache", None)
+        if groups is None:
+            groups = self._compute_team_groups()
+        return groups
+
+    def _clear_attacker_assignments(self, env_ids=None):
+        assignments = getattr(self, "attacker_slots", None)
+        if assignments is None:
+            return
+        if env_ids is None:
+            assignments.fill_(-1)
+        elif len(env_ids) > 0:
+            assignments[env_ids] = -1
+
     def _attacker_mask(self, affordances):
-        """Mark the closest robot to the ball once per team."""
+        """Mark a stable attacker once per team, with distance hysteresis.
+
+        The current attacker is retained until another teammate is closer by
+        ``high_level_attacker_switch_margin`` metres.  This prevents role and
+        support-target chatter when both robots are near the ball.
+        """
 
         mask = torch.zeros(
             self.num_envs,
@@ -276,16 +324,36 @@ class HighLevelSkillWrapper(gym.Wrapper):
             device=self.device,
         )
         distances = affordances["distance"]
-        for group in self._team_groups():
+        assignments = getattr(self, "attacker_slots", None)
+        margin = max(float(getattr(self, "attacker_switch_margin", 0.15)), 0.0)
+        for team_index, group in enumerate(self._team_groups()):
             if not group:
                 continue
             group_distances = distances[:, group]
             nearest = torch.argmin(group_distances, dim=1)
             rows = torch.arange(self.num_envs, device=self.device)
-            mask[rows, torch.as_tensor(group, device=self.device)[nearest]] = True
+            slots = torch.as_tensor(group, dtype=torch.long, device=self.device)
+            nearest_slot = slots[nearest]
+            if assignments is None or assignments.shape[1] <= team_index:
+                # Lightweight test fixtures may construct the wrapper with
+                # ``__new__`` and omit stateful role storage.
+                chosen_slot = nearest_slot
+            else:
+                previous_slot = assignments[:, team_index]
+                previous_valid = (previous_slot.unsqueeze(-1) == slots).any(dim=-1)
+                previous_index = (previous_slot.unsqueeze(-1) == slots).long().argmax(dim=-1)
+                previous_distance = group_distances[rows, previous_index]
+                switch = (~previous_valid) | (
+                    group_distances[rows, nearest].detach()
+                    + margin
+                    < previous_distance.detach()
+                )
+                chosen_slot = torch.where(switch, nearest_slot, previous_slot)
+                assignments[:, team_index] = chosen_slot
+            mask[rows, chosen_slot] = True
         return mask
 
-    def _walk_support_commands(self, roots=None):
+    def _walk_support_commands(self, roots=None, attacker_mask=None):
         """Generate a spread-out support walk for non-attacking teammates.
 
         The support target is lateral to, and slightly behind, the ball from
@@ -298,6 +366,8 @@ class HighLevelSkillWrapper(gym.Wrapper):
 
         if roots is None:
             roots = self._robot_roots()
+        if attacker_mask is None:
+            attacker_mask = self._attacker_mask(self._skill_affordances(roots))
         position = roots[:, :, :2]
         commands = torch.zeros(
             self.num_envs,
@@ -341,14 +411,8 @@ class HighLevelSkillWrapper(gym.Wrapper):
             ).clamp(min=1e-6)
             lateral = torch.stack((-goal_direction[:, 1], goal_direction[:, 0]), dim=-1)
 
-            group_distances = torch.norm(
-                position[:, group] - ball_xy[:, None, :], dim=-1
-            )
-            attacker_local = torch.argmin(group_distances, dim=1)
-            rows = torch.arange(self.num_envs, device=self.device)
-            attacker_slot = torch.as_tensor(group, device=self.device)[attacker_local]
             for local_index, slot in enumerate(group):
-                is_attacker = attacker_slot == slot
+                is_attacker = attacker_mask[:, slot]
                 # Use the robot's current lateral side to avoid swapping sides
                 # as it approaches the support target.  A deterministic slot
                 # fallback handles an exact centre-line tie.
@@ -382,6 +446,17 @@ class HighLevelSkillWrapper(gym.Wrapper):
                 )[:, :2]
                 speed = torch.norm(body_delta, dim=-1, keepdim=True).clamp(min=1e-6)
                 direction = body_delta / speed
+                support_deadband = max(
+                    float(
+                        getattr(
+                            self.env.cfg.rewards,
+                            "high_level_support_command_deadband",
+                            0.08,
+                        )
+                    ),
+                    0.0,
+                )
+                settled = speed[:, 0] <= support_deadband
                 support_speed = float(
                     getattr(self.env.cfg.rewards, "high_level_support_walk_speed", 0.75)
                 )
@@ -400,6 +475,7 @@ class HighLevelSkillWrapper(gym.Wrapper):
                 commands[:, slot, 2] = torch.clamp(
                     1.5 * yaw_to_ball, -walk_scale[2], walk_scale[2]
                 )
+                commands[settled, slot] = 0.0
                 commands[is_attacker, slot] = 0.0
         return commands
 
@@ -571,11 +647,36 @@ class HighLevelSkillWrapper(gym.Wrapper):
             6,
         )
         requested_skill_ids = torch.argmax(action[:, :, :3], dim=-1)
+        # Keep lightweight/offline fixtures that construct the wrapper with
+        # ``__new__`` compatible with the full initialized wrapper.
+        if not hasattr(self, "skill_transition_mask"):
+            self.skill_transition_mask = torch.zeros_like(
+                self.requested_skill_ids, dtype=torch.bool
+            )
         self.skill_transition_mask[:] = requested_skill_ids != self.requested_skill_ids
         affordances = self._skill_affordances()
-        self.decision_robot_ball_distances[:] = affordances["distance"]
+        self.decision_robot_ball_distances[:] = affordances.get(
+            "distance",
+            torch.zeros(
+                self.num_envs, self.num_robots, dtype=torch.float, device=self.device
+            ),
+        )
         attacker_mask = self._attacker_mask(affordances)
         self.env.high_level_attacker_mask = attacker_mask
+        preserve_external = torch.as_tensor(
+            getattr(
+                self,
+                "preserve_external_high_level_actions",
+                torch.zeros_like(requested_skill_ids, dtype=torch.bool),
+            ),
+            dtype=torch.bool,
+            device=self.device,
+        )
+        if preserve_external.shape != requested_skill_ids.shape:
+            raise ValueError(
+                "preserve_external_high_level_actions must have shape "
+                f"{tuple(requested_skill_ids.shape)}, got {tuple(preserve_external.shape)}"
+            )
 
         skill_ids = requested_skill_ids.clone()
         role_conflict = torch.zeros_like(requested_skill_ids, dtype=torch.bool)
@@ -588,8 +689,16 @@ class HighLevelSkillWrapper(gym.Wrapper):
             )
         )
         if use_geometric_fallback:
-            dribble_invalid = (requested_skill_ids == 1) & ~affordances["can_dribble"]
-            shoot_invalid = (requested_skill_ids == 2) & ~affordances["can_shoot"]
+            dribble_invalid = (
+                (requested_skill_ids == 1)
+                & ~affordances["can_dribble"]
+                & ~preserve_external
+            )
+            shoot_invalid = (
+                (requested_skill_ids == 2)
+                & ~affordances["can_shoot"]
+                & ~preserve_external
+            )
             role_aware = bool(
                 getattr(
                     self.env.cfg.env,
@@ -600,6 +709,7 @@ class HighLevelSkillWrapper(gym.Wrapper):
             support_role_conflict = (
                 (requested_skill_ids != SKILL_TO_ID["walk"])
                 & ~attacker_mask
+                & ~preserve_external
                 if role_aware
                 else torch.zeros_like(requested_skill_ids, dtype=torch.bool)
             )
@@ -607,6 +717,7 @@ class HighLevelSkillWrapper(gym.Wrapper):
                 (requested_skill_ids == SKILL_TO_ID["walk"])
                 & attacker_mask
                 & affordances["can_dribble"]
+                & ~preserve_external
                 if role_aware
                 else torch.zeros_like(requested_skill_ids, dtype=torch.bool)
             )
@@ -625,7 +736,11 @@ class HighLevelSkillWrapper(gym.Wrapper):
             # skill either.  Its walk command is replaced below with the
             # lateral support target, regardless of which walk parameters the
             # old coordinator sampled.
-            support_override = ~attacker_mask if role_aware else support_override
+            support_override = (
+                ~attacker_mask & ~preserve_external
+                if role_aware
+                else support_override
+            )
             force_walk = force_walk | support_override
             # Role arbitration is a coordination override, not a physically
             # invalid request.  Keep the geometric-invalid diagnostic separate
@@ -646,7 +761,7 @@ class HighLevelSkillWrapper(gym.Wrapper):
         commands = torch.maximum(torch.minimum(commands, final_scales), -final_scales)
         if use_geometric_fallback:
             walk_to_ball_commands = self._walk_to_ball_commands(affordances)
-            support_commands = self._walk_support_commands()
+            support_commands = self._walk_support_commands(attacker_mask=attacker_mask)
             role_aware = bool(
                 getattr(self.env.cfg.env, "high_level_role_aware_fallback", True)
             )
@@ -944,15 +1059,19 @@ class HighLevelSkillWrapper(gym.Wrapper):
         self.high_level_obs_history[env_ids] = 0.0
         self.skill_ids[env_ids] = 0
         self.requested_skill_ids[env_ids] = 0
-        self.skill_transition_mask[env_ids] = False
+        if hasattr(self, "skill_transition_mask"):
+            self.skill_transition_mask[env_ids] = False
         self.invalid_skill_mask[env_ids] = False
         self.collision_avoidance_mask[env_ids] = False
         self.attacker_command_assist_mask[env_ids] = False
         self.role_conflict_mask[env_ids] = False
         self.skill_commands[env_ids] = 0.0
         self.decision_robot_ball_distances[env_ids] = 0.0
+        self._clear_attacker_assignments(env_ids)
         self.env.high_level_skill_ids[env_ids] = 0
         self.env.high_level_requested_skill_ids[env_ids] = 0
+        if hasattr(self.env, "high_level_attacker_mask"):
+            self.env.high_level_attacker_mask[env_ids] = False
         if hasattr(self.env, "high_level_skill_transition_mask"):
             self.env.high_level_skill_transition_mask[env_ids] = False
         self.env.high_level_invalid_skill_mask[env_ids] = False
@@ -960,6 +1079,7 @@ class HighLevelSkillWrapper(gym.Wrapper):
 
     def reset(self):
         self.env.reset()
+        self._clear_attacker_assignments()
         self.high_level_obs.zero_()
         self.high_level_obs_history.zero_()
         self.low_level_obs_history_full.zero_()
@@ -976,6 +1096,9 @@ class HighLevelSkillWrapper(gym.Wrapper):
         self.decision_robot_ball_distances.zero_()
         self.env.high_level_skill_ids.zero_()
         self.env.high_level_requested_skill_ids.zero_()
+        self.env.high_level_attacker_mask = torch.zeros(
+            self.num_envs, self.num_robots, dtype=torch.bool, device=self.device
+        )
         self.env.high_level_skill_transition_mask = self.skill_transition_mask
         self.env.high_level_invalid_skill_mask.zero_()
         self.env.high_level_attacker_command_assist_mask = self.attacker_command_assist_mask

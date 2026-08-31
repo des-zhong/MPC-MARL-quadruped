@@ -110,11 +110,14 @@ def high_level_checkpoint_contract(policy_record):
     payload = load_config(config_path)
     cfg = _wandb_config_value(payload.get("Cfg", {}))
     env = _wandb_config_value(cfg.get("env", {})) if isinstance(cfg, Mapping) else {}
+    rewards = _wandb_config_value(cfg.get("rewards", {})) if isinstance(cfg, Mapping) else {}
     self_play = _wandb_config_value(payload.get("self_play", {}))
     if not isinstance(env, Mapping):
         env = {}
     if not isinstance(self_play, Mapping):
         self_play = {}
+    if not isinstance(rewards, Mapping):
+        rewards = {}
     team_size = self_play.get("team_size", env.get("num_team_robots"))
     return {
         "config_path": str(config_path),
@@ -128,6 +131,8 @@ def high_level_checkpoint_contract(policy_record):
         "role_aware_fallback": env.get("high_level_role_aware_fallback"),
         "near_ball_probability": env.get("high_level_near_ball_init_probability"),
         "boundary_walls": env.get("add_boundary_walls"),
+        "attacker_switch_margin": rewards.get("high_level_attacker_switch_margin"),
+        "support_command_deadband": rewards.get("high_level_support_command_deadband"),
     }
 
 
@@ -160,6 +165,8 @@ def validate_high_level_evaluation_contract(policy_record, args):
         "role_aware_fallback": bool(getattr(args, "role_aware_fallback", True)),
         "near_ball_probability": float(args.near_ball_init_probability),
         "boundary_walls": bool(getattr(args, "boundary_walls", True)),
+        "attacker_switch_margin": float(getattr(args, "attacker_switch_margin", 0.15)),
+        "support_command_deadband": float(getattr(args, "support_command_deadband", 0.08)),
     }
     mismatches = []
     for name, actual_value in actual.items():
@@ -247,6 +254,10 @@ def find_run_level_config(policy_dir):
 def validate_high_level_training_args(args):
     """Fail before simulator startup on unstable or inconsistent PPO settings."""
 
+    if int(getattr(args, "physx_num_threads", 10)) < 1:
+        raise ValueError("--physx-num-threads must be at least 1")
+    if int(getattr(args, "save_video_interval", 500)) < 0:
+        raise ValueError("--save-video-interval cannot be negative")
     if args.learning_rate <= 0.0:
         raise ValueError("--learning-rate must be positive")
     if args.desired_kl <= 0.0:
@@ -281,6 +292,12 @@ def validate_high_level_training_args(args):
         raise ValueError("--robot-collision-penalty must be non-negative")
     if args.robot_collision_distance <= 0.0:
         raise ValueError("--robot-collision-distance must be positive")
+    if getattr(args, "robot_collision_lookahead", 0.25) < 0.0:
+        raise ValueError("--robot-collision-lookahead must be non-negative")
+    if getattr(args, "attacker_switch_margin", 0.15) < 0.0:
+        raise ValueError("--attacker-switch-margin must be non-negative")
+    if getattr(args, "support_command_deadband", 0.08) < 0.0:
+        raise ValueError("--support-command-deadband must be non-negative")
     if args.collision_avoidance_distance <= 0.0:
         raise ValueError("--collision-avoidance-distance must be positive")
     if args.collision_avoidance_lookahead < 0.0:
@@ -408,7 +425,11 @@ def configure_high_level_cfg(Cfg, args):
     max_cmd_y = max(walk_y_scale, dribble_y_scale, shoot_y_scale, 1e-6)
     max_cmd_yaw = max(walk_yaw_scale, dribble_yaw_scale, 1.0)
     Cfg.env.high_level_command_obs_scale = [max_cmd_x, max_cmd_y, max_cmd_yaw]
-    Cfg.env.record_video = True
+    Cfg.sim.physx.num_threads = int(getattr(args, "physx_num_threads", 10))
+    Cfg.env.export_step_telemetry = bool(
+        getattr(args, "export_step_telemetry", False)
+    )
+    Cfg.env.record_video = int(getattr(args, "save_video_interval", 500)) > 0
     Cfg.env.num_recording_envs = 1
     Cfg.env.recording_width_px = 640
     Cfg.env.recording_height_px = 640
@@ -584,11 +605,21 @@ def configure_high_level_cfg(Cfg, args):
     Cfg.rewards.high_level_support_depth = 0.5
     Cfg.rewards.high_level_support_lateral = 1.2
     Cfg.rewards.high_level_support_walk_speed = 0.75
+    Cfg.rewards.high_level_support_command_deadband = float(
+        getattr(args, "support_command_deadband", 0.08)
+    )
+    Cfg.rewards.high_level_attacker_switch_margin = float(
+        getattr(args, "attacker_switch_margin", 0.15)
+    )
     # The AS2 base collision geometry is roughly 0.2 x 0.224 m, with a front
-    # attachment extending to about 0.33 m. A 0.65 m centre clearance catches
-    # genuine contact configurations without penalizing ordinary ball contests.
+    # attachment extending to about 0.33 m. The configurable centre clearance
+    # catches genuine contact configurations without penalizing ordinary ball
+    # contests; the MPC launchers use a moderate 0.70 m warning threshold.
     Cfg.rewards.high_level_robot_collision_distance = float(
         getattr(args, "robot_collision_distance", 0.65)
+    )
+    Cfg.rewards.high_level_robot_collision_lookahead = float(
+        getattr(args, "robot_collision_lookahead", 0.25)
     )
     Cfg.rewards.high_level_robot_avoidance_distance = float(
         getattr(args, "collision_avoidance_distance", 0.55)
@@ -885,7 +916,7 @@ def train_robot(args):
     RunnerArgs.resume_policy_only = args.resume_mode == "policy-only"
     RunnerArgs.resume_path = args.resume_run
     RunnerArgs.resume_checkpoint = args.resume_checkpoint
-    RunnerArgs.save_video_interval = 500
+    RunnerArgs.save_video_interval = args.save_video_interval
     # Resolved after wandb.init: by default each run owns its checkpoint
     # directory under wandb/run-<timestamp>-<id>/files/.
     RunnerArgs.checkpoint_dir = args.checkpoint_dir
@@ -1072,6 +1103,26 @@ def build_arg_parser():
     parser.add_argument("--policy-device", default="cpu")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument(
+        "--physx-num-threads",
+        type=int,
+        default=10,
+        help="PhysX CPU worker threads used by this process.",
+    )
+    parser.add_argument(
+        "--save-video-interval",
+        type=int,
+        default=500,
+        help="PPO iterations between videos; zero disables the recording camera.",
+    )
+    parser.add_argument(
+        "--export-step-telemetry",
+        action="store_true",
+        help=(
+            "Export detailed low-level NumPy telemetry on every simulator step. "
+            "Disabled by default for high-level training to avoid GPU-to-CPU copies."
+        ),
+    )
     parser.add_argument("--project", default=None)
     parser.add_argument(
         "--checkpoint-dir",
@@ -1200,6 +1251,24 @@ def build_arg_parser():
         type=float,
         default=0.65,
         help="Robot-centre distance in metres at which the smooth collision penalty begins.",
+    )
+    parser.add_argument(
+        "--robot-collision-lookahead",
+        type=float,
+        default=0.25,
+        help="Seconds of constant-velocity lookahead used by collision reward shaping.",
+    )
+    parser.add_argument(
+        "--attacker-switch-margin",
+        type=float,
+        default=0.15,
+        help="Metres by which a teammate must be closer before taking the attacker role.",
+    )
+    parser.add_argument(
+        "--support-command-deadband",
+        type=float,
+        default=0.08,
+        help="Set the support Walk command to zero inside this target-distance deadband.",
     )
     parser.add_argument(
         "--collision-avoidance",

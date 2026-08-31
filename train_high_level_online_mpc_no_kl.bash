@@ -15,18 +15,15 @@ usage() {
   cat <<EOF
 Usage: $0 [--cuda N] [training options]
 
-Launch high-level MAPPO self-play training. Unrecognized options are passed
-to the Python trainer.
+Launch terminal-value online MPC training without MPC-to-policy KL
+distillation. Unrecognized options are passed to the Python trainer.
 
-  --cuda N   CUDA device index (default: ${DRIBBLEBOT_CUDA_INDEX:-5})
+  --cuda N   CUDA device index (default: ${DRIBBLEBOT_CUDA_INDEX:-4})
   -h, --help Show this launcher help
-
-CPU defaults can be overridden with DRIBBLEBOT_CPU_THREADS,
-PHYSX_NUM_THREADS, and SAVE_VIDEO_INTERVAL.
 EOF
 }
 
-CUDA_INDEX="${DRIBBLEBOT_CUDA_INDEX:-5}"
+CUDA_INDEX="${DRIBBLEBOT_CUDA_INDEX:-4}"
 TRAINING_ARGS=()
 while (( $# > 0 )); do
   case "$1" in
@@ -59,47 +56,65 @@ if [[ ! "${CUDA_INDEX}" =~ ^[0-9]+$ ]]; then
   exit 2
 fi
 
-# ===== Paths to edit for a new run =====
+# Keep this launcher aligned with the full method. The dedicated Python entry
+# point enforces the controlled ablation: terminal value and dense MPC guidance
+# stay enabled while the KL/distillation coefficient is exactly zero.
+# The online world-model ensemble is randomly initialized and trained from
+# this run's replay. No --world-model-checkpoint is passed.
+HIGH_LEVEL_CHECKPOINT="checkpoints/reproduction/high_level/ac_weights_latest.pt"
+TERMINAL_VALUE_CHECKPOINT="${TERMINAL_VALUE_CHECKPOINT:-checkpoints/terminal_value_env_v2_bootstrap/best.pt}"
+WORLD_MODEL_CONFIG="configs/world_model_as2.yaml"
+MPC_CONFIG="configs/mpc_joint_teams.yaml"
 WALK_POLICY_DIR="checkpoints/reproduction/walk"
 DRIBBLE_POLICY_DIR="checkpoints/reproduction/dribble"
 SHOOT_POLICY_DIR="checkpoints/reproduction/shoot"
-# Warm-start from the strongest fixed-window checkpoint in the analyzed run.
-# Policy-only mode intentionally resets the critic and continuous exploration.
-# RESUME_CHECKPOINT="wandb/run-20260824_155604-f3sipxl6/files/tmp/legged_data/high_level/ac_weights_latest.pt"
-RESUME_CHECKPOINT=""
-# Empty keeps the default W&B run checkpoint directory.
 CHECKPOINT_DIR=""
-# =======================================
 
 OUTPUT_ARGS=()
 if [[ -n "${CHECKPOINT_DIR}" ]]; then
   OUTPUT_ARGS=(--checkpoint-dir "${CHECKPOINT_DIR}")
 fi
 
-exec "${PYTHON_BIN}" scripts/train_high_level.py \
+exec "${PYTHON_BIN}" scripts/train_high_level_online_mpc_no_kl.py \
+  --world-model-config "${WORLD_MODEL_CONFIG}" \
+  --mpc-config "${MPC_CONFIG}" \
+  --mpc-profile teacher_training \
+  --num-envs 32 \
   --num-robots 2 \
   --robot-collision-penalty "${ROBOT_COLLISION_PENALTY:-3.0}" \
   --robot-collision-distance "${ROBOT_COLLISION_DISTANCE:-0.70}" \
   --robot-collision-lookahead "${ROBOT_COLLISION_LOOKAHEAD:-0.25}" \
   --attacker-switch-margin "${ATTACKER_SWITCH_MARGIN:-0.15}" \
   --support-command-deadband "${SUPPORT_COMMAND_DEADBAND:-0.08}" \
-  --self-play-update-interval 2000 \
+  --self-play-update-interval "${SELF_PLAY_UPDATE_INTERVAL:-400}" \
   --opponent-pool-size 8 \
   --opponent-latest-probability 0.5 \
-  --skill-entropy-coef 0.002 \
-  --skill-entropy-final-coef 0.0002 \
-  --skill-entropy-anneal-iterations 4000 \
-  --skill-policy-source local \
-  --walk-policy-dir "${WALK_POLICY_DIR}" \
-  --dribble-policy-dir "${DRIBBLE_POLICY_DIR}" \
-  --shoot-policy-dir "${SHOOT_POLICY_DIR}" \
+  --world-model-update-interval 25 \
+  --world-model-replay-buffer-size 100000 \
+  --world-model-replay-recent-fraction 0.5 \
+  --world-model-replay-recent-window 10000 \
+  --mpc-horizon 2 \
+  --mpc-num-samples 256 \
+  --mpc-num-iterations 4 \
+  --terminal-value-checkpoint "${TERMINAL_VALUE_CHECKPOINT}" \
+  --mpc-kl-coefficient 0.0 \
+  --mpc-guidance-reward-coefficient 1.0 \
+  --mpc-warmup-steps "${MPC_WARMUP_STEPS:-2400}" \
+  --mpc-min-replay-size 20000 \
+  --mpc-min-world-model-updates 48 \
+  --mpc-min-terminal-value-updates 4 \
+  --no-auto-resume-online-replay \
   --headless \
   --policy-device "cuda:${CUDA_INDEX}" \
   --physx-num-threads "${PHYSX_NUM_THREADS:-4}" \
   --save-video-interval "${SAVE_VIDEO_INTERVAL:-0}" \
+  --resume \
+  --resume-mode full \
   --device "cuda:${CUDA_INDEX}" \
+  --resume-checkpoint "${HIGH_LEVEL_CHECKPOINT}" \
+  --skill-policy-source local \
+  --walk-policy-dir "${WALK_POLICY_DIR}" \
+  --dribble-policy-dir "${DRIBBLE_POLICY_DIR}" \
+  --shoot-policy-dir "${SHOOT_POLICY_DIR}" \
   "${OUTPUT_ARGS[@]}" \
   "${TRAINING_ARGS[@]}"
-# --resume \
-#   --resume-mode policy-only \
-#   --resume-checkpoint "${RESUME_CHECKPOINT}" \

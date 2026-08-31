@@ -38,6 +38,7 @@ from dribblebot.mpc.terminal_value import (
     ReturnNormalizer,
     TerminalValueModel,
     ValueModelConfig,
+    compute_discounted_returns,
     load_value_checkpoint,
     save_value_checkpoint,
 )
@@ -50,12 +51,12 @@ from dribblebot.world_model.trainer import load_checkpoint, save_checkpoint
 
 
 class WorldModelReplayBuffer:
-    """Bounded transition replay with an explicit historical sampling mix.
+    """Bounded opponent-stratified replay with a recent/historical mix.
 
-    A ring buffer alone can over-sample the newest opponent when its capacity
-    is small.  ``recent_fraction`` and ``recent_window`` reserve part of every
-    minibatch for recent data while sampling the remainder from older entries,
-    retaining opponent diversity until entries actually age out.
+    Capacity is balanced across opponent snapshot IDs so a long interval
+    against the latest opponent cannot erase every older opponent.  Each
+    minibatch reserves ``recent_fraction`` for the latest snapshot and samples
+    the remainder evenly across historical snapshots.
     """
 
     MODEL_KEYS = (
@@ -72,11 +73,13 @@ class WorldModelReplayBuffer:
         self.capacity = int(capacity)
         self.recent_fraction = float(recent_fraction)
         self.recent_window = max(1, min(int(recent_window), self.capacity))
-        self._items = deque(maxlen=self.capacity)
+        self._buckets = {}
+        self._size = 0
+        self._sequence = 0
         self._generator = torch.Generator().manual_seed(int(seed))
 
     def __len__(self):
-        return len(self._items)
+        return self._size
 
     def add_batch(self, batch: Mapping[str, torch.Tensor]) -> None:
         if not batch:
@@ -92,38 +95,129 @@ class WorldModelReplayBuffer:
                     item[key] = value[row].detach().cpu().clone()
                 else:
                     item[key] = value[row] if isinstance(value, (list, tuple)) else value
-            self._items.append(item)
+            self._append_item(item)
 
-    def _sample_indices(self, count: int) -> torch.Tensor:
-        size = len(self._items)
-        if size < 1:
+    @staticmethod
+    def _opponent_iteration(item):
+        """Return a stable opponent ID for stratified retention/sampling."""
+
+        value = item.get("opponent_snapshot_iteration", -1)
+        if torch.is_tensor(value):
+            value = value.reshape(-1)[0].item() if value.numel() else -1
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return -1
+
+    def _append_item(self, item):
+        """Append while reserving capacity for every known opponent.
+
+        A plain deque evicts the oldest snapshot wholesale.  That made a
+        100k-transition buffer forget all but the current opponent when
+        snapshots were rotated every few hundred PPO iterations.  Evict from
+        the most over-represented opponent bucket instead; with the small
+        opponent pool used by self-play this keeps every snapshot represented
+        until the buffer is genuinely full of distinct opponents.
+        """
+
+        incoming_id = self._opponent_iteration(item)
+        if incoming_id not in self._buckets:
+            self._buckets[incoming_id] = deque()
+        if self._size >= self.capacity:
+            ids_after_insert = len(self._buckets)
+            fair_share = max(float(self.capacity) / max(ids_after_insert, 1), 1.0)
+            oversized = [
+                key for key, bucket in self._buckets.items()
+                if len(bucket) > fair_share
+            ]
+            if oversized:
+                evict_id = max(oversized, key=lambda key: len(self._buckets[key]))
+            else:
+                candidates = list(self._buckets)
+                if incoming_id in candidates and len(candidates) > 1:
+                    candidates.remove(incoming_id)
+                evict_id = max(candidates, key=lambda key: len(self._buckets[key]))
+            self._buckets[evict_id].popleft()
+            self._size -= 1
+            if not self._buckets[evict_id]:
+                del self._buckets[evict_id]
+        self._buckets.setdefault(incoming_id, deque()).append((self._sequence, item))
+        self._sequence += 1
+        self._size += 1
+
+    def items(self):
+        """Return replay rows in insertion order for checkpointing/auditing."""
+
+        sequenced = [entry for bucket in self._buckets.values() for entry in bucket]
+        sequenced.sort(key=lambda entry: entry[0])
+        return [item for _, item in sequenced]
+
+    def state_dict(self):
+        return {
+            "format": "dribblebot_world_model_replay_v2",
+            "capacity": self.capacity,
+            "recent_fraction": self.recent_fraction,
+            "recent_window": self.recent_window,
+            "items": self.items(),
+        }
+
+    def load_state_dict(self, payload):
+        if not isinstance(payload, Mapping):
+            raise ValueError("replay state must be a mapping")
+        items = payload.get("items", [])
+        if not isinstance(items, (list, tuple)):
+            raise ValueError("replay state items must be a list")
+        self._buckets.clear()
+        self._size = 0
+        self._sequence = 0
+        for item in items[-self.capacity:]:
+            if not isinstance(item, Mapping):
+                raise ValueError("replay state contains a non-mapping item")
+            self._append_item(dict(item))
+
+    def opponent_counts(self):
+        return {key: len(bucket) for key, bucket in self._buckets.items()}
+
+    def _sample_rows(self, count: int):
+        if self._size < 1:
             raise ValueError("cannot sample an empty replay buffer")
         count = int(count)
-        recent_start = max(0, size - self.recent_window)
         recent_count = min(count, int(round(count * self.recent_fraction)))
         historical_count = count - recent_count
-        recent = torch.randint(
-            recent_start, size, (recent_count,), generator=self._generator
-        ) if recent_count else torch.empty(0, dtype=torch.long)
-        if historical_count and recent_start:
-            historical = torch.randint(
-                0, recent_start, (historical_count,), generator=self._generator
-            )
-        elif historical_count:
-            historical = torch.randint(
-                0, size, (historical_count,), generator=self._generator
-            )
-        else:
-            historical = torch.empty(0, dtype=torch.long)
-        return torch.cat((recent, historical), dim=0)
+        ordered = self.items()
+        recent_pool = ordered[-self.recent_window :]
+        rows = []
+        for _ in range(recent_count):
+            index = int(torch.randint(
+                len(recent_pool), (1,), generator=self._generator
+            ))
+            rows.append(recent_pool[index])
+
+        opponent_ids = sorted(self._buckets)
+        newest_id = opponent_ids[-1]
+        historical_pools = {
+            key: [entry[1] for entry in self._buckets[key]]
+            for key in opponent_ids
+            if key != newest_id
+        }
+        historical_ids = sorted(historical_pools)
+        if not historical_pools:
+            # A short buffer or a large recent window has no disjoint
+            # historical slice; sample the complete buffer with replacement.
+            historical_pools = {-1: ordered}
+            historical_ids = [-1]
+        order = torch.randperm(
+            len(historical_ids), generator=self._generator
+        ).tolist()
+        for offset in range(historical_count):
+            opponent_id = historical_ids[order[offset % len(order)]]
+            pool = historical_pools[opponent_id]
+            index = int(torch.randint(len(pool), (1,), generator=self._generator))
+            rows.append(pool[index])
+        return rows
 
     def sample(self, count: int, device: Optional[torch.device] = None) -> Dict[str, torch.Tensor]:
-        indices = self._sample_indices(count)
-        # Deque indexing is linear. Materialize references once so a large
-        # historical buffer still has O(size + batch) rather than O(size*batch)
-        # sampling cost.
-        items = list(self._items)
-        rows = [items[int(index)] for index in indices]
+        rows = self._sample_rows(count)
         keys = rows[0].keys()
         result = {}
         for key in keys:
@@ -165,13 +259,22 @@ class OnlineWorldModelTrainer:
             for optimizer, state in zip(self.optimizers, optimizer_states):
                 optimizer.load_state_dict(state)
         self.loss_config = dict(loss_config or {})
+        self.update_bursts = 0
+        self.gradient_updates = 0
+        self.ready = False
         self.feature_weights = feature_group_weights(
             self.model.schema, self.loss_config, self.device
         )
 
     def update(self) -> Dict[str, float]:
         if len(self.replay) < max(2, self.batch_size):
-            return {"world_model/update_skipped": 1.0, "world_model/replay_size": float(len(self.replay))}
+            return {
+                "world_model/update_skipped": 1.0,
+                "world_model/replay_size": float(len(self.replay)),
+                "world_model/ready": float(self.ready),
+                "world_model/update_bursts": float(self.update_bursts),
+                "world_model/gradient_updates_total": float(self.gradient_updates),
+            }
         self.model.train()
         totals: Dict[str, float] = {}
         updates = 0
@@ -201,15 +304,22 @@ class OnlineWorldModelTrainer:
                     self.model.members[member_index].parameters(), self.gradient_clip_norm
                 )
                 optimizer.step()
+                self.gradient_updates += 1
                 for key, value in losses.items():
                     totals[f"world_model/{key}"] = (
                         totals.get(f"world_model/{key}", 0.0)
                         + float(value.detach())
                     )
                 updates += 1
+        if updates:
+            self.update_bursts += 1
+            self.ready = True
         self.model.eval()
         totals["world_model/replay_size"] = float(len(self.replay))
         totals["world_model/updates"] = float(updates)
+        totals["world_model/ready"] = float(self.ready)
+        totals["world_model/update_bursts"] = float(self.update_bursts)
+        totals["world_model/gradient_updates_total"] = float(self.gradient_updates)
         return {
             key: (
                 value / max(updates, 1)
@@ -240,15 +350,24 @@ class OnlineTerminalValueTrainer:
         self.gamma = float(gamma)
         self.gradient_clip_norm = float(gradient_clip_norm)
         self.enabled = bool(enabled)
-        self.ready = bool(pretrained) if self.enabled else True
+        self.pretrained = bool(pretrained)
+        self.ready = self.pretrained if self.enabled else True
+        self.update_bursts = 0
+        self.gradient_updates = 0
 
     def update(self) -> Dict[str, float]:
         if not self.enabled:
             return {"terminal_value/enabled": 0.0}
         if len(self.replay) < max(2, self.batch_size):
-            return {"terminal_value/update_skipped": 1.0}
+            return {
+                "terminal_value/update_skipped": 1.0,
+                "terminal_value/ready": float(self.ready),
+                "terminal_value/update_bursts": float(self.update_bursts),
+                "terminal_value/gradient_updates_total": float(self.gradient_updates),
+            }
         self.model.train()
         total = 0.0
+        performed = 0
         for _ in range(self.updates_per_interval):
             if len(self.replay) < self.batch_size:
                 break
@@ -268,10 +387,19 @@ class OnlineTerminalValueTrainer:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_norm)
             self.optimizer.step()
+            self.gradient_updates += 1
+            performed += 1
             total += float(loss.detach())
-        self.ready = True
+        if performed:
+            self.update_bursts += 1
+        self.ready = self.ready or bool(performed)
         self.model.eval()
-        return {"terminal_value/loss": total / self.updates_per_interval}
+        return {
+            "terminal_value/loss": total / max(performed, 1),
+            "terminal_value/ready": float(self.ready),
+            "terminal_value/update_bursts": float(self.update_bursts),
+            "terminal_value/gradient_updates_total": float(self.gradient_updates),
+        }
 
 
 def _wrapper_actions_to_canonical(wrapper_actions, match_env, action_adapter):
@@ -404,9 +532,119 @@ class OnlineMPCSelfPlayExtension:
         self._high_level_steps = 0
         self._episode_states = [[] for _ in range(self.train_matches)]
         self._episode_rewards = [[] for _ in range(self.train_matches)]
+        self._episode_terminated = [[] for _ in range(self.train_matches)]
+        self._episode_truncated = [[] for _ in range(self.train_matches)]
         # TerminalStateCapture is installed by build_online_training before
         # this extension is constructed.
         self.capture = getattr(args, "terminal_state_capture", None)
+        self._load_online_replay()
+
+    def _load_online_replay(self):
+        checkpoint = getattr(self.args, "online_replay_checkpoint", None)
+        if (
+            checkpoint is None
+            and bool(getattr(self.args, "resume", False))
+            and bool(getattr(self.args, "auto_resume_online_replay", True))
+        ):
+            resume = getattr(self.args, "resume_checkpoint", None)
+            if resume:
+                candidate = Path(resume).expanduser().resolve().parent / (
+                    "online_replay_latest.pt"
+                )
+                if candidate.is_file():
+                    checkpoint = str(candidate)
+        if not checkpoint:
+            return
+        path = Path(checkpoint).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f"online replay checkpoint does not exist: {path}")
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+        except TypeError:
+            payload = torch.load(path, map_location="cpu")
+        if payload.get("format") != "dribblebot_online_replay_v1":
+            raise ValueError(f"Unsupported online replay checkpoint format: {path}")
+        self.replay.load_state_dict(payload.get("dynamics", {}))
+        self.value_replay.load_state_dict(payload.get("value", {}))
+        counters = payload.get("trainer_counters", {})
+        self.world_model_trainer.update_bursts = int(
+            counters.get("world_model_update_bursts", 0)
+        )
+        self.world_model_trainer.gradient_updates = int(
+            counters.get("world_model_gradient_updates", 0)
+        )
+        self.world_model_trainer.ready = (
+            self.world_model_trainer.gradient_updates > 0
+        )
+        self.terminal_trainer.update_bursts = int(
+            counters.get("terminal_value_update_bursts", 0)
+        )
+        self.terminal_trainer.gradient_updates = int(
+            counters.get("terminal_value_gradient_updates", 0)
+        )
+        self.terminal_trainer.ready = (
+            self.terminal_trainer.ready
+            or self.terminal_trainer.gradient_updates > 0
+        )
+        self._high_level_steps = int(payload.get("high_level_steps", 0))
+        print(
+            f"Loaded {len(self.replay)} dynamics and {len(self.value_replay)} "
+            f"value transitions from {path}"
+        )
+
+    def _planner_ready(self):
+        """Require useful replay/model updates before trusting MPC labels."""
+
+        if self._high_level_steps < int(self.args.mpc_warmup_steps):
+            return False
+        if len(self.replay) < int(getattr(self.args, "mpc_min_replay_size", 1)):
+            return False
+        if self.world_model_trainer.gradient_updates < int(
+            getattr(self.args, "mpc_min_world_model_updates", 1)
+        ):
+            return False
+        if self.planner.config.use_terminal_value:
+            if not self.terminal_trainer.ready:
+                return False
+            if (
+                not self.terminal_trainer.pretrained
+                and self.terminal_trainer.gradient_updates
+                < int(getattr(self.args, "mpc_min_terminal_value_updates", 1))
+            ):
+                return False
+        return True
+
+    def _readiness_metrics(self):
+        opponent_counts = self.replay.opponent_counts()
+        metrics = {
+            "mpc/readiness": float(self._planner_ready()),
+            "mpc/warmup_steps": float(self.args.mpc_warmup_steps),
+            "mpc/world_model_update_bursts": float(
+                self.world_model_trainer.update_bursts
+            ),
+            "mpc/world_model_gradient_updates": float(
+                self.world_model_trainer.gradient_updates
+            ),
+            "mpc/terminal_value_update_bursts": float(
+                self.terminal_trainer.update_bursts
+            ),
+            "mpc/terminal_value_gradient_updates": float(
+                self.terminal_trainer.gradient_updates
+            ),
+            "mpc/replay_size": float(len(self.replay)),
+            "mpc/min_replay_size": float(
+                getattr(self.args, "mpc_min_replay_size", 1)
+            ),
+            "world_model/replay_opponent_count": float(len(opponent_counts)),
+        }
+        if opponent_counts:
+            metrics["world_model/replay_oldest_opponent_iteration"] = float(
+                min(opponent_counts)
+            )
+            metrics["world_model/replay_latest_opponent_iteration"] = float(
+                max(opponent_counts)
+            )
+        return metrics
 
     def bind_runner(self, runner):
         self.runner = runner
@@ -419,19 +657,55 @@ class OnlineMPCSelfPlayExtension:
     def train_matches(self):
         return int(self.env.num_train_envs // self.env.team_size)
 
+    def _timeout_return_target(self, row, next_state, match_done, timeout):
+        """Build a completed episode target with correct timeout bootstrapping."""
+
+        rewards = self._episode_rewards[row]
+        terminated = self._episode_terminated[row]
+        truncated = self._episode_truncated[row]
+        bootstrap = 0.0
+        bootstrap_enabled = bool(
+            getattr(self.args, "terminal_bootstrap_on_timeout", True)
+        )
+        if (
+            bool(timeout)
+            and bootstrap_enabled
+            and self.terminal_trainer.ready
+        ):
+            with torch.no_grad():
+                bootstrap = float(
+                    self.terminal_trainer.model.predict(
+                        next_state[row : row + 1].to(self.terminal_trainer.device)
+                    )[0].detach().cpu()
+                )
+        returns = compute_discounted_returns(
+            rewards,
+            terminated,
+            truncated,
+            self.terminal_trainer.gamma,
+            bootstrap_value=bootstrap,
+            bootstrap_on_truncation=bool(timeout and bootstrap_enabled),
+        )
+        tail_exclusion = int(
+            getattr(self.args, "terminal_timeout_tail_exclusion", 0)
+        )
+        if bool(timeout) and bootstrap_enabled and not self.terminal_trainer.ready:
+            # Do not train on the least reliable suffix while the bootstrap
+            # model is still uninitialized.  This is configurable and defaults
+            # to retaining all data once the warm-up model is ready.
+            tail_exclusion = max(0, tail_exclusion)
+            if tail_exclusion:
+                keep = max(0, len(returns) - tail_exclusion)
+                returns = returns[:keep]
+        return returns
+
     def before_env_step(self, iteration, obs_before, actions):
         batch = self.train_matches
         state = self.state_adapter.extract_state(self.match_env)["tensor"][:batch]
         if self.capture is not None:
             self.capture.clear()
         plan = None
-        if (
-            self._high_level_steps >= int(self.args.mpc_warmup_steps)
-            and (
-                not self.planner.config.use_terminal_value
-                or self.terminal_trainer.ready
-            )
-        ):
+        if self._planner_ready():
             opponent_wrapper = self.env.preview_opponent_actions()[:batch]
             opponent_action = _wrapper_actions_to_canonical(
                 opponent_wrapper, self.match_env, self.action_adapter
@@ -504,10 +778,20 @@ class OnlineMPCSelfPlayExtension:
             infos["mpc_guidance_disagreement"] = disagreement.reshape(
                 -1
             ).detach()
+        if "high_level_match_rewards" not in info:
+            raise KeyError(
+                "Online MPC training requires SharedPolicySelfPlayWrapper to "
+                "provide 'high_level_match_rewards'; refusing to use a single "
+                "robot's shaped reward as a silent fallback."
+            )
         match_rewards = torch.as_tensor(
-            info.get("high_level_match_rewards", rewards[:batch * team].reshape(batch, team)[:, 0]),
-            device=pending["state"].device, dtype=torch.float,
-        ).reshape(-1)[:batch]
+            info["high_level_match_rewards"],
+            device=pending["state"].device,
+            dtype=torch.float,
+        )
+        if match_rewards.ndim > 1:
+            match_rewards = match_rewards.reshape(match_rewards.shape[0], -1)[:, 0]
+        match_rewards = match_rewards.reshape(-1)[:batch]
         match_done = dones[:batch * team].reshape(batch, team).any(dim=1)
         timeout_values = torch.as_tensor(
             info.get("time_outs", torch.zeros(batch * team, dtype=torch.bool)),
@@ -571,32 +855,36 @@ class OnlineMPCSelfPlayExtension:
             state_cpu = pending["state"].detach().cpu()
             rewards_cpu = match_rewards.detach().cpu().tolist()
             done_cpu = match_done.detach().cpu().tolist()
+            timeout_cpu = timeout_values.detach().cpu().tolist()
+            terminated_cpu = terminated.detach().cpu().tolist()
             for row in range(batch):
                 self._episode_states[row].append(state_cpu[row])
                 self._episode_rewards[row].append(float(rewards_cpu[row]))
+                self._episode_terminated[row].append(bool(terminated_cpu[row]))
+                self._episode_truncated[row].append(bool(timeout_cpu[row]))
                 if done_cpu[row]:
-                    continuation = 0.0
-                    returns = []
-                    for reward in reversed(self._episode_rewards[row]):
-                        continuation = (
-                            reward
-                            + self.terminal_trainer.gamma * continuation
-                        )
-                        returns.append(continuation)
-                    returns.reverse()
-                    self.value_replay.add_batch({
-                        "state": torch.stack(self._episode_states[row]),
-                        "return_to_go": torch.tensor(
-                            returns, dtype=torch.float
-                        ),
-                        "opponent_snapshot_iteration": torch.full(
-                            (len(returns),),
-                            int(selected_opponent_iterations[row]),
-                            dtype=torch.long,
-                        ),
-                    })
+                    returns = self._timeout_return_target(
+                        row, next_state, bool(done_cpu[row]), bool(timeout_cpu[row])
+                    )
+                    states = self._episode_states[row]
+                    if len(returns) < len(states):
+                        states = states[: len(returns)]
+                    if len(returns):
+                        self.value_replay.add_batch({
+                            "state": torch.stack(states),
+                            "return_to_go": torch.tensor(
+                                returns, dtype=torch.float
+                            ),
+                            "opponent_snapshot_iteration": torch.full(
+                                (len(returns),),
+                                int(selected_opponent_iterations[row]),
+                                dtype=torch.long,
+                            ),
+                        })
                     self._episode_states[row].clear()
                     self._episode_rewards[row].clear()
+                    self._episode_terminated[row].clear()
+                    self._episode_truncated[row].clear()
         # A zero KL coefficient is a real ablation, not an unbounded target
         # cache.  Keep MPC planning active for pipeline parity, but do not
         # retain teacher labels when no distillation update can consume them.
@@ -609,6 +897,9 @@ class OnlineMPCSelfPlayExtension:
                 "target_std": targets[1].detach().cpu(),
                 "target_probs": targets[2].detach().cpu(),
                 "target_masks": targets[3].detach().cpu()[None].expand(batch * team, -1, -1),
+                "opponent_snapshot_iteration": selected_opponent_iterations.repeat_interleave(
+                    team
+                ).detach().cpu(),
             })
         if self._planner_state is not None and bool(match_done.any()):
             self._planner_state.reset(match_done.nonzero(as_tuple=False).flatten())
@@ -625,8 +916,11 @@ class OnlineMPCSelfPlayExtension:
                 "mpc_distillation/enabled": 0.0,
                 "mpc_distillation/coefficient": 0.0,
             }
-        if self._high_level_steps < int(self.args.mpc_warmup_steps):
-            return {}
+        if not self._planner_ready():
+            return {
+                "mpc_distillation/enabled": 0.0,
+                "mpc_distillation/update_skipped_not_ready": 1.0,
+            }
         records = getattr(self, "_distill_records", [])
         if not records:
             return {}
@@ -741,6 +1035,7 @@ class OnlineMPCSelfPlayExtension:
         metrics = dict(self._metrics)
         self._metrics = {}
         metrics.update(self._distill_update(iteration))
+        metrics.update(self._readiness_metrics())
         return metrics
 
     def save_checkpoint(self, path, iteration):
@@ -776,20 +1071,39 @@ class OnlineMPCSelfPlayExtension:
         world_latest = output / "world_model_online_latest.pt"
         shutil.copy2(world_path, world_latest)
         saved = [str(world_path), str(world_latest)]
-        if not self.terminal_trainer.enabled:
-            return saved
-        value_path = output / f"terminal_value_online_{iteration}.pt"
-        value_config = ValueModelConfig(
-            device=str(self.terminal_trainer.device),
-            gamma=self.terminal_trainer.gamma,
-        )
-        save_value_checkpoint(
-            value_path, self.terminal_trainer.model, self.terminal_trainer.optimizer,
-            iteration, value_config, {}, "online_replay",
-        )
-        value_latest = output / "terminal_value_online_latest.pt"
-        shutil.copy2(value_path, value_latest)
-        saved.extend((str(value_path), str(value_latest)))
+        if self.terminal_trainer.enabled:
+            value_path = output / f"terminal_value_online_{iteration}.pt"
+            value_config = ValueModelConfig(
+                device=str(self.terminal_trainer.device),
+                gamma=self.terminal_trainer.gamma,
+            )
+            save_value_checkpoint(
+                value_path, self.terminal_trainer.model, self.terminal_trainer.optimizer,
+                iteration, value_config, {}, "online_replay",
+            )
+            value_latest = output / "terminal_value_online_latest.pt"
+            shutil.copy2(value_path, value_latest)
+            saved.extend((str(value_path), str(value_latest)))
+        if bool(getattr(self.args, "save_online_replay", True)):
+            replay_payload = {
+                "format": "dribblebot_online_replay_v1",
+                "high_level_steps": self._high_level_steps,
+                "dynamics": self.replay.state_dict(),
+                "value": self.value_replay.state_dict(),
+                "trainer_counters": {
+                    "world_model_update_bursts": self.world_model_trainer.update_bursts,
+                    "world_model_gradient_updates": self.world_model_trainer.gradient_updates,
+                    "terminal_value_update_bursts": self.terminal_trainer.update_bursts,
+                    "terminal_value_gradient_updates": self.terminal_trainer.gradient_updates,
+                },
+            }
+            replay_path = output / f"online_replay_{iteration}.pt"
+            replay_latest = output / "online_replay_latest.pt"
+            temporary = replay_path.with_suffix(replay_path.suffix + ".tmp")
+            torch.save(replay_payload, temporary)
+            temporary.replace(replay_path)
+            shutil.copy2(replay_path, replay_latest)
+            saved.extend((str(replay_path), str(replay_latest)))
         return saved
 
 
@@ -918,12 +1232,82 @@ def build_arg_parser():
         help="Enable or remove the terminal continuation value from MPC ranking.",
     )
     parser.add_argument(
-        "--mpc-warmup-steps", "--mpc-warmup", type=int, default=500,
+        "--mpc-warmup-steps", "--mpc-warmup", type=int, default=2400,
         help="Vectorized high-level environment steps collected before MPC/distillation can start.",
     )
+    parser.add_argument(
+        "--mpc-min-replay-size", type=int, default=20_000,
+        help=(
+            "Minimum real high-level transitions required in dynamics replay "
+            "before MPC can run. This readiness gate is applied in addition "
+            "to --mpc-warmup-steps."
+        ),
+    )
+    parser.add_argument(
+        "--mpc-min-world-model-updates", type=int, default=48,
+        help="Minimum online world-model gradient updates before MPC can run.",
+    )
+    parser.add_argument(
+        "--mpc-min-terminal-value-updates", type=int, default=4,
+        help=(
+            "Minimum online terminal-value gradient updates before MPC can "
+            "run when no pretrained terminal-value checkpoint was loaded."
+        ),
+    )
+    timeout_group = parser.add_mutually_exclusive_group()
+    timeout_group.add_argument(
+        "--terminal-bootstrap-on-timeout",
+        dest="terminal_bootstrap_on_timeout",
+        action="store_true",
+        help="Bootstrap timeout return targets from V(next_state).",
+    )
+    timeout_group.add_argument(
+        "--no-terminal-bootstrap-on-timeout",
+        dest="terminal_bootstrap_on_timeout",
+        action="store_false",
+        help="Treat timeout targets as finite-horizon returns.",
+    )
+    parser.set_defaults(terminal_bootstrap_on_timeout=True)
+    parser.add_argument(
+        "--terminal-timeout-tail-exclusion", type=int, default=8,
+        help=(
+            "Number of final timeout states omitted until a terminal-value "
+            "model is ready to bootstrap them."
+        ),
+    )
+    parser.add_argument(
+        "--online-replay-checkpoint", default=None,
+        help="Optional saved dynamics/value replay checkpoint to restore.",
+    )
+    replay_resume_group = parser.add_mutually_exclusive_group()
+    replay_resume_group.add_argument(
+        "--auto-resume-online-replay",
+        dest="auto_resume_online_replay",
+        action="store_true",
+        help="When resuming a policy, also restore adjacent online_replay_latest.pt if present.",
+    )
+    replay_resume_group.add_argument(
+        "--no-auto-resume-online-replay",
+        dest="auto_resume_online_replay",
+        action="store_false",
+        help="Start dynamics/value replay and readiness counters from scratch.",
+    )
+    parser.set_defaults(auto_resume_online_replay=True)
+    replay_save_group = parser.add_mutually_exclusive_group()
+    replay_save_group.add_argument(
+        "--save-online-replay", dest="save_online_replay", action="store_true"
+    )
+    replay_save_group.add_argument(
+        "--no-save-online-replay", dest="save_online_replay", action="store_false"
+    )
+    parser.set_defaults(save_online_replay=True)
     parser.add_argument("--mpc-distillation-batch-size", type=int, default=1024)
     # Online CEM is substantially more expensive than policy-only PPO.
-    parser.set_defaults(num_envs=32, project="as2_high_level_online_mpc")
+    parser.set_defaults(
+        num_envs=32,
+        project="as2_high_level_online_mpc",
+        self_play_update_interval=400,
+    )
     return parser
 
 
@@ -940,6 +1324,20 @@ def validate_online_args(args):
         )
     if args.mpc_warmup_steps < 0:
         raise ValueError("--mpc-warmup-steps cannot be negative")
+    for name in (
+        "mpc_min_replay_size",
+        "mpc_min_world_model_updates",
+        "mpc_min_terminal_value_updates",
+    ):
+        if int(getattr(args, name)) < 1:
+            raise ValueError(f"--{name.replace('_', '-')} must be positive")
+    if int(args.mpc_min_replay_size) > int(args.world_model_replay_buffer_size):
+        raise ValueError(
+            "--mpc-min-replay-size cannot exceed "
+            "--world-model-replay-buffer-size"
+        )
+    if int(args.terminal_timeout_tail_exclusion) < 0:
+        raise ValueError("--terminal-timeout-tail-exclusion cannot be negative")
     for name in ("mpc_horizon", "mpc_num_samples", "mpc_num_iterations"):
         value = getattr(args, name)
         if value is not None and value < 1:
@@ -986,6 +1384,7 @@ def train_robot(args):
     RunnerArgs.resume_policy_only = args.resume_mode == "policy-only"
     RunnerArgs.resume_path = args.resume_run
     RunnerArgs.resume_checkpoint = args.resume_checkpoint
+    RunnerArgs.save_video_interval = args.save_video_interval
     RunnerArgs.checkpoint_dir = args.checkpoint_dir
     RunnerArgs.self_play_update_interval = args.self_play_update_interval
     RunnerArgs.skill_entropy_initial_coef = args.skill_entropy_coef
