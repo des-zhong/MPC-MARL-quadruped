@@ -14,8 +14,8 @@ if str(ROOT) not in sys.path:
 import numpy as np
 import torch
 
-from dribblebot.mpc.teacher_dataset import TeacherDataset
-from dribblebot.mpc.terminal_value import compute_discounted_returns, load_value_checkpoint
+from quadruped.mpc.teacher_dataset import TeacherDataset
+from quadruped.mpc.terminal_value import compute_discounted_returns, load_value_checkpoint
 
 
 @torch.no_grad()

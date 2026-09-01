@@ -31,10 +31,10 @@ else:
 import torch
 import torch.nn.functional as F
 
-from dribblebot.mpc.config import load_mpc_config
-from dribblebot.mpc.hybrid_cem import HybridCEMMPC
-from dribblebot.mpc.objective import MPCObjective
-from dribblebot.mpc.terminal_value import (
+from quadruped.mpc.config import load_mpc_config
+from quadruped.mpc.hybrid_cem import HybridCEMMPC
+from quadruped.mpc.objective import MPCObjective
+from quadruped.mpc.terminal_value import (
     ReturnNormalizer,
     TerminalValueModel,
     ValueModelConfig,
@@ -42,12 +42,12 @@ from dribblebot.mpc.terminal_value import (
     load_value_checkpoint,
     save_value_checkpoint,
 )
-from dribblebot.world_model.ensemble import WorldModelEnsemble
-from dribblebot.world_model.losses import feature_group_weights, one_step_member_loss
-from dribblebot.world_model.normalizer import WorldModelNormalizer
-from dribblebot.world_model.schema import EVENT_NAMES
-from dribblebot.world_model.state_adapter import FootballWorldModelStateAdapter
-from dribblebot.world_model.trainer import load_checkpoint, save_checkpoint
+from quadruped.world_model.ensemble import WorldModelEnsemble
+from quadruped.world_model.losses import feature_group_weights, one_step_member_loss
+from quadruped.world_model.normalizer import WorldModelNormalizer
+from quadruped.world_model.schema import EVENT_NAMES
+from quadruped.world_model.state_adapter import FootballWorldModelStateAdapter
+from quadruped.world_model.trainer import load_checkpoint, save_checkpoint
 
 
 class WorldModelReplayBuffer:
@@ -1012,7 +1012,7 @@ class OnlineMPCSelfPlayExtension:
             return {
                 "mpc_distillation/update_skipped_nonfinite_parameters": 1.0,
             }
-        from dribblebot_learn.ppo_cse.actor_critic import AC_Args
+        from quadruped_learn.ppo_cse.actor_critic import AC_Args
         with torch.no_grad():
             policy.std.clamp_(min=AC_Args.min_action_std, max=AC_Args.max_action_std)
         return {
@@ -1358,10 +1358,10 @@ def train_robot(args):
     validate_online_args(args)
     set_training_seed(getattr(args, "seed", 42))
     from scripts.train_high_level import configure_high_level_cfg, load_skill_policies
-    from dribblebot.envs.base.legged_robot_config import Cfg
-    from dribblebot.envs.as2.two_robot_velocity_tracking import TwoRobotVelocityTrackingEasyEnv
-    from dribblebot.envs.wrappers.high_level_skill_wrapper import HighLevelSkillWrapper
-    from dribblebot.envs.wrappers.shared_self_play_wrapper import SharedPolicySelfPlayWrapper
+    from quadruped.envs.base.legged_robot_config import Cfg
+    from quadruped.envs.as2.two_robot_velocity_tracking import TwoRobotVelocityTrackingEasyEnv
+    from quadruped.envs.wrappers.high_level_skill_wrapper import HighLevelSkillWrapper
+    from quadruped.envs.wrappers.shared_self_play_wrapper import SharedPolicySelfPlayWrapper
     try:
         from scripts.collect_world_model_data import TerminalStateCapture
     except ModuleNotFoundError as error:
@@ -1369,10 +1369,10 @@ def train_robot(args):
             raise
         # The collector was moved to discard/ in lightweight deployments; the
         # simulator controller contains the same capture primitive.
-        from dribblebot.mpc.simulator_controller import TerminalStateCapture
-    from dribblebot_learn.ppo_cse import Runner, RunnerArgs
-    from dribblebot_learn.ppo_cse.actor_critic import AC_Args
-    from dribblebot_learn.ppo_cse.ppo import PPO_Args
+        from quadruped.mpc.simulator_controller import TerminalStateCapture
+    from quadruped_learn.ppo_cse import Runner, RunnerArgs
+    from quadruped_learn.ppo_cse.actor_critic import AC_Args
+    from quadruped_learn.ppo_cse.ppo import PPO_Args
     import wandb
 
     configure_high_level_cfg(Cfg, args)
@@ -1445,7 +1445,7 @@ def train_robot(args):
     )
     capture = TerminalStateCapture(match_env, state_adapter)
     args.terminal_state_capture = capture
-    config = __import__("dribblebot.world_model.config", fromlist=["load_config"]).load_config(args.world_model_config)
+    config = __import__("quadruped.world_model.config", fromlist=["load_config"]).load_config(args.world_model_config)
     world_model, world_checkpoint = _build_world_model(args.world_model_checkpoint, state_adapter, config, args.device)
     mpc_config, mpc_payload = load_mpc_config(args.mpc_config, args.mpc_profile)
     if args.mpc_horizon is not None:

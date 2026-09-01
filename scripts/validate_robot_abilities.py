@@ -262,7 +262,7 @@ def run_single(args):
     # guarantees a clean simulator for each child.
     from scripts import play_walk_dribble_shoot as playback
     from scripts.playback_utils import get_raw_env, get_sensor_slice, patch_obs_command, set_walking_command
-    from dribblebot.command_frames import body_xy_to_world_xy, world_xy_to_body_xy
+    from quadruped.command_frames import body_xy_to_world_xy, world_xy_to_body_xy
     import imageio
     import torch
 

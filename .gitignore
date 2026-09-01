@@ -8,6 +8,11 @@ __pycache__/
 .coverage
 htmlcov/
 discard/
+
+# Validation suites are not required to reproduce the training pipeline
+/tests/
+/isaaclab-rebuild/tests/
+
 # Packaging and native-extension build products
 *.egg-info/
 build/

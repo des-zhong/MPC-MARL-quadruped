@@ -9,7 +9,7 @@ from typing import Any, Mapping, Sequence
 import torch
 
 try:
-    from dribblebot.world_model.schema import EVENT_NAMES, StateSchema, default_state_schema, validate_event_names
+    from quadruped.world_model.schema import EVENT_NAMES, StateSchema, default_state_schema, validate_event_names
 except ModuleNotFoundError:
     # The migration package is installed as a separate Isaac Lab extension,
     # while the existing model code remains at the repository root. Resolve
@@ -17,7 +17,7 @@ except ModuleNotFoundError:
     repository_root = Path(__file__).resolve().parents[4]
     if str(repository_root) not in sys.path:
         sys.path.insert(0, str(repository_root))
-    from dribblebot.world_model.schema import EVENT_NAMES, StateSchema, default_state_schema, validate_event_names
+    from quadruped.world_model.schema import EVENT_NAMES, StateSchema, default_state_schema, validate_event_names
 
 
 def _wxyz_to_rpy(quaternion: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

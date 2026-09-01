@@ -17,8 +17,8 @@ assert isaacgym
 import numpy as np
 import torch
 
-from dribblebot.mpc.runtime import add_simulator_arguments, build_runtime
-from dribblebot.world_model.metrics import uncertainty_error_correlation
+from quadruped.mpc.runtime import add_simulator_arguments, build_runtime
+from quadruped.world_model.metrics import uncertainty_error_correlation
 
 
 def _group_rmse(schema, prediction, actual, group, valid):

@@ -5,7 +5,7 @@ system for quadruped robot soccer in NVIDIA Isaac Gym. AS2 quadrupeds learn
 walking, dribbling, and shooting as separate low-level skills. A shared
 high-level policy selects those skills for every robot, trains against an older
 frozen copy of itself through self-play, and can receive privileged guidance
-from world-model MPC during training.
+from world-model MPC during training. 
 
 The main pipeline supports:
 
@@ -350,18 +350,16 @@ The convenience launcher is
 
 ```text
 configs/                    World-model and MPC configurations
-dribblebot/envs/as2/        AS2 simulator environments
-dribblebot/envs/wrappers/   Skill, self-play, and teacher wrappers
-dribblebot/world_model/     Joint dynamics model and dataset components
-dribblebot/mpc/             Hybrid CEM MPC and teacher tooling
-dribblebot_learn/           PPO implementation
+quadruped/envs/as2/         AS2 simulator environments
+quadruped/envs/wrappers/    Skill, self-play, and teacher wrappers
+quadruped/world_model/      Joint dynamics model and dataset components
+quadruped/mpc/              Hybrid CEM MPC and teacher tooling
+quadruped_learn/            PPO implementation
 scripts/                    Training, validation, collection, and analysis tools
 tests/                      Unit and contract tests
 ```
 
 ## Acknowledgements and license
 
-This work builds on the original DribbleBot implementation by Yandong Ji,
-Gabriel B. Margolis, and Pulkit Agrawal, as well as Walk These Ways and NVIDIA
-Isaac Gym. Redistributed upstream components retain their original licenses.
+This repo is heavily modified from [DribbleBot ]()[github.com/Improbable-AI/dribblebot](https://github.com/Improbable-AI/dribblebot). Redistributed upstream components retain their original licenses.
 See [LICENSE](LICENSE) and [LICENSES/](LICENSES/) for details.

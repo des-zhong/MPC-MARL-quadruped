@@ -60,7 +60,7 @@ class ReplayMPCSelfPlayExtension(online_mpc.OnlineMPCSelfPlayExtension):
         # ``train_high_level_online_mpc`` configures PPO before constructing
         # this extension.  Set it again defensively so this script remains
         # replay-first even if the base trainer changes its defaults later.
-        from dribblebot_learn.ppo_cse.ppo import PPO_Args
+        from quadruped_learn.ppo_cse.ppo import PPO_Args
 
         PPO_Args.num_learning_epochs = int(self.args.on_policy_ppo_epochs)
 
@@ -226,7 +226,7 @@ class ReplayMPCSelfPlayExtension(online_mpc.OnlineMPCSelfPlayExtension):
                             state.clear()
                 self._distill_optimizer.zero_grad(set_to_none=True)
                 continue
-            from dribblebot_learn.ppo_cse.actor_critic import AC_Args
+            from quadruped_learn.ppo_cse.actor_critic import AC_Args
 
             with torch.no_grad():
                 policy.std.clamp_(

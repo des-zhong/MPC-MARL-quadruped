@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dribblebot.world_model.dataset import assert_no_episode_leakage, load_manifest
+from quadruped.world_model.dataset import assert_no_episode_leakage, load_manifest
 
 
 def main(args) -> None:

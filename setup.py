@@ -2,7 +2,7 @@ from setuptools import find_packages
 from distutils.core import setup
 
 setup(
-    name='dribblebot',
+    name='quadruped',
     version='1.0.0',
     author='Yandong Ji',
     license="BSD-3-Clause",

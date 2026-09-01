@@ -10,9 +10,9 @@ import isaacgym
 import numpy as np
 import torch
 
-from dribblebot.world_model.config import load_config
-from dribblebot.world_model.state_adapter import FootballWorldModelStateAdapter
-from dribblebot.world_model.trainer import load_checkpoint
+from quadruped.world_model.config import load_config
+from quadruped.world_model.state_adapter import FootballWorldModelStateAdapter
+from quadruped.world_model.trainer import load_checkpoint
 from scripts.collect_world_model_data import TerminalStateCapture, build_environment
 
 

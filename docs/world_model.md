@@ -112,7 +112,7 @@ Offline evaluation reports state/feature-group/reward errors, NLL, termination a
 
 ```python
 import torch
-from dribblebot.world_model.trainer import load_checkpoint
+from quadruped.world_model.trainer import load_checkpoint
 
 model, checkpoint = load_checkpoint("checkpoints/world_model_as2/best.pt", "cuda")
 rollout = model.rollout(

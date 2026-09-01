@@ -16,7 +16,7 @@ from matplotlib import pyplot as plt
 import numpy as np
 import torch
 
-from dribblebot.mpc.terminal_value import ValueDataset, load_value_checkpoint
+from quadruped.mpc.terminal_value import ValueDataset, load_value_checkpoint
 
 
 @torch.no_grad()

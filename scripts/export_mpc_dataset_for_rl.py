@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from dribblebot.mpc.rl_export import export_teacher_dataset_for_rl
+from quadruped.mpc.rl_export import export_teacher_dataset_for_rl
 
 
 def main(args):

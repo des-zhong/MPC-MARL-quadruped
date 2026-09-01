@@ -81,10 +81,10 @@ def main() -> int:
     import torch
 
     assert isaacgym
-    from dribblebot.envs.as2.as2_config import config_as2
-    from dribblebot.envs.as2.velocity_tracking import VelocityTrackingEasyEnv
-    from dribblebot.envs.base.legged_robot_config import Cfg
-    from dribblebot.envs.wrappers.history_wrapper import HistoryWrapper
+    from quadruped.envs.as2.as2_config import config_as2
+    from quadruped.envs.as2.velocity_tracking import VelocityTrackingEasyEnv
+    from quadruped.envs.base.legged_robot_config import Cfg
+    from quadruped.envs.wrappers.history_wrapper import HistoryWrapper
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)

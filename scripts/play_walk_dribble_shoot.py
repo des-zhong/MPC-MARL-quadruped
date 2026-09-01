@@ -17,11 +17,11 @@ import numpy as np
 import torch
 from tqdm import trange
 
-from dribblebot.envs.base.legged_robot_config import Cfg
-from dribblebot.envs.as2.as2_config import config_as2
-from dribblebot.envs.as2.velocity_tracking import VelocityTrackingEasyEnv
-from dribblebot.envs.wrappers.history_wrapper import HistoryWrapper
-from dribblebot.command_frames import body_xy_to_world_xy, world_xy_to_body_xy
+from quadruped.envs.base.legged_robot_config import Cfg
+from quadruped.envs.as2.as2_config import config_as2
+from quadruped.envs.as2.velocity_tracking import VelocityTrackingEasyEnv
+from quadruped.envs.wrappers.history_wrapper import HistoryWrapper
+from quadruped.command_frames import body_xy_to_world_xy, world_xy_to_body_xy
 from scripts.playback_utils import (
     GAITS,
     build_policy_metadata,
