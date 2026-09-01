@@ -676,6 +676,11 @@ def configure_high_level_cfg(Cfg, args):
         shoot_x_scale,
         shoot_y_scale,
     ]
+    # Coordinator ball commands remain in the canonical/world field frame.
+    # HighLevelSkillWrapper converts them to the body-frame skill contract at
+    # each low-level policy inference.
+    Cfg.commands.ball_xy_frame = "body"
+    Cfg.env.high_level_ball_xy_frame = "team_canonical_field"
 
     # Conservative until load_skill_policies resolves the exact per-policy
     # training clips and raises this raw-environment ceiling as needed.
@@ -727,6 +732,7 @@ def load_skill_policies(args):
         find_policy_config_path,
         resolve_ac_weights_file,
         resolve_policy_files,
+        validate_ball_skill_command_frame,
     )
 
     policy_types = {
@@ -835,6 +841,16 @@ def load_skill_policies(args):
         policy_metadata["source_location"] = (
             run_path if source_kind == "wandb" else str(policy_dir)
         )
+        try:
+            validate_ball_skill_command_frame(
+                skill,
+                policy_metadata,
+                source=source_label,
+            )
+        except Exception:
+            if temporary_download is not None:
+                temporary_download.cleanup()
+            raise
         try:
             record = load_policy_record(
                 skill,

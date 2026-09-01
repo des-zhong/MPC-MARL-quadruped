@@ -7,6 +7,8 @@ PYTHON_BIN="${DRIBBLEBOT_PYTHON:-/home/zhz/anaconda3/envs/legged_env/bin/python}
 
 # ===== Paths to edit for a new run =====
 WALK_POLICY_DIR="checkpoints/reproduction/walk"
+# Replace these with newly retrained body-frame ball-skill checkpoints. The
+# bundled reproduction dribble/shoot configs are intentionally rejected.
 DRIBBLE_POLICY_DIR="checkpoints/reproduction/dribble"
 SHOOT_POLICY_DIR="checkpoints/reproduction/shoot"
 OUTPUT_DIR="outputs/ability_validation"

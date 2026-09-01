@@ -133,14 +133,21 @@ def summarize_shoot(rows, args):
     peak_idx = int(np.argmax(speeds))
     peak_speed = float(speeds[peak_idx])
     peak_alignment = direction_cosine(velocities[peak_idx], target)
-    start = np.array([rows[0]["ball_x"], rows[0]["ball_y"]])
-    end = np.array([rows[-1]["ball_x"], rows[-1]["ball_y"]])
     target_norm = np.linalg.norm(target)
-    launch_distance = (
-        float(np.dot(end - start, target / target_norm))
-        if target_norm > 1.0e-8
-        else float(np.linalg.norm(end - start))
-    )
+    launch_distance = 0.0
+    for previous, current in zip(rows, rows[1:]):
+        displacement = np.array(
+            [current["ball_x"] - previous["ball_x"], current["ball_y"] - previous["ball_y"]]
+        )
+        command_world = np.array(
+            [current["command_x_world"], current["command_y_world"]]
+        )
+        world_norm = np.linalg.norm(command_world)
+        launch_distance += (
+            float(np.dot(displacement, command_world / world_norm))
+            if target_norm > 1.0e-8 and world_norm > 1.0e-8
+            else float(np.linalg.norm(displacement))
+        )
     criteria = {
         "peak_ball_speed": {
             "value": peak_speed,
@@ -255,6 +262,7 @@ def run_single(args):
     # guarantees a clean simulator for each child.
     from scripts import play_walk_dribble_shoot as playback
     from scripts.playback_utils import get_raw_env, get_sensor_slice, patch_obs_command, set_walking_command
+    from dribblebot.command_frames import body_xy_to_world_xy, world_xy_to_body_xy
     import imageio
     import torch
 
@@ -262,6 +270,12 @@ def run_single(args):
     if args.ball_x is None:
         args.ball_x = 3.0 if args.ability == "walk" else args.ball_distance
     policy_record = _policy_record(playback, args, phase)
+    if args.ability in ("dribble", "shoot"):
+        playback.validate_ball_skill_command_frame(
+            args.ability,
+            policy_record.get("policy_metadata"),
+            source=policy_record.get("source"),
+        )
     metadata_config = policy_record.get("policy_metadata", {}).get("config_path")
     config_path = Path(args.config).expanduser().resolve() if args.config else metadata_config
     if config_path is None:
@@ -308,7 +322,16 @@ def run_single(args):
 
             robot_xy = raw_env.base_pos[0, :2].detach().cpu().numpy()
             ball_xy = raw_env.object_pos_world_frame[0, :2].detach().cpu().numpy()
-            ball_vel = raw_env.object_lin_vel[0, :2].detach().cpu().numpy()
+            ball_vel_world_tensor = raw_env.object_lin_vel[0:1, :2]
+            ball_vel_body_tensor = world_xy_to_body_xy(
+                ball_vel_world_tensor, raw_env.base_quat[0:1]
+            )
+            ball_vel = ball_vel_body_tensor[0].detach().cpu().numpy()
+            ball_vel_world = ball_vel_world_tensor[0].detach().cpu().numpy()
+            command_world = body_xy_to_world_xy(
+                torch.as_tensor(command[:2], dtype=raw_env.base_quat.dtype, device=raw_env.device).view(1, 2),
+                raw_env.base_quat[0:1],
+            )[0].detach().cpu().numpy()
             base_vel = raw_env.base_lin_vel[0, :2].detach().cpu().numpy()
             yaw_rate = float(raw_env.base_ang_vel[0, 2].item())
             rows.append(
@@ -319,6 +342,8 @@ def run_single(args):
                     "command_x": float(command[0]),
                     "command_y": float(command[1]),
                     "command_yaw": float(command[2]),
+                    "command_x_world": float(command_world[0]),
+                    "command_y_world": float(command_world[1]),
                     "robot_x": float(robot_xy[0]),
                     "robot_y": float(robot_xy[1]),
                     "robot_vx_body": float(base_vel[0]),
@@ -328,6 +353,8 @@ def run_single(args):
                     "ball_y": float(ball_xy[1]),
                     "ball_vx": float(ball_vel[0]),
                     "ball_vy": float(ball_vel[1]),
+                    "ball_vx_world": float(ball_vel_world[0]),
+                    "ball_vy_world": float(ball_vel_world[1]),
                     "robot_ball_dist": float(np.linalg.norm(ball_xy - robot_xy)),
                     "reward": float(reward[0].item()),
                     "action_norm": float(torch.norm(action[0]).item()),
@@ -448,13 +475,13 @@ def build_parser():
     parser.add_argument("--walk-yaw", type=float, default=0.0)
     parser.add_argument("--dribble-speed", type=float, default=0.9, help=argparse.SUPPRESS)
     parser.add_argument("--dribble-angle-deg", type=float, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--dribble-x", type=float, default=0.9)
-    parser.add_argument("--dribble-y", type=float, default=0.1)
-    parser.add_argument("--dribble-yaw", type=float, default=0.3)
+    parser.add_argument("--dribble-x", type=float, default=0.9, help="Body-frame dribble x command.")
+    parser.add_argument("--dribble-y", type=float, default=0.1, help="Body-frame dribble y command.")
+    parser.add_argument("--dribble-yaw", type=float, default=0.3, help="Body-frame yaw-rate command.")
     parser.add_argument("--shoot-speed", type=float, default=3.0, help=argparse.SUPPRESS)
     parser.add_argument("--shoot-angle-deg", type=float, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--shoot-x", type=float, default=3.0)
-    parser.add_argument("--shoot-y", type=float, default=0.0)
+    parser.add_argument("--shoot-x", type=float, default=3.0, help="Body-frame shoot x command.")
+    parser.add_argument("--shoot-y", type=float, default=0.0, help="Body-frame shoot y command.")
     parser.add_argument("--ball-distance", type=float, default=0.55)
     parser.add_argument("--ball-x", type=float, default=0.5)
     parser.add_argument("--ball-y", type=float, default=0.5)

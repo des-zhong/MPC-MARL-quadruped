@@ -15,7 +15,9 @@ from scripts.playback_utils import (
     find_local_wandb_config,
     find_policy_config_path,
     policy_action_clip_from_config,
+    policy_ball_xy_frame_from_config,
     restore_wandb_file,
+    validate_ball_skill_command_frame,
     wandb_run_cache_dir,
 )
 from scripts.train_high_level import add_skill_policy_source_args
@@ -53,6 +55,7 @@ def test_online_skill_source_forces_fresh_process_temporary_downloads(monkeypatc
         return root / "body.jit", root / "adaptation.jit", None, run, {
             "config_path": str(root / "config.yaml"),
             "action_clip": 1.0,
+            "ball_xy_frame": "body",
             "artifacts": {},
         }
 
@@ -211,11 +214,14 @@ Cfg:
     normalization:
       clip_observations: 100.0
       clip_actions: 10.0
+    commands:
+      ball_xy_frame: body
 """,
         encoding="utf-8",
     )
 
     assert policy_action_clip_from_config(config) == 10.0
+    assert policy_ball_xy_frame_from_config(config) == "body"
     metadata = build_policy_metadata(
         body,
         adaptation,
@@ -229,6 +235,7 @@ Cfg:
     assert metadata["checkpoint"] == "latest"
     assert metadata["action_clip"] == 10.0
     assert metadata["action_clip_source"].startswith("config:")
+    assert metadata["ball_xy_frame"] == "body"
     expected = {
         "body": body,
         "adaptation_module": adaptation,
@@ -286,6 +293,7 @@ def test_wrapper_clips_each_selected_policy_to_its_own_training_range(monkeypatc
         "dribble": {"policy": policy(5.0)},
         "shoot": {"policy": policy(-5.0)},
     }
+    wrapper._execution_command = lambda robot_slot: wrapper.skill_commands[:, robot_slot]
     wrapper._full_command = lambda skill_id, command: torch.zeros(3, 15)
     wrapper._robot_low_level_observation_full = lambda robot_slot, command: torch.zeros(3, 75)
     wrapper._update_low_level_history = lambda robot_slot, obs: None
@@ -300,6 +308,55 @@ def test_wrapper_clips_each_selected_policy_to_its_own_training_range(monkeypatc
     assert torch.all(actions[wrapper.skill_ids == 0] == 1.0)
     assert torch.all(actions[wrapper.skill_ids == 1] == 5.0)
     assert torch.all(actions[wrapper.skill_ids == 2] == -1.0)
+
+
+def test_ball_skill_checkpoint_requires_explicit_body_frame(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text("Cfg:\n  commands: {}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Legacy world-frame or unlabelled checkpoints"):
+        validate_ball_skill_command_frame(
+            "dribble",
+            {"config_path": str(config), "ball_xy_frame": None},
+        )
+
+
+def test_execution_adapter_reprojects_world_ball_commands_per_robot_yaw(monkeypatch):
+    module, torch = _load_wrapper_module(monkeypatch)
+    wrapper = module.HighLevelSkillWrapper.__new__(module.HighLevelSkillWrapper)
+    wrapper.device = torch.device("cpu")
+    wrapper.num_envs = 1
+    wrapper.num_robots = 2
+    wrapper.skill_ids = torch.tensor([[1, 2]])
+    # These are executable world commands after each team's canonical adapter.
+    wrapper.skill_commands = torch.tensor([[[1.0, 0.0, 0.2], [-1.0, 0.0, 0.0]]])
+    roots = torch.zeros(1, 2, 13)
+    roots[0, 0, 5:7] = torch.tensor([
+        torch.sin(torch.tensor(torch.pi / 4.0)),
+        torch.cos(torch.tensor(torch.pi / 4.0)),
+    ])
+    roots[0, 1, 5:7] = torch.tensor([1.0, 0.0])
+    wrapper.env = types.SimpleNamespace(
+        root_states=roots.reshape(-1, 13),
+        robot_actor_idxs_all=torch.tensor([[0, 1]]),
+    )
+
+    first = wrapper._execution_command(0)
+    second = wrapper._execution_command(1)
+
+    assert torch.allclose(first[0, :2], torch.tensor([0.0, -1.0]), atol=1e-6)
+    assert torch.allclose(second[0, :2], torch.tensor([1.0, 0.0]), atol=1e-6)
+    # The conversion is not latched at the high-level decision. It follows the
+    # robot pose on every low-level inference while the world target stays put.
+    roots[0, 0, 5:7] = torch.tensor([0.0, 1.0])
+    assert torch.allclose(
+        wrapper._execution_command(0)[0, :2], torch.tensor([1.0, 0.0]), atol=1e-6
+    )
+    # Tactical storage/telemetry is never overwritten by the execution adapter.
+    assert torch.equal(
+        wrapper.skill_commands,
+        torch.tensor([[[1.0, 0.0, 0.2], [-1.0, 0.0, 0.0]]]),
+    )
 
 
 def test_wrapper_clears_high_level_state_only_for_reset_rows(monkeypatch):

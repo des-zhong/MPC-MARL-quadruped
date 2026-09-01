@@ -246,6 +246,47 @@ def policy_action_clip_from_config(config_path):
     return clip
 
 
+def policy_ball_xy_frame_from_config(config_path):
+    """Read the explicit dribble/shoot planar command frame from a run config."""
+
+    import yaml
+
+    with Path(config_path).open("rb") as file:
+        payload = yaml.safe_load(file) or {}
+    cfg = _unwrap_wandb_config_value(payload.get("Cfg", payload))
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Cfg is not a mapping in {config_path}")
+    commands = _unwrap_wandb_config_value(cfg.get("commands", {}))
+    if not isinstance(commands, dict) or "ball_xy_frame" not in commands:
+        raise KeyError(f"Cfg.commands.ball_xy_frame is missing from {config_path}")
+    frame = str(_unwrap_wandb_config_value(commands["ball_xy_frame"])).lower()
+    if frame not in ("body", "world"):
+        raise ValueError(
+            f"Invalid Cfg.commands.ball_xy_frame={frame!r} in {config_path}; "
+            "expected 'body' or 'world'."
+        )
+    return frame
+
+
+def validate_ball_skill_command_frame(skill_name, policy_metadata, source=None):
+    """Reject ball-skill checkpoints that predate the body-frame contract."""
+
+    if skill_name not in ("dribble", "shoot"):
+        return
+    metadata = policy_metadata or {}
+    frame = metadata.get("ball_xy_frame")
+    if frame == "body":
+        return
+    source = source or metadata.get("config_path") or "unknown checkpoint"
+    detail = "missing" if frame is None else repr(frame)
+    raise ValueError(
+        f"{skill_name} policy from {source} has Cfg.commands.ball_xy_frame={detail}; "
+        "the current low-level execution contract requires 'body'. Legacy "
+        "world-frame or unlabelled checkpoints are not safely compatible. "
+        f"Retrain/export the {skill_name} skill with the updated training script."
+    )
+
+
 def build_policy_metadata(
     body_path,
     adaptation_module_path,
@@ -283,6 +324,17 @@ def build_policy_metadata(
     if not math.isfinite(resolved_clip) or resolved_clip <= 0.0:
         raise ValueError(f"Policy action clip must be finite and positive, got {resolved_clip!r}")
 
+    ball_xy_frame = None
+    ball_xy_frame_source = "config unavailable"
+    if config_path is not None:
+        try:
+            ball_xy_frame = policy_ball_xy_frame_from_config(config_path)
+            ball_xy_frame_source = f"config:{config_path}"
+        except KeyError:
+            # Absence is intentionally retained as metadata. Ball-skill loaders
+            # reject it with retraining guidance instead of assuming a frame.
+            ball_xy_frame_source = f"missing in config:{config_path}"
+
     def artifact(path):
         if path is None:
             return None
@@ -298,6 +350,8 @@ def build_policy_metadata(
         "config_path": str(config_path) if config_path is not None else None,
         "action_clip": resolved_clip,
         "action_clip_source": clip_source,
+        "ball_xy_frame": ball_xy_frame,
+        "ball_xy_frame_source": ball_xy_frame_source,
         "artifacts": {
             "body": artifact(body_path),
             "adaptation_module": artifact(adaptation_module_path),

@@ -21,6 +21,7 @@ from dribblebot.envs.base.legged_robot_config import Cfg
 from dribblebot.envs.as2.as2_config import config_as2
 from dribblebot.envs.as2.velocity_tracking import VelocityTrackingEasyEnv
 from dribblebot.envs.wrappers.history_wrapper import HistoryWrapper
+from dribblebot.command_frames import body_xy_to_world_xy, world_xy_to_body_xy
 from scripts.playback_utils import (
     GAITS,
     build_policy_metadata,
@@ -35,6 +36,7 @@ from scripts.playback_utils import (
     resolve_policy_files,
     restore_wandb_file,
     set_walking_command,
+    validate_ball_skill_command_frame,
 )
 
 
@@ -482,10 +484,24 @@ def load_phase_policies(args):
     return policies
 
 
+def validate_phase_policy_command_frames(policies):
+    for phase in ("dribble", "shoot"):
+        record = policies[phase]
+        validate_ball_skill_command_frame(
+            phase,
+            record.get("policy_metadata"),
+            source=record.get("source"),
+        )
+
+
 def configure_rollout_cfg(args, config_path=None):
     config_as2(Cfg)
     if config_path is not None:
         load_cfg_yaml(config_path)
+    # Ball-policy checkpoints are validated before simulator creation. Keep the
+    # runtime observation/reward contract explicit even if a run config came
+    # from an older default class.
+    Cfg.commands.ball_xy_frame = "body"
 
     Cfg.env.num_envs = 1
     Cfg.env.num_recording_envs = 1
@@ -936,6 +952,7 @@ def validate_command_args(args, parser):
 
 def run(args):
     phase_policies = load_phase_policies(args)
+    validate_phase_policy_command_frames(phase_policies)
     dribble_record = phase_policies["dribble"]
     metadata_config = dribble_record.get("policy_metadata", {}).get("config_path")
     if args.config:
@@ -983,7 +1000,16 @@ def run(args):
 
             robot_xy = raw_env.base_pos[0, :2].detach().cpu().numpy()
             ball_xy = raw_env.object_pos_world_frame[0, :2].detach().cpu().numpy()
-            ball_vel = raw_env.object_lin_vel[0, :2].detach().cpu().numpy()
+            ball_vel_world_tensor = raw_env.object_lin_vel[0:1, :2]
+            ball_vel_body_tensor = world_xy_to_body_xy(
+                ball_vel_world_tensor, raw_env.base_quat[0:1]
+            )
+            ball_vel = ball_vel_body_tensor[0].detach().cpu().numpy()
+            ball_vel_world = ball_vel_world_tensor[0].detach().cpu().numpy()
+            command_world = body_xy_to_world_xy(
+                torch.as_tensor(cmd[:2], dtype=raw_env.base_quat.dtype, device=raw_env.device).view(1, 2),
+                raw_env.base_quat[0:1],
+            )[0].detach().cpu().numpy()
             cmd_xy = cmd[:2]
             cmd_speed = float(np.linalg.norm(cmd_xy))
             ball_speed = float(np.linalg.norm(ball_vel))
@@ -1004,6 +1030,10 @@ def run(args):
                 "ball_y": float(ball_xy[1]),
                 "ball_vx": float(ball_vel[0]),
                 "ball_vy": float(ball_vel[1]),
+                "ball_vx_world": float(ball_vel_world[0]),
+                "ball_vy_world": float(ball_vel_world[1]),
+                "cmd_x_world": float(command_world[0]),
+                "cmd_y_world": float(command_world[1]),
                 "ball_speed": ball_speed,
                 "ball_angle_deg": ball_angle,
                 "ball_cmd_angle_error_deg": wrap_angle_deg(ball_angle - cmd_angle),
@@ -1122,15 +1152,15 @@ def parse_args():
     parser.add_argument("--approach-max-y-vel", type=float, default=0.0, help="Max lateral velocity during walking approach.")
     parser.add_argument("--approach-lateral-gain", type=float, default=0.0, help="Small optional lateral gain during walking approach.")
     parser.add_argument("--approach-min-forward-scale", type=float, default=0.25, help="Forward speed scale while turning toward the ball.")
-    parser.add_argument("--dribble-speed", type=float, default=0.9, help="World-frame dribbled-ball speed command.")
-    parser.add_argument("--dribble-angle-deg", type=float, default=None, help="World-frame dribble command angle in degrees.")
-    parser.add_argument("--dribble-x", type=float, default=None, help="Direct world-frame dribble x velocity. Overrides speed/angle.")
-    parser.add_argument("--dribble-y", type=float, default=None, help="Direct world-frame dribble y velocity. Overrides speed/angle.")
+    parser.add_argument("--dribble-speed", type=float, default=0.9, help="Body-frame dribbled-ball speed command.")
+    parser.add_argument("--dribble-angle-deg", type=float, default=None, help="Body-frame dribble command angle in degrees.")
+    parser.add_argument("--dribble-x", type=float, default=None, help="Direct body-frame dribble x velocity. Overrides speed/angle.")
+    parser.add_argument("--dribble-y", type=float, default=None, help="Direct body-frame dribble y velocity. Overrides speed/angle.")
     parser.add_argument("--dribble-yaw", type=float, default=0.5, help="Robot body-frame yaw-rate command during dribbling.")
-    parser.add_argument("--shoot-speed", type=float, default=3.0, help="World-frame post-shot ball speed command.")
-    parser.add_argument("--shoot-angle-deg", type=float, default=None, help="World-frame shooting command angle in degrees.")
-    parser.add_argument("--shoot-x", type=float, default=None, help="Direct world-frame shoot x velocity. Overrides speed/angle.")
-    parser.add_argument("--shoot-y", type=float, default=None, help="Direct world-frame shoot y velocity. Overrides speed/angle.")
+    parser.add_argument("--shoot-speed", type=float, default=3.0, help="Body-frame post-shot ball speed command.")
+    parser.add_argument("--shoot-angle-deg", type=float, default=None, help="Body-frame shooting command angle in degrees.")
+    parser.add_argument("--shoot-x", type=float, default=None, help="Direct body-frame shoot x velocity. Overrides speed/angle.")
+    parser.add_argument("--shoot-y", type=float, default=None, help="Direct body-frame shoot y velocity. Overrides speed/angle.")
     parser.add_argument("--approach-steps", type=int, default=0, help="Optional max approach steps before dribbling. Set 0 to disable.")
     parser.add_argument("--dribble-steps", type=int, default=0, help="Optional max dribble steps before shooting. Set 0 to disable.")
     parser.add_argument("--shoot-min-steps", type=int, default=25, help="Minimum shoot steps before returning to approach.")

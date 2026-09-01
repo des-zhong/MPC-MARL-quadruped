@@ -30,6 +30,7 @@ class Cfg(PrefixProto, cli=False):
         shooting_reset_longitudinal_range = [0.30, 0.90]
         shooting_reset_lateral_range = [-0.45, 0.45]
         shooting_reset_yaw_error_range = [-0.60, 0.60]
+        shooting_reset_world_yaw_range = [-3.14159265, 3.14159265]
         shooting_reset_zero_velocities = True
         control_all_robots = False
         high_level_control = False
@@ -41,6 +42,7 @@ class Cfg(PrefixProto, cli=False):
         high_level_dribble_command_scale = [1.5, 1.5, 1.0]
         high_level_shoot_command_scale = [1.5, 1.5, 0.0]
         high_level_command_obs_scale = [1.5, 1.5, 1.0]
+        high_level_ball_xy_frame = "team_canonical_field"
         # Optional geometric fallback for experiments that explicitly want
         # invalid dribble/shoot requests replaced by another skill.  The
         # coordinator executes its requested skill directly by default.
@@ -198,6 +200,9 @@ class Cfg(PrefixProto, cli=False):
         max_yaw_curriculum = 1.
         exclusive_command_sampling = False
         num_commands = 3
+        # Explicit low-level soccer command contract. Legacy skill configs
+        # omitted this field and used world-frame dribble/shoot xy commands.
+        ball_xy_frame = "body"
         resampling_time = 10.  # time before command are changed[s]
         subsample_gait = False
         gait_interval_s = 10.  # time between resampling gait params

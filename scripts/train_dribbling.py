@@ -35,7 +35,11 @@ def build_arg_parser():
         default="tmp/legged_data/dribble",
         help="Run-local checkpoint output directory.",
     )
-    parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume only a checkpoint already trained with ball_xy_frame=body.",
+    )
     parser.add_argument(
         "--resume-run",
         default=None,
@@ -46,7 +50,7 @@ def build_arg_parser():
     )
     parser.add_argument(
         "--resume-checkpoint",
-        default="wandb/as2_dribble-ihrruh16/files/tmp/legged_data/dribble/ac_weights_latest.pt",
+        default="tmp/legged_data/dribble/ac_weights_latest.pt",
         help=(
             "Local checkpoint path when --resume-run is omitted, or the "
             "artifact-relative filename to restore from the W&B source run."
@@ -250,8 +254,9 @@ def train_robot(args=None, headless=True):
     Cfg.rewards.terminal_body_ori = 0.5
 
     # command sampling
-    # commands[:, :2] = desired dribbled-ball xy velocity.
+    # commands[:, :2] = desired dribbled-ball velocity in the robot body frame.
     # commands[:, 2] = desired robot yaw velocity.
+    Cfg.commands.ball_xy_frame = "body"
     Cfg.commands.resampling_time = 7
     Cfg.commands.heading_command = False
 

@@ -44,7 +44,11 @@ def build_arg_parser():
         default="tmp/legged_data/shoot",
         help="Run-local checkpoint output directory.",
     )
-    parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume only a checkpoint already trained with ball_xy_frame=body.",
+    )
     parser.add_argument("--resume-run", default=None)
     parser.add_argument(
         "--resume-checkpoint",
@@ -205,7 +209,9 @@ def train_robot(args=None, headless=True):
     ###############################
 
     Cfg.env.add_balls = True
-    # Sample attainable shooting setups in the desired kick frame. This
+    Cfg.commands.ball_xy_frame = "body"
+    # Sample attainable shooting setups in the desired body-relative kick
+    # frame at arbitrary world headings. This
     # requires the robot to translate around the ball instead of solving a
     # fully random pose, moving-ball, and kick-direction problem at once.
     Cfg.env.shooting_reset_relative_to_command = True
@@ -221,6 +227,7 @@ def train_robot(args=None, headless=True):
         -args.reset_yaw_error_range,
         args.reset_yaw_error_range,
     ]
+    Cfg.env.shooting_reset_world_yaw_range = [-3.14159265, 3.14159265]
     Cfg.env.shooting_reset_zero_velocities = True
     Cfg.ball.init_pos_range = [0.0, 0.0, 0.0]
     Cfg.ball.init_vel_range = [0.0, 0.0, 0.0]
@@ -279,7 +286,7 @@ def train_robot(args=None, headless=True):
     Cfg.rewards.terminal_body_ori = 0.5
 
     # command sampling
-    # commands[:, :2] = desired post-kick ball xy velocity.
+    # commands[:, :2] = desired post-kick ball xy velocity in the robot body frame.
     # commands[:, 2] is unused for shooting and is kept fixed.
     Cfg.commands.resampling_time = 10
     Cfg.commands.heading_command = False
@@ -374,8 +381,11 @@ def train_robot(args=None, headless=True):
     # setup-pose and signed-progress terms replace it.
     Cfg.reward_scales.shooting_robot_ball_pos = 0.0
     Cfg.reward_scales.shooting_robot_ball_behind = 0.5
-    Cfg.reward_scales.shooting_robot_forward_cmd = 0.5
-    Cfg.reward_scales.shooting_ball_in_front = 0.25
+    # With a body-frame command these orientations are fixed relative to the
+    # robot and cannot be improved by yawing. The setup-pose rewards below are
+    # command-aware and provide the controllable geometry signal instead.
+    Cfg.reward_scales.shooting_robot_forward_cmd = 0.0
+    Cfg.reward_scales.shooting_ball_in_front = 0.0
     Cfg.reward_scales.shooting_robot_approach_ball = 1.5
     Cfg.reward_scales.shooting_excess_yaw = -0.1
     Cfg.reward_scales.shooting_launch = 50.0
