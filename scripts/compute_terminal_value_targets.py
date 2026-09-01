@@ -11,8 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from dribblebot.mpc.terminal_value import ValueModelConfig, build_value_dataset
-from dribblebot.world_model.config import load_config
+from quadruped.mpc.terminal_value import ValueModelConfig, build_value_dataset
+from quadruped.world_model.config import load_config
 
 
 def main(args):

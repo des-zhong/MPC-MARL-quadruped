@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from dribblebot.mpc.iterative import run_iterative_pipeline
+from quadruped.mpc.iterative import run_iterative_pipeline
 
 
 def main(args):

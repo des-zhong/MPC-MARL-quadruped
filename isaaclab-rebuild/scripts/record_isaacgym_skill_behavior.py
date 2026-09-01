@@ -133,8 +133,8 @@ def main() -> None:
     import isaacgym
     import torch
 
-    from dribblebot.envs.as2.two_robot_velocity_tracking import TwoRobotVelocityTrackingEasyEnv
-    from dribblebot.envs.wrappers.high_level_skill_wrapper import HighLevelSkillWrapper
+    from quadruped.envs.as2.two_robot_velocity_tracking import TwoRobotVelocityTrackingEasyEnv
+    from quadruped.envs.wrappers.high_level_skill_wrapper import HighLevelSkillWrapper
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)

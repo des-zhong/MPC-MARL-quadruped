@@ -469,7 +469,7 @@ def load_ac_weights(ac_weights_path, map_location):
 def get_raw_env(env):
     # Keep Isaac Gym imports out of this robot-neutral helper's module import;
     # playback entry points load Isaac Gym before torch as required.
-    from dribblebot.envs.wrappers.history_wrapper import HistoryWrapper
+    from quadruped.envs.wrappers.history_wrapper import HistoryWrapper
 
     if isinstance(env, HistoryWrapper):
         return env.env

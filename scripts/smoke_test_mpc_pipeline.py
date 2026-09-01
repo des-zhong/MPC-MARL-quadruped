@@ -16,19 +16,19 @@ import isaacgym
 assert isaacgym
 from matplotlib import pyplot as plt
 
-from dribblebot.mpc.collection import (
+from quadruped.mpc.collection import (
     TeacherRolloutCollector,
     build_collection_metadata,
     finalize_expansion_dataset,
 )
-from dribblebot.mpc.runtime import add_simulator_arguments, build_runtime
-from dribblebot.mpc.teacher_dataset import (
+from quadruped.mpc.runtime import add_simulator_arguments, build_runtime
+from quadruped.mpc.teacher_dataset import (
     TEACHER_REQUIRED_KEYS,
     TeacherDataset,
     TeacherEpisodeWriter,
 )
-from dribblebot.mpc.visualization import plot_top_down
-from dribblebot.world_model.dataset import EpisodeShardWriter, WorldModelDataset
+from quadruped.mpc.visualization import plot_top_down
+from quadruped.world_model.dataset import EpisodeShardWriter, WorldModelDataset
 
 
 def main(args):

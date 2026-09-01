@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from tqdm import trange
 
-from dribblebot.envs.base.legged_robot_config import Cfg
+from quadruped.envs.base.legged_robot_config import Cfg
 try:
     from scripts.play_walk_dribble_shoot import (
         load_policy_record,
@@ -315,9 +315,9 @@ def load_opponent_high_level_policy(args, high_level_policy):
 
 
 def make_env(args, skill_policies):
-    from dribblebot.envs.as2.two_robot_velocity_tracking import TwoRobotVelocityTrackingEasyEnv
-    from dribblebot.envs.wrappers.high_level_skill_wrapper import HighLevelSkillWrapper
-    from dribblebot.envs.wrappers.shared_self_play_wrapper import SharedPolicySelfPlayWrapper
+    from quadruped.envs.as2.two_robot_velocity_tracking import TwoRobotVelocityTrackingEasyEnv
+    from quadruped.envs.wrappers.high_level_skill_wrapper import HighLevelSkillWrapper
+    from quadruped.envs.wrappers.shared_self_play_wrapper import SharedPolicySelfPlayWrapper
 
     configure_eval_cfg(args)
     raw_env = TwoRobotVelocityTrackingEasyEnv(sim_device=args.device, headless=args.headless, cfg=Cfg)
@@ -768,7 +768,7 @@ def run(args):
     skill_policies = load_skill_policies(args)
     env, raw_env = make_env(args, skill_policies)
     if getattr(args, "opponent_rule_based", False):
-        from dribblebot.envs.wrappers.rule_based_opponent import RuleBasedOpponent
+        from quadruped.envs.wrappers.rule_based_opponent import RuleBasedOpponent
 
         rule_opponent = RuleBasedOpponent(
             env,

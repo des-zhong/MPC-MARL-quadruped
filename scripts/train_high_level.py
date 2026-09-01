@@ -105,7 +105,7 @@ def high_level_checkpoint_contract(policy_record):
     config_path = metadata.get("config_path")
     if not config_path:
         return None
-    from dribblebot.world_model.config import load_config
+    from quadruped.world_model.config import load_config
 
     payload = load_config(config_path)
     cfg = _wandb_config_value(payload.get("Cfg", {}))
@@ -352,7 +352,7 @@ def add_skill_policy_source_args(parser):
 
 
 def configure_high_level_cfg(Cfg, args):
-    from dribblebot.envs.as2.as2_config import config_as2
+    from quadruped.envs.as2.as2_config import config_as2
 
     config_as2(Cfg)
     walk_x_scale = abs(float(args.walk_x_speed_scale))
@@ -740,7 +740,7 @@ def load_skill_policies(args):
         "dribble": "ball",
         "shoot": "ball",
     }
-    from dribblebot.envs.base.legged_robot_config import Cfg
+    from quadruped.envs.base.legged_robot_config import Cfg
 
     history_length = int(Cfg.env.num_observation_history)
     expected_history_dims = {
@@ -757,7 +757,7 @@ def load_skill_policies(args):
             # but deliberately does not consult or populate the repository's
             # persistent tmp/wandb_restore_cache directory.
             temporary_download = tempfile.TemporaryDirectory(
-                prefix=f"dribblebot-{skill}-wandb-"
+                prefix=f"quadruped-{skill}-wandb-"
             )
             try:
                 (
@@ -911,7 +911,7 @@ def train_robot(args):
 
     set_training_seed(args.seed)
 
-    from dribblebot.envs.base.legged_robot_config import Cfg
+    from quadruped.envs.base.legged_robot_config import Cfg
 
     configure_high_level_cfg(Cfg, args)
     skill_policies = load_skill_policies(args)
@@ -921,12 +921,12 @@ def train_robot(args):
 
     import wandb
 
-    from dribblebot.envs.as2.two_robot_velocity_tracking import TwoRobotVelocityTrackingEasyEnv
-    from dribblebot.envs.wrappers.high_level_skill_wrapper import HighLevelSkillWrapper
-    from dribblebot.envs.wrappers.shared_self_play_wrapper import SharedPolicySelfPlayWrapper
-    from dribblebot_learn.ppo_cse import Runner, RunnerArgs
-    from dribblebot_learn.ppo_cse.actor_critic import AC_Args
-    from dribblebot_learn.ppo_cse.ppo import PPO_Args
+    from quadruped.envs.as2.two_robot_velocity_tracking import TwoRobotVelocityTrackingEasyEnv
+    from quadruped.envs.wrappers.high_level_skill_wrapper import HighLevelSkillWrapper
+    from quadruped.envs.wrappers.shared_self_play_wrapper import SharedPolicySelfPlayWrapper
+    from quadruped_learn.ppo_cse import Runner, RunnerArgs
+    from quadruped_learn.ppo_cse.actor_critic import AC_Args
+    from quadruped_learn.ppo_cse.ppo import PPO_Args
 
     RunnerArgs.resume = bool(args.resume)
     RunnerArgs.resume_policy_only = args.resume_mode == "policy-only"
@@ -1030,13 +1030,13 @@ def train_robot(args):
         opponent_latest_probability=args.opponent_latest_probability,
     )
     if getattr(args, "world_model_checkpoint", None):
-        from dribblebot.envs.wrappers.mpc_teacher_guidance_wrapper import (
+        from quadruped.envs.wrappers.mpc_teacher_guidance_wrapper import (
             MPCTeacherGuidanceWrapper,
         )
-        from dribblebot.mpc import HybridCEMMPC, MPCObjective
-        from dribblebot.mpc.config import load_mpc_config
-        from dribblebot.world_model.state_adapter import FootballWorldModelStateAdapter
-        from dribblebot.world_model.trainer import load_checkpoint
+        from quadruped.mpc import HybridCEMMPC, MPCObjective
+        from quadruped.mpc.config import load_mpc_config
+        from quadruped.world_model.state_adapter import FootballWorldModelStateAdapter
+        from quadruped.world_model.trainer import load_checkpoint
 
         world_model, checkpoint = load_checkpoint(
             args.world_model_checkpoint, args.device

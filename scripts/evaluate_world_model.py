@@ -10,10 +10,10 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from dribblebot.world_model.dataset import WorldModelDataset
-from dribblebot.world_model.metrics import binary_metrics, regression_metrics, uncertainty_error_correlation
-from dribblebot.world_model.schema import event_names_from_metadata, validate_event_names
-from dribblebot.world_model.trainer import load_checkpoint
+from quadruped.world_model.dataset import WorldModelDataset
+from quadruped.world_model.metrics import binary_metrics, regression_metrics, uncertainty_error_correlation
+from quadruped.world_model.schema import event_names_from_metadata, validate_event_names
+from quadruped.world_model.trainer import load_checkpoint
 
 
 def _group_metrics(model, prediction, target):

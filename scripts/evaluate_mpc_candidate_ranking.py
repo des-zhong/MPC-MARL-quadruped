@@ -18,8 +18,8 @@ from isaacgym import gymtorch
 import numpy as np
 import torch
 
-from dribblebot.mpc.runtime import add_simulator_arguments, build_runtime
-from dribblebot.world_model.metrics import reward_ranking_metrics
+from quadruped.mpc.runtime import add_simulator_arguments, build_runtime
+from quadruped.world_model.metrics import reward_ranking_metrics
 
 
 def _clone_environment_zero(runtime):

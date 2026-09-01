@@ -35,14 +35,14 @@
 
 主要模块：
 
-- `dribblebot/envs/base/base_task.py`
-- `dribblebot/envs/base/legged_robot.py`
-- `dribblebot/envs/base/legged_robot_walk.py`
-- `dribblebot/envs/base/legged_robot_two.py`
-- `dribblebot/sensors/`
-- `dribblebot/rewards/`
-- `dribblebot/terrains/`
-- `dribblebot/envs/wrappers/`
+- `quadruped/envs/base/base_task.py`
+- `quadruped/envs/base/legged_robot.py`
+- `quadruped/envs/base/legged_robot_walk.py`
+- `quadruped/envs/base/legged_robot_two.py`
+- `quadruped/sensors/`
+- `quadruped/rewards/`
+- `quadruped/terrains/`
+- `quadruped/envs/wrappers/`
 
 这些模块把 simulator lifecycle、Gym tensor layout、actor indices、reset、reward、observation 和 wrapper 逻辑集中在几个很大的、较 shallow 的 module 中。训练脚本仍直接创建 Isaac Gym 环境。
 

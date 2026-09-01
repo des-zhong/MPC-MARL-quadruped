@@ -19,12 +19,12 @@ assert isaacgym
 import numpy as np
 import torch
 
-from dribblebot.mpc.evaluation import (
+from quadruped.mpc.evaluation import (
     evaluate_method,
     method_overrides,
 )
-from dribblebot.mpc.runtime import add_simulator_arguments, build_runtime
-from dribblebot.world_model.config import load_config
+from quadruped.mpc.runtime import add_simulator_arguments, build_runtime
+from quadruped.world_model.config import load_config
 
 
 def _set_seed(seed):

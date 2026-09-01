@@ -18,14 +18,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from dribblebot.mpc.terminal_value import (
+from quadruped.mpc.terminal_value import (
     CombinedValueDataset, ReturnNormalizer, TerminalValueModel, TerminalValueTrainer, ValueDataset,
     ValueModelConfig, build_value_dataset,
 )
-from dribblebot.world_model.dataset import WorldModelDataset
-from dribblebot.world_model.config import load_config
-from dribblebot.world_model.schema import StateSchema
-from dribblebot.world_model.trainer import fit_normalizer, load_checkpoint, seed_everything
+from quadruped.world_model.dataset import WorldModelDataset
+from quadruped.world_model.config import load_config
+from quadruped.world_model.schema import StateSchema
+from quadruped.world_model.trainer import fit_normalizer, load_checkpoint, seed_everything
 
 
 def _wandb_config(args, config, processed_roots, train, validation, model, trainer):

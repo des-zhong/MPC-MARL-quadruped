@@ -16,8 +16,8 @@ assert isaacgym
 import torch
 from matplotlib import pyplot as plt
 
-from dribblebot.mpc.runtime import add_simulator_arguments, build_runtime
-from dribblebot.mpc.visualization import plot_top_down
+from quadruped.mpc.runtime import add_simulator_arguments, build_runtime
+from quadruped.mpc.visualization import plot_top_down
 
 
 def _print_plan(runtime, transition):

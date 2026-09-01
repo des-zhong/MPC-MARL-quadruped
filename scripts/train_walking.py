@@ -40,15 +40,15 @@ def train_robot(args=None, headless=True):
     assert isaacgym
     import torch
 
-    from dribblebot.envs.base.legged_robot_config import Cfg
-    from dribblebot.envs.as2.as2_config import config_as2
-    from dribblebot.envs.as2.walk_tracking import VelocityTrackingEasyEnv
+    from quadruped.envs.base.legged_robot_config import Cfg
+    from quadruped.envs.as2.as2_config import config_as2
+    from quadruped.envs.as2.walk_tracking import VelocityTrackingEasyEnv
 
-    from dribblebot_learn.ppo_cse import Runner
-    from dribblebot.envs.wrappers.history_wrapper import HistoryWrapper
-    from dribblebot_learn.ppo_cse.actor_critic import AC_Args
-    from dribblebot_learn.ppo_cse.ppo import PPO_Args
-    from dribblebot_learn.ppo_cse import RunnerArgs
+    from quadruped_learn.ppo_cse import Runner
+    from quadruped.envs.wrappers.history_wrapper import HistoryWrapper
+    from quadruped_learn.ppo_cse.actor_critic import AC_Args
+    from quadruped_learn.ppo_cse.ppo import PPO_Args
+    from quadruped_learn.ppo_cse import RunnerArgs
 
     config_as2(Cfg)
     Cfg.env.num_envs = args.num_envs

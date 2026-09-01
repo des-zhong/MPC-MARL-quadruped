@@ -72,8 +72,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def _configure_legacy_env(args: argparse.Namespace) -> object:
-    from dribblebot.envs.as2.as2_config import config_as2
-    from dribblebot.envs.base.legged_robot_config import Cfg
+    from quadruped.envs.as2.as2_config import config_as2
+    from quadruped.envs.base.legged_robot_config import Cfg
 
     config_as2(Cfg)
     # ``config_as2`` configures the asset path, gains, and initial state but
@@ -201,7 +201,7 @@ def _install_deterministic_ball_asset_profile() -> None:
 
     from isaacgym import gymapi
 
-    from dribblebot.assets.ball import Ball
+    from quadruped.assets.ball import Ball
 
     ball_profile = make_physics_profile(include_ball=True)["ball"]
 
@@ -425,7 +425,7 @@ def main() -> None:
     import isaacgym
     import torch
 
-    from dribblebot.envs.as2.velocity_tracking import VelocityTrackingEasyEnv
+    from quadruped.envs.as2.velocity_tracking import VelocityTrackingEasyEnv
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
