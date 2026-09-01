@@ -10,6 +10,9 @@ PYTHON_BIN="${DRIBBLEBOT_PYTHON:-/home/zhz/anaconda3/envs/legged_env/bin/python}
 HIGH_LEVEL_POLICY_DIR="wandb/run-20260830_153204-xjhoe0b9/files/tmp/legged_data/high_level"
 OPPONENT_HIGH_LEVEL_POLICY_DIR="${HIGH_LEVEL_POLICY_DIR}"
 WALK_POLICY_DIR="checkpoints/reproduction/walk"
+# Dribble/shoot must be replaced with newly retrained checkpoints whose
+# config.yaml contains Cfg.commands.ball_xy_frame: body. The bundled
+# reproduction checkpoints are legacy world-frame policies and are rejected.
 DRIBBLE_POLICY_DIR="checkpoints/reproduction/dribble"
 SHOOT_POLICY_DIR="checkpoints/reproduction/shoot"
 VIDEO_PATH="outputs/high_level_eval.mp4"

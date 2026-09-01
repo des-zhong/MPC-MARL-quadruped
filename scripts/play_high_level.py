@@ -344,6 +344,8 @@ def validate_high_level_obs_shape(policy_record, env):
     )
 
 def validate_low_level_skill_shapes(skill_policies, env):
+    from scripts.playback_utils import validate_ball_skill_command_frame
+
     full_history_dim = env.low_level_obs_dim_full * env.low_level_history_length
     no_object_history_dim = (env.low_level_obs_dim_full - 3) * env.low_level_history_length
 
@@ -357,6 +359,11 @@ def validate_low_level_skill_shapes(skill_policies, env):
 
     errors = []
     for skill_name, policy_record in skill_policies.items():
+        validate_ball_skill_command_frame(
+            skill_name,
+            policy_record.get("policy_metadata"),
+            source=policy_record.get("source"),
+        )
         expected_dim = policy_record.get("expected_history_dim")
         if expected_dim is None:
             continue
@@ -574,7 +581,9 @@ def row_from_step(
         row[f"robot{robot_idx}_cmd_y"] = float(commands[0, robot_idx, 1])
         row[f"robot{robot_idx}_cmd_yaw"] = float(commands[0, robot_idx, 2])
         row[f"robot{robot_idx}_cmd_xy_frame"] = (
-            "body" if executed[0, robot_idx] == 0 else "field"
+            "body"
+            if executed[0, robot_idx] == 0
+            else "team_canonical_field"
         )
 
         obstacle = (

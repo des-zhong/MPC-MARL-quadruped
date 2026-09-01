@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 from dribblebot.utils.math_utils import quat_apply_yaw, wrap_to_pi, get_scale_shift
+from dribblebot.command_frames import body_xy_to_world_xy, world_xy_to_body_xy
 from isaacgym.torch_utils import *
 from .rewards import Rewards
 from .shooting_geometry import (
@@ -110,6 +111,32 @@ class SoccerRewards(Rewards):
     def _shooting_command_scale(self):
         return self._command_scale("shooting_command_scale", [1.5, 1.5])
 
+    def _ball_xy_command_frame(self):
+        frame = str(getattr(self.env.cfg.commands, "ball_xy_frame", "body")).lower()
+        if frame not in ("body", "world"):
+            raise ValueError(
+                "cfg.commands.ball_xy_frame must be 'body' or 'world', "
+                f"got {frame!r}"
+            )
+        return frame
+
+    def _ball_command_xy_body(self):
+        command = self.env.commands[:, :2]
+        if self._ball_xy_command_frame() == "body":
+            return command
+        return world_xy_to_body_xy(command, self.env.base_quat)
+
+    def _ball_command_xy_world(self):
+        command = self.env.commands[:, :2]
+        if self._ball_xy_command_frame() == "world":
+            return command
+        return body_xy_to_world_xy(command, self.env.base_quat)
+
+    def _ball_velocity_xy_body(self):
+        return world_xy_to_body_xy(
+            self.env.object_lin_vel[:, :2], self.env.base_quat
+        )
+
     # encourage robot velocity align vector from robot body to ball
     # r_cv
     def _reward_dribbling_robot_ball_vel(self):
@@ -141,40 +168,51 @@ class SoccerRewards(Rewards):
         )
 
     def _reward_dribbling_backward_motion(self):
-        """Penalize base motion opposite the direction the body faces."""
+        """Penalize base motion opposite the requested body-frame direction."""
 
-        _, _, yaw = get_euler_xyz(self.env.base_quat)
-        body_forward = torch.stack((torch.cos(yaw), torch.sin(yaw)), dim=-1)
+        command_xy = self._ball_command_xy_body()
+        default_forward = torch.zeros_like(command_xy)
+        default_forward[:, 0] = 1.0
+        command_norm = torch.norm(command_xy, dim=-1, keepdim=True)
+        requested_direction = torch.where(
+            command_norm > 1e-6,
+            command_xy / command_norm.clamp_min(1e-6),
+            default_forward,
+        )
         return dribbling_backward_motion_penalty(
             self.env.base_lin_vel[:, :2],
-            body_forward,
+            requested_direction,
             getattr(self.env.cfg.rewards, "dribbling_forward_speed_scale", 1.0),
         )
 
     # encourage ball vel align with unit vector between ball target and ball current position
     # r^bv
     def _reward_dribbling_ball_vel(self):
-        # target velocity is command input
+        # Ball commands and tracking velocities share the robot body frame.
         command_scale = self._dribbling_command_scale()[:2]
-        lin_vel_error = torch.sum(torch.square((self.env.commands[:, :2] - self.env.object_lin_vel[:, :2]) / command_scale), dim=1)
+        lin_vel_error = torch.sum(
+            torch.square(
+                (self._ball_command_xy_body() - self._ball_velocity_xy_body())
+                / command_scale
+            ),
+            dim=1,
+        )
         # rew_dribbling_ball_vel = torch.exp(-lin_vel_error / (self.env.cfg.rewards.tracking_sigma*2))
         return torch.exp(-lin_vel_error / (self.env.cfg.rewards.tracking_sigma*2))
         
     def _reward_dribbling_robot_ball_yaw(self):
         robot_ball_vec = self.env.object_pos_world_frame[:,0:2] - self.env.base_pos[:,0:2]
+        robot_ball_vec = world_xy_to_body_xy(robot_ball_vec, self.env.base_quat)
         d_robot_ball=robot_ball_vec / torch.norm(robot_ball_vec, dim=-1).clamp_min(1e-6).unsqueeze(dim=-1)
 
-        unit_command_vel = self.env.commands[:,:2] / torch.norm(self.env.commands[:,:2], dim=-1).clamp_min(1e-6).unsqueeze(dim=-1)
-        robot_ball_cmd_yaw_error = torch.norm(unit_command_vel, dim=-1) - torch.sum(d_robot_ball * unit_command_vel, dim=-1)
-
-        # robot ball vector align with body yaw angle
-        roll, pitch, yaw = get_euler_xyz(self.env.base_quat)
-        body_yaw_vec = torch.zeros(self.env.num_envs, 2, device=self.env.device)
-        body_yaw_vec[:,0] = torch.cos(yaw)
-        body_yaw_vec[:,1] = torch.sin(yaw)
+        # Keep the ball controllably in front. Unlike a world-frame command, a
+        # body-frame lateral command cannot be made forward by turning, so it
+        # must not also be used as a desired robot-to-ball bearing.
+        body_yaw_vec = torch.zeros_like(d_robot_ball)
+        body_yaw_vec[:, 0] = 1.0
         robot_ball_body_yaw_error = torch.norm(body_yaw_vec, dim=-1) - torch.sum(d_robot_ball * body_yaw_vec, dim=-1)
-        delta_dribbling_robot_ball_cmd_yaw = 2.0
-        rew_dribbling_robot_ball_yaw = torch.exp(-delta_dribbling_robot_ball_cmd_yaw * (robot_ball_cmd_yaw_error+robot_ball_body_yaw_error))
+        delta_dribbling_robot_ball_yaw = 2.0
+        rew_dribbling_robot_ball_yaw = torch.exp(-delta_dribbling_robot_ball_yaw * robot_ball_body_yaw_error)
         return rew_dribbling_robot_ball_yaw
     
     def _reward_dribbling_ball_vel_norm(self):
@@ -196,7 +234,9 @@ class SoccerRewards(Rewards):
     #     return rew_vel_angle_tracking
 
     def _reward_dribbling_ball_vel_angle(self):
-        angle_diff = torch.atan2(self.env.commands[:,1], self.env.commands[:,0]) - torch.atan2(self.env.object_lin_vel[:,1], self.env.object_lin_vel[:,0])
+        command_xy = self._ball_command_xy_body()
+        ball_velocity_xy = self._ball_velocity_xy_body()
+        angle_diff = torch.atan2(command_xy[:,1], command_xy[:,0]) - torch.atan2(ball_velocity_xy[:,1], ball_velocity_xy[:,0])
         angle_diff_in_pi = torch.pow(wrap_to_pi(angle_diff), 2)
         rew_vel_angle_tracking = 1.0 - angle_diff_in_pi/(torch.pi**2)
         return rew_vel_angle_tracking
@@ -222,13 +262,13 @@ class SoccerRewards(Rewards):
         return lin_weight * lin_reward + (1.0 - lin_weight) * yaw_reward
 
     def _command_xy(self):
-        cmd = self.env.commands[:, :2]
+        cmd = self._ball_command_xy_body()
         cmd_norm = torch.norm(cmd, dim=-1).clamp(min=1e-6)
         cmd_dir = cmd / cmd_norm.unsqueeze(-1)
         return cmd, cmd_norm, cmd_dir
 
     def _ball_xy_vel(self):
-        return self.env.object_lin_vel[:, :2]
+        return self._ball_velocity_xy_body()
 
     def _active_command_gate(self):
         _, target_speed, _ = self._command_xy()
@@ -269,7 +309,7 @@ class SoccerRewards(Rewards):
         return shooting_setup_geometry(
             self.env.base_pos[:, :2],
             self.env.object_pos_world_frame[:, :2],
-            self.env.commands[:, :2],
+            self._ball_command_xy_world(),
             setup_distance,
         )
 
@@ -321,12 +361,16 @@ class SoccerRewards(Rewards):
         return 0.5 * (alignment + 1.0) * moving_gate * self._post_kick_gate() * self._separation_gate()
 
     def _reward_shooting_ball_out(self):
-        _, _, cmd_dir = self._command_xy()
+        command_world = self._ball_command_xy_world()
+        command_speed = torch.norm(command_world, dim=-1).clamp(min=1e-6)
+        cmd_dir = command_world / command_speed.unsqueeze(-1)
         robot_to_ball = self.env.object_pos_world_frame[:, :2] - self.env.base_pos[:, :2]
         ball_distance = torch.norm(robot_to_ball, dim=-1).clamp(min=1e-6)
         ball_dir_from_robot = robot_to_ball / ball_distance.unsqueeze(-1)
         position_alignment = torch.sum(ball_dir_from_robot * cmd_dir, dim=-1).clamp(min=0.0, max=1.0)
-        speed_along_cmd = torch.sum(self._ball_xy_vel() * cmd_dir, dim=-1).clamp(min=0.0)
+        speed_along_cmd = torch.sum(
+            self.env.object_lin_vel[:, :2] * cmd_dir, dim=-1
+        ).clamp(min=0.0)
         speed_scale = torch.norm(self._shooting_command_scale()).clamp(min=1e-6)
         setup_distance = getattr(self.env.cfg.rewards, "shooting_setup_distance", 0.45)
         separation = (ball_distance - setup_distance).clamp(min=0.0)
@@ -345,8 +389,8 @@ class SoccerRewards(Rewards):
 
     def _reward_shooting_robot_forward_cmd(self):
         _, _, cmd_dir = self._command_xy()
-        body_forward = self._body_forward_xy()
-        heading_alignment = torch.sum(body_forward * cmd_dir, dim=-1).clamp(min=-1.0, max=1.0)
+        # The body-frame forward direction is +x.
+        heading_alignment = cmd_dir[:, 0].clamp(min=-1.0, max=1.0)
         # Gate heading by setup quality. Rotating at an arbitrary position can
         # no longer collect the full reward.
         return 0.5 * (heading_alignment + 1.0) \
@@ -367,7 +411,7 @@ class SoccerRewards(Rewards):
             self.env.prev_base_pos[:, :2],
             self.env.base_pos[:, :2],
             self.env.object_pos_world_frame[:, :2],
-            self.env.commands[:, :2],
+            self._ball_command_xy_world(),
             setup_distance,
             self.env.dt,
             speed_scale,

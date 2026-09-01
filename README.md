@@ -135,6 +135,10 @@ is missed. Results are written under `outputs/ability_validation/`. The
 [validate_skill.bash](validate_skill.bash) launcher is a local example; update
 its checkpoint paths before using it.
 
+Dribble and shoot low-level xy commands are expressed in the executing robot's
+body frame. Their run config must contain `Cfg.commands.ball_xy_frame: body`;
+legacy world-frame or unlabelled checkpoints must be retrained.
+
 ## 3. Train the high-level multi-agent policy
 
 High-level training runs two equal AS2 teams. `--num-robots` is the number of
@@ -146,7 +150,9 @@ probability across older policies, including the initialization anchor.
 The learning team attacks the `+x` goal and the red opponent team attacks the
 `-x` goal. Shared-policy observations are rotated into the same canonical
 perspective, while field-frame dribble and shooting commands are rotated back
-before opponent execution.
+before opponent execution. Immediately before low-level inference, the execution
+adapter rotates each robot's world-field ball command into that robot's current
+body frame. This conversion is recomputed every low-level step.
 
 The default collision term now begins at a 0.65 m robot-centre distance with a
 penalty magnitude of 2.0. Override these with

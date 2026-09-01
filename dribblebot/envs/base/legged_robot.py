@@ -12,6 +12,7 @@ import torch
 from dribblebot import MINI_GYM_ROOT_DIR
 from dribblebot.envs.base.base_task import BaseTask
 from dribblebot.utils.math_utils import quat_apply_yaw, wrap_to_pi, get_scale_shift
+from dribblebot.command_frames import body_xy_to_world_xy, world_xy_to_body_xy
 from dribblebot.utils.terrain import Terrain, perlin
 from .legged_robot_config import Cfg
 
@@ -209,7 +210,20 @@ class LeggedRobot(BaseTask):
         active_command = target_speed > self.cfg.rewards.shooting_min_command_speed
         cmd_dir = cmd_xy / target_speed.unsqueeze(-1)
 
-        ball_vel = self.object_lin_vel[:, :2]
+        command_frame = str(
+            getattr(self.cfg.commands, "ball_xy_frame", "body")
+        ).lower()
+        if command_frame == "body":
+            ball_vel = world_xy_to_body_xy(
+                self.object_lin_vel[:, :2], self.base_quat
+            )
+        elif command_frame == "world":
+            ball_vel = self.object_lin_vel[:, :2]
+        else:
+            raise ValueError(
+                "cfg.commands.ball_xy_frame must be 'body' or 'world', "
+                f"got {command_frame!r}"
+            )
         ball_speed = torch.norm(ball_vel, dim=-1).clamp(min=1e-6)
         speed_along_cmd = torch.sum(ball_vel * cmd_dir, dim=-1)
         velocity_alignment = (speed_along_cmd / ball_speed).clamp(min=-1.0, max=1.0)
@@ -222,6 +236,8 @@ class LeggedRobot(BaseTask):
         self.shooting_launched_buf[:] = torch.logical_or(self.shooting_launched_buf, launched_now)
 
         robot_to_ball = self.object_pos_world_frame[:, :2] - self.base_pos[:, :2]
+        if command_frame == "body":
+            robot_to_ball = world_xy_to_body_xy(robot_to_ball, self.base_quat)
         ball_forward_distance = torch.sum(robot_to_ball * cmd_dir, dim=-1)
         success_speed = self.cfg.rewards.shooting_success_speed_fraction * target_speed
         self.shooting_success_buf[:] = active_command \
@@ -970,7 +986,13 @@ class LeggedRobot(BaseTask):
             getattr(cfg.env, "shooting_reset_relative_to_command", False)
         )
         shooting_cmd_dir = None
-        if shooting_relative_reset:
+        command_frame = str(getattr(cfg.commands, "ball_xy_frame", "body")).lower()
+        if command_frame not in ("body", "world"):
+            raise ValueError(
+                "cfg.commands.ball_xy_frame must be 'body' or 'world', "
+                f"got {command_frame!r}"
+            )
+        if shooting_relative_reset and command_frame == "world":
             command_xy = self.commands[env_ids, :2]
             command_norm = torch.norm(command_xy, dim=-1, keepdim=True)
             default_direction = torch.zeros_like(command_xy)
@@ -990,10 +1012,63 @@ class LeggedRobot(BaseTask):
             ).squeeze(-1)
             random_yaw_angle = torch.zeros(len(env_ids), 3, dtype=torch.float, device=self.device)
             random_yaw_angle[:, 2] = yaw_angle
+        elif shooting_relative_reset:
+            # Body-frame commands must not determine the global spawn heading.
+            # Sample an independent world yaw, then rotate the desired relative
+            # kick direction through the resulting robot pose below.
+            world_yaw_range = getattr(
+                cfg.env,
+                "shooting_reset_world_yaw_range",
+                [-float(cfg.terrain.yaw_init_range), float(cfg.terrain.yaw_init_range)],
+            )
+            random_yaw_angle = torch.zeros(
+                len(env_ids), 3, dtype=torch.float, device=self.device
+            )
+            random_yaw_angle[:, 2] = torch_rand_float(
+                float(world_yaw_range[0]),
+                float(world_yaw_range[1]),
+                (len(env_ids), 1),
+                device=self.device,
+            ).squeeze(-1)
         else:
             random_yaw_angle = 2*(torch.rand(len(env_ids), 3, dtype=torch.float, device=self.device,
                                                          requires_grad=False)-0.5)*torch.tensor([0, 0, cfg.terrain.yaw_init_range], device=self.device)
         self.root_states[robot_env_ids,3:7] = quat_from_euler_xyz(random_yaw_angle[:,0], random_yaw_angle[:,1], random_yaw_angle[:,2])
+        if shooting_relative_reset and command_frame == "body":
+            command_xy = body_xy_to_world_xy(
+                self.commands[env_ids, :2],
+                self.root_states[robot_env_ids, 3:7],
+            )
+            command_norm = torch.norm(command_xy, dim=-1, keepdim=True)
+            default_direction = torch.zeros_like(command_xy)
+            default_direction[:, 0] = 1.0
+            shooting_cmd_dir = torch.where(
+                command_norm > 1e-6,
+                command_xy / command_norm.clamp_min(1e-6),
+                default_direction,
+            )
+            # Vary the initial setup around the ideal body-relative kick axis;
+            # rewards still use the exact command and teach recovery to it.
+            yaw_error_range = getattr(
+                cfg.env, "shooting_reset_yaw_error_range", [-0.6, 0.6]
+            )
+            setup_yaw_error = torch_rand_float(
+                float(yaw_error_range[0]),
+                float(yaw_error_range[1]),
+                (len(env_ids), 1),
+                device=self.device,
+            ).squeeze(-1)
+            setup_cos = torch.cos(setup_yaw_error)
+            setup_sin = torch.sin(setup_yaw_error)
+            shooting_cmd_dir = torch.stack(
+                (
+                    setup_cos * shooting_cmd_dir[:, 0]
+                    - setup_sin * shooting_cmd_dir[:, 1],
+                    setup_sin * shooting_cmd_dir[:, 0]
+                    + setup_cos * shooting_cmd_dir[:, 1],
+                ),
+                dim=-1,
+            )
             
         # base velocities
         if shooting_relative_reset and getattr(cfg.env, "shooting_reset_zero_velocities", True):

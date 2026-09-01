@@ -3,6 +3,8 @@ import math
 import torch
 from isaacgym.torch_utils import quat_apply, quat_rotate_inverse
 
+from dribblebot.command_frames import world_xy_to_body_xy
+
 
 SKILL_NAMES = ("walk", "dribble", "shoot")
 SKILL_TO_ID = {name: idx for idx, name in enumerate(SKILL_NAMES)}
@@ -24,6 +26,19 @@ class HighLevelSkillWrapper(gym.Wrapper):
         self.num_robots = int(getattr(env, "num_robots", getattr(env.cfg.env, "num_robots", 2)))
         if self.num_robots < 1:
             raise ValueError("num_robots must be at least 1")
+        high_level_ball_frame = str(
+            getattr(
+                env.cfg.env,
+                "high_level_ball_xy_frame",
+                "team_canonical_field",
+            )
+        )
+        if high_level_ball_frame != "team_canonical_field":
+            raise ValueError(
+                "HighLevelSkillWrapper requires "
+                "cfg.env.high_level_ball_xy_frame='team_canonical_field', "
+                f"got {high_level_ball_frame!r}"
+            )
         self.num_actions = int(getattr(env.cfg.env, "high_level_num_actions", 6 * self.num_robots))
         self.num_obs = int(getattr(env.cfg.env, "high_level_num_observations", 25 * self.num_robots + 6))
         if self.num_actions != 6 * self.num_robots:
@@ -843,6 +858,26 @@ class HighLevelSkillWrapper(gym.Wrapper):
         full[shoot_mask, 2] = 0.0
         return full
 
+    def _execution_command(self, robot_slot):
+        """Adapt stored tactical commands to the selected low-level contract.
+
+        ``skill_commands`` remains in the high-level execution frame: walking
+        is body-relative, while dribble/shoot is in the world field frame after
+        team canonicalization.  Ball-skill policies consume body-frame xy, so
+        re-project their world target through the robot's *current* yaw on every
+        low-level step.  This preserves a fixed tactical field direction while
+        the robot turns during a high-level control interval.
+        """
+
+        command = self.skill_commands[:, robot_slot, :].clone()
+        ball_skill = self.skill_ids[:, robot_slot] != SKILL_TO_ID["walk"]
+        root_state = self._robot_root_states(robot_slot)
+        body_xy = world_xy_to_body_xy(command[:, :2], root_state[:, 3:7])
+        command[:, :2] = torch.where(
+            ball_skill.unsqueeze(-1), body_xy, command[:, :2]
+        )
+        return command
+
     def _robot_root_states(self, robot_slot):
         actor_idxs = self.env.robot_actor_idxs_all[:, robot_slot]
         return self.env.root_states[actor_idxs]
@@ -920,7 +955,10 @@ class HighLevelSkillWrapper(gym.Wrapper):
         actions = torch.zeros(self.num_envs, self.num_robots, 12, dtype=torch.float, device=self.device)
         full_commands = []
         for robot_slot in range(self.num_robots):
-            full_command = self._full_command(self.skill_ids[:, robot_slot], self.skill_commands[:, robot_slot, :])
+            execution_command = self._execution_command(robot_slot)
+            full_command = self._full_command(
+                self.skill_ids[:, robot_slot], execution_command
+            )
             full_commands.append(full_command)
             obs_full = self._robot_low_level_observation_full(robot_slot, full_command)
             self._update_low_level_history(robot_slot, obs_full)
