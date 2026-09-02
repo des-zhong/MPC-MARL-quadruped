@@ -40,9 +40,9 @@ from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
 
 
 def _action(skill_id: int, command_xy: torch.Tensor) -> torch.Tensor:
-    result = torch.zeros(command_xy.shape[0], 6, device=command_xy.device)
-    result[:, skill_id] = 3.0
-    result[:, 3:5] = command_xy.clamp(-2.0, 2.0)
+    result = torch.zeros(command_xy.shape[0], 4, device=command_xy.device)
+    result[:, 0] = int(skill_id)
+    result[:, 1:3] = command_xy.clamp(-2.0, 2.0)
     return result
 
 
@@ -67,7 +67,7 @@ def _team_action(raw_env) -> torch.Tensor:
             )
             walk[shoot] = kick[shoot]
         actions.append(walk)
-    return torch.stack(actions, dim=1).reshape(-1, 6)
+    return torch.stack(actions, dim=1).reshape(-1, 4)
 
 
 def _all_robot_action(raw_env) -> torch.Tensor:
@@ -98,9 +98,8 @@ def _all_robot_action(raw_env) -> torch.Tensor:
 
 def _opponent(observation: dict[str, torch.Tensor]) -> torch.Tensor:
     history = observation["obs_history"]
-    result = torch.zeros(history.shape[0], 6, device=history.device)
-    result[:, 0] = 3.0
-    result[:, 3] = 1.25
+    result = torch.zeros(history.shape[0], 4, device=history.device)
+    result[:, 1] = 1.25
     return result
 
 

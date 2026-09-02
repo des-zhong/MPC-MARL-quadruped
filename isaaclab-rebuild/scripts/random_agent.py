@@ -74,12 +74,12 @@ def main() -> None:
     if len(set(legacy_joint_ids)) != len(mdp.LEGACY_JOINT_NAMES):
         raise RuntimeError(f"AS2 legacy joint mapping contains duplicate indices: {legacy_joint_ids}")
     action_dim = raw_env.action_manager.total_action_dim
-    if action_dim not in (3, 6, 12):
+    if action_dim not in (3, 4, 12):
         raise RuntimeError(
-            "Migrated AS2 smoke tasks must expose 12D joint actions, the 6D "
+            "Migrated AS2 smoke tasks must expose 12D joint actions, the 4D hybrid "
             f"skill coordinator, or a 3D fixed-skill command; got {action_dim}"
         )
-    action_term_name = "skill_policy" if action_dim in (3, 6) else "joint_pos"
+    action_term_name = "skill_policy" if action_dim in (3, 4) else "joint_pos"
     action_term = raw_env.action_manager.get_term(action_term_name)
     resolved_action_names = getattr(action_term, "_joint_names", None)
     if resolved_action_names is not None and list(resolved_action_names) != list(mdp.LEGACY_JOINT_NAMES):
@@ -98,6 +98,8 @@ def main() -> None:
                     (raw_env.num_envs, action_dim),
                     device=raw_env.device,
                 ) - 1.0
+                if action_dim == 4:
+                    actions[:, 0] = torch.randint(0, 3, (raw_env.num_envs,), device=raw_env.device)
                 if not torch.isfinite(actions).all():
                     raise RuntimeError("generated random action contains non-finite values")
                 step_result = env.step(actions)

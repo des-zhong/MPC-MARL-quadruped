@@ -137,7 +137,14 @@ def main() -> None:
         done_frames = []
         with torch.inference_mode():
             for step in range(args_cli.steps):
-                action = torch.from_numpy(coordinator[step]).to(raw_env.device)
+                legacy_action = torch.from_numpy(coordinator[step]).to(raw_env.device)
+                action = torch.cat(
+                    (
+                        legacy_action[:, :3].argmax(dim=-1, keepdim=True).to(legacy_action.dtype),
+                        legacy_action[:, 3:6],
+                    ),
+                    dim=-1,
+                )
                 _, _, terminated, truncated, _ = env.step(action)
                 done = torch.logical_or(terminated, truncated)
                 history = action_term.policy_history

@@ -73,13 +73,13 @@ def _action_from_skill(
     command_xy: torch.Tensor,
     device: torch.device,
 ) -> torch.Tensor:
-    """Build one 6D coordinator action from a desired body-frame command."""
+    """Build one hybrid coordinator action from a skill and command."""
 
-    action = torch.zeros(command_xy.shape[0], 6, device=device)
-    action[:, int(skill_id)] = 3.0
-    # decode_high_level_action applies tanh to these values.  Clamp the input
+    action = torch.zeros(command_xy.shape[0], 4, device=device)
+    action[:, 0] = int(skill_id)
+    # The action term applies tanh to these values. Clamp the input
     # to avoid accidentally requesting commands outside the configured range.
-    action[:, 3:5] = command_xy.clamp(-2.0, 2.0)
+    action[:, 1:3] = command_xy.clamp(-2.0, 2.0)
     return action
 
 
@@ -115,7 +115,7 @@ def _make_team_action(manager_env, device: torch.device) -> torch.Tensor:
             )
             skill_action[shoot] = shoot_action[shoot]
         actions.append(skill_action)
-    return torch.stack(actions, dim=1).reshape(-1, 6)
+    return torch.stack(actions, dim=1).reshape(-1, 4)
 
 
 def _opponent_policy(observation: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -123,9 +123,8 @@ def _opponent_policy(observation: dict[str, torch.Tensor]) -> torch.Tensor:
 
     history = observation["obs_history"]
     # Team-1 robots face -x at reset, so +x is the forward body-frame command.
-    action = torch.zeros(history.shape[0], 6, device=history.device)
-    action[:, 0] = 3.0
-    action[:, 3] = 1.25
+    action = torch.zeros(history.shape[0], 4, device=history.device)
+    action[:, 1] = 1.25
     return action
 
 

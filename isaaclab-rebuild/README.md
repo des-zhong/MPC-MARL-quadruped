@@ -1,8 +1,36 @@
 # DribbleBot IsaacLab 迁移线
 
 本文档是 `isaaclab-rebuild/` 的中文运行说明。该目录将原 Isaac Gym Preview 4
-实现迁移到 IsaacLab 的 manager-based 环境，当前重点是 AS2 四足机器人的
-walking、dribbling、shooting 低层技能，以及四机器人足球 match/self-play 环境。
+实现迁移到 IsaacLab 的 manager-based 环境。**主目标是在 IsaacLab 中从零训练
+上层共享参数 MARL policy**；walking、dribbling、shooting 是冻结的环境内部执行器，
+不是本迁移线要重新训练的 policy。Isaac Gym 用来提供足球任务的行为契约，不要求
+逐行或逐 API 复制其实现。
+
+### 迁移范围
+
+从 Isaac Gym 必须迁移、并作为 MARL 训练 gate 的内容：
+
+- 2v2 场景、物理时间尺度、球场/球门/边界以及会改变比赛状态转移的物理参数；
+- 每个 agent 的混合 4D skill action（1 个离散 `skill_index` + 3 个连续参数）、
+  34D 局部观测、4 帧历史和两队 canonical frame；
+- 三个冻结低层 checkpoint 的推理输入、命令坐标系、技能切换、非法动作降级和
+  20 ms/200 ms 控制频率；
+- 比赛 reset 分布、goal/out-of-bounds/fall/time-out 终止语义；
+- 上层 reward、每机器人 credit assignment、rule-based opponent、self-play pool、
+  checkpoint resume 和并行 PPO 接口；
+- 训练可用性指标：有限 observation/reward/action、有效技能覆盖率、episode 统计、
+  TensorBoard/checkpoint、吞吐量以及一段 from-scratch learning curve。
+
+以下内容不阻塞上层 MARL from-scratch 训练，按需后续迁移：
+
+- Isaac Gym 的 simulator lifecycle、tensor API 和旧训练入口；
+- walk/dribble/shoot 各自的低层训练 reward、command curriculum 和低层 PPO 配置；
+- Gym 与 Lab 的逐时刻轨迹完全一致、完全相同的 learning curve；
+- world-model collector、MPC teacher/runtime、版本化 USD 和视频展示增强。
+
+低层 policy contract 仍必须保持兼容，因为它直接决定 MARL action 的真实执行结果。
+但验收重点是三个技能在随机比赛状态下可用、稳定且可区分，而不是重新复现它们的
+低层训练过程。
 
 ## 1. 版本与当前状态
 
@@ -27,7 +55,7 @@ walking、dribbling、shooting 低层技能，以及四机器人足球 match/sel
 
 - AS2 velocity/dribble 的 GPU physics 与 legacy policy-contract parity；
 - 四台 AS2 articulation + 一个足球的 match scene；
-- 24D manager action、`(4, 34)` match observation、self-play 的 `(2, 34)` /
+- 16D manager action、`(4, 34)` match observation、self-play 的 `(2, 34)` /
   `(2, 136)` 接口；
 - 10 个低层 tick 的 macro 聚合、invalid-skill geometric fallback；
 - canonical recorder snapshot 与 128D world-model state 编码；
@@ -35,10 +63,13 @@ walking、dribbling、shooting 低层技能，以及四机器人足球 match/sel
 - 四机器人 CUDA PPO lifecycle：4-step rollout、1 iteration、checkpoint 与
   TensorBoard event 写出均通过；另已从 `model_450.pt` 恢复并连续训练到
   iteration 500，默认 500-iteration detached opponent snapshot 刷新通过。
+- 2026-09-02 hybrid-action smoke 已验证 `Categorical(3) × Normal(3)` PPO、16D
+  manager action、一次 optimizer update、TensorBoard 和 3D parameter-std checkpoint。
 
-仍未完成的正式 gate：高质量 shooting 成功率、历史 opponent pool 的长期行为、
-完整足球 reward parity，以及 live world-model/MPC
-接入。当前 match reward 是打通训练链路的最小 baseline，不应解读为成熟的足球博弈目标。
+仍未完成的正式 gate：高质量 shooting 成功率、历史 opponent pool 的长期行为，
+以及 live world-model/MPC 接入。2026-09-01
+已同步当前 Isaac Gym 的球技能命令坐标系、随机比赛开局、角色滞回、support deadband、
+物理边界墙和主要 dense reward；这是新的训练基线，旧训练曲线不应直接横向比较。
 
 ## 2. 已注册环境
 
@@ -48,7 +79,7 @@ walking、dribbling、shooting 低层技能，以及四机器人足球 match/sel
 | `Isaac-DribbleBot-AS2-Dribble-Flat-v0` | 带动态足球的 dribbling 训练环境 |
 | `Isaac-DribbleBot-AS2-Shooting-Flat-v0` | command-relative shooting 环境 |
 | `Isaac-DribbleBot-AS2-Skill-Flat-v0` | 单机器人三技能冻结策略集成 smoke |
-| `Isaac-DribbleBot-AS2-Match-Macro-Flat-v0` | 四机器人、24D manager action、macro wrapper |
+| `Isaac-DribbleBot-AS2-Match-Macro-Flat-v0` | 四机器人、16D manager action、macro wrapper |
 | `Isaac-DribbleBot-AS2-Match-SelfPlay-Flat-v0` | 2v2 self-play，外部只暴露学习队两个 agent |
 | 各 ID 的 `-Play-v0` | 小规模可视化/smoke 版本 |
 
@@ -169,15 +200,24 @@ skill id 1 -> dribble
 skill id 2 -> shoot
 ```
 
-coordinator 每台机器人输出 6D：
+coordinator 每台机器人输出混合 4D：
 
 ```text
-[walk_logit, dribble_logit, shoot_logit, command_x, command_y, command_yaw]
+[skill_index, parameter_x, parameter_y, parameter_yaw]
 ```
 
-最大 logit 选择 skill，后三个值经过 `tanh` 和对应 skill 的 command scale 后送入
-低层策略。低层策略根据 15 帧 legacy history 产生 12D AS2 joint-position action，
-再转换为关节目标。
+`skill_index ∈ {0,1,2}` 分别表示 walk、dribble、shoot；后三个参数由混合策略的
+Gaussian head 采样，经过 `tanh` 和对应 skill 的 command scale 后送入低层策略。
+每个机器人只执行所选的一个冻结 ckpt。低层策略根据 15 帧 legacy history 产生
+12D AS2 joint-position action，再转换为关节目标。
+
+训练时 RSL-RL 使用 `Categorical(3)` 处理 `skill_index`、`Normal(3)` 处理连续参数，
+联合计算 log-prob 和 entropy。环境仍以一个 `(N,4)` GPU tensor 传递混合动作，第一列
+必须是整数值；这只是 vectorized transport，不把离散 skill 当作连续物理量学习。
+
+这是新的 learner action contract。已有旧版 6D Gaussian coordinator checkpoint
+不能继续作为同一 PPO 优化器恢复训练；如需观看旧 checkpoint，播放/对手 adapter 会
+把其三段 logits 转成 `argmax skill_index`，但新训练应从新的 hybrid policy 初始化。
 
 需要区分两件事：
 
@@ -246,6 +286,25 @@ export DRIBBLEBOT_CHECKPOINT_ROOT=/path/to/reproduction
 - joint target scale：hip 0.125，thigh/calf 0.25；
 - match action term 负责 skill 路由、command 注入、history 更新和非法请求降级。
 
+当前 Isaac Gym 的新 dribble/shoot 训练约定为：coordinator 仍输出 canonical/world
+field-frame 命令，每个低层 tick 按机器人实时 yaw 转为 body-frame，再交给球技能。
+IsaacLab 已同步这个 adapter，并明确区分两项配置：
+
+- `ball_command_input_frame`：上层传入语义；match 固定为 `world`；
+- `ball_skill_command_frame`：冻结 checkpoint 实际训练时使用的命令坐标系。
+
+仓库现有 `checkpoints/reproduction/{dribble,shoot}/config.yaml` 没有
+`Cfg.commands.ball_xy_frame` metadata，因此为防止静默改变旧 checkpoint 行为，默认
+仍按 legacy `world` contract 加载。安装明确包含 `ball_xy_frame: body` 的新球技能
+bundle 后，启动前设置：
+
+```bash
+export DRIBBLEBOT_BALL_SKILL_COMMAND_FRAME=body
+```
+
+不能把旧 world-frame 与新 body-frame 的 dribble/shoot checkpoint 混在同一个
+bundle 中。walk 命令始终是 body-frame，不受这个变量影响。
+
 非法请求会记录 `requested_skill_id`、最终 `skill_id` 和 `invalid_skill`：shoot
 不可达但 dribble 可达时降为 dribble；两者都不可达时降为 walk。
 
@@ -268,7 +327,9 @@ export DRIBBLEBOT_CHECKPOINT_ROOT=/path/to/reproduction
 raw manager 观测为 `(num_matches, 4, 34)`，self-play 对外为学习队两个 agent 的
 `(num_matches × 2, 34)`，actor 使用 4 帧 136D history。34D 包含自身位置/速度、
 朝向、球相对位置和速度、进攻球门方向、最近队友/对手、球的 dribble/shoot
-affordance、当前 skill one-hot 和 skill command。
+affordance、attacker/support role bit、当前 skill one-hot 和 skill command。role bit
+复用了旧 observation 中恒为 1 的 teammate-presence 槽，因此维度仍保持 34；每队
+离球最近者先成为 attacker，只有另一台机器人至少近 0.15 m 时才切换角色。
 
 team 1 在 world frame 攻击 `-x`，观测会旋转到共享策略的 canonical `+x` frame；
 walk command 保持 body-frame，dribble/shoot 平面 command 在送入 action term 前反向
@@ -276,25 +337,34 @@ walk command 保持 body-frame，dribble/shoot 平面 command 在送入 action t
 
 ### 5.2 Reward
 
-match 当前只注册四项：
+match 已同步当前 Isaac Gym 上层 MARL 进攻链路中的主要 team-level terms（14 项）：
 
 | term | raw value | weight |
 |---|---|---:|
-| `alive` | 1 | `+1.0` |
-| `goal` | 学习队进球的 0/1 | `+20.0` |
-| `opponent_goal` | 对手进球的 0/1 | `-20.0` |
-| `possession` | `exp(-2 d_min²)`，`d_min` 是四台机器人到球的最小距离 | `+0.5` |
+| `goal` | 学习队进球事件 | `+500.0` |
+| `accidental_termination` | 对手进球、球出界或机器人跌倒 | `-200.0` |
+| `ball_goal_progress` | 球速在对方球门方向的投影，clip 到 `[-1,1]` | `+2.0` |
+| `robot_spacing` | 有效队友间距，拥挤和 support 抢球为负 | `+0.75` |
+| `robot_collision` | 当前/未来 0.25 s 内、0.65 m 阈值的最坏 pair overlap² | `-2.0` |
+| `invalid_skill` | 学习队任一机器人请求非法 skill | `-3.0` |
+| `pass_ball` | shoot 后球朝可接应队友运动 | `+2.0` |
+| `approach_ball` | attacker 使用 walk 时朝球的速度投影 | `+1.0` |
+| `walk_command_alignment` | attacker walk command 与球方向一致性 | `+0.5` |
+| `face_ball_while_approaching` | attacker 行走时朝向足球，且按命令速度门控 | `+0.5` |
+| `face_goal_while_moving` | attacker 同时朝球门方向和机身前向移动 | `+0.75` |
+| `dribble_ball_control` | 近球 dribble 时球速与 field command 一致性 | `+2.0` |
+| `shoot_setup` | 近球 shoot 时机器人—球—球门对齐 | `+5.0` |
+| `shoot_launch` | 有效 shoot 使球沿 command 突增到发射速度 | `+10.0` |
 
 IsaacLab `RewardManager` 会再乘 manager step `dt=0.02`：
 
 ```text
-r_t = 0.02 * (1 + 20*I_goal - 20*I_opponent_goal
-              + 0.5*exp(-2*d_min^2))
+r_t = 0.02 * sum(weight_i * term_i)
 ```
 
 每个 macro step 累加最多 10 个低层 reward，self-play 再把 match-level reward 复制
-给学习队两个 agent。当前 possession 不区分球队，且没有推进、传球、射门质量、
-协作 credit 或实体球门碰撞，因此只适合作为 baseline/smoke reward。
+给学习队两个 agent。attacker/support local credit 会再按 agent 单独叠加；pass 和
+shoot-launch 已同步，其中 launch term 持有 reset-safe 的前一拍球速/距离状态。
 
 低层 walk/dribble/shoot 任务中的 locomotion reward 不会自动继承到 match；低层
 policy 在 match 中是冻结推理模块。
@@ -307,11 +377,50 @@ policy 在 match 中是冻结推理模块。
 - ball out：`|x| > 4.0` 或 `|y| > 2.5`；
 - robot fallen：任意 base height `< 0.20 m`。
 
-reset 时四台机器人位于 `(-1,±0.65)` 和 `(+1,±0.65)`，后两台 yaw 为 π，球在
-原点附近；root velocity、关节状态、低层 history、coordinator history 和 skill
-metadata 都会清零。
+训练 reset 使用 8 m × 5 m 球场内的随机布局：学习队在 `x∈[-3.4,0]`，对手在
+`x∈[0,3.4]`，所有机器人 `y∈[-1.9,1.9]`、yaw 为 `[-π,π]`，机器人和球默认保持
+0.75 m clearance；球范围为 `x∈[-3.2,2.8]`、`y∈[-1.7,1.7]`，40% reset 会把球
+放到随机一台机器人前方 0.4–0.95 m。PLAY 配置仍使用固定的
+`(-1,±0.65)` / `(+1,±0.65)` 布局，便于复现和录制。
+
+场地外围包含 6 段 0.5 m 高碰撞墙，两端在 `|y|≤1.0` 留球门开口；两侧有白色
+立柱/横梁，地面使用 `resources/textures/field.png` 的无碰撞 UV 贴图，物理接触仍由
+TerrainImporter 单独负责。终场、长边和球门检测使用 8 m × 5 m canonical field。
+reset 同时清零 root velocity、关节
+状态、低层/coordinator history、skill metadata 和 attacker 滞回状态。
 
 ## 6. 如何开始训练
+
+### 6.0 一键训练脚本
+
+默认使用 8 个并行 match、24-step rollout、5000 iterations 和 `cuda:0`：
+
+```bash
+./isaaclab-rebuild/train_self_play.sh
+```
+
+常用参数通过环境变量覆盖，不需要修改脚本：
+
+```bash
+# GUI 小规模训练
+HEADLESS=0 NUM_ENVS=1 RUN_NAME=gui_debug \
+  ./isaaclab-rebuild/train_self_play.sh
+
+# 从 checkpoint 继续到目标 iteration（MAX_ITERATIONS 是最终目标值）
+RESUME_CHECKPOINT=/absolute/path/to/model_1000.pt \
+MAX_ITERATIONS=5000 RUN_NAME=resumed \
+  ./isaaclab-rebuild/train_self_play.sh
+
+# 换 GPU 或只打印最终命令
+DEVICE=cuda:1 DRY_RUN=1 ./isaaclab-rebuild/train_self_play.sh
+```
+
+支持的环境变量包括 `ISAAC_PYTHON`、`TASK`、`DEVICE`、`NUM_ENVS`、
+`NUM_STEPS_PER_ENV`、`MAX_ITERATIONS`、`SEED`、`RUN_NAME`、`HEADLESS`、
+`RESUME_CHECKPOINT`、`OPPONENT_CHECKPOINT_ROOT`、`OPPONENT_POLICY_DEVICE`、
+`OPPONENT_MODE`、`OPPONENT_POOL_SIZE`、`OPPONENT_LATEST_PROBABILITY`、`DRIBBLEBOT_CHECKPOINT_ROOT`
+和 `DRIBBLEBOT_BALL_SKILL_COMMAND_FRAME`。
+额外 CLI 参数会原样追加到 Python 训练入口。
 
 ### 6.1 GUI 训练 smoke（推荐先运行）
 
@@ -372,8 +481,21 @@ $ISAAC_PY isaaclab-rebuild/scripts/train_self_play.py \
 
 不指定时，新训练从零对手（zero opponent）开始，避免 Isaac Sim 启动阶段同步复制
 CUDA actor；PPO 更新后按默认 500 iteration cadence 生成 detached opponent snapshot。
+运行时 pool 最多保留 8 个 snapshot（初始 anchor 不淘汰），每个 match/reset 独立采样；
+默认以 50% 概率选择最新 snapshot，其余概率均分给历史版本。
+learned pool 会写入 RSL-RL checkpoint 的 `infos.dribblebot_opponent_pool` 并在 resume
+时重建；保存内容仅含 actor MLP/normalizer，不重复保存 critic。旧的完整 ActorCritic
+pool state 也能兼容读取。
 从 checkpoint 恢复时，脚本会在当前 iteration 立即生成恢复 actor 的 detached snapshot，
 避免恢复后临时退回 zero opponent。指定 `--opponent_checkpoint_root` 时则直接加载归档对手。
+
+训练时也可以使用无需 checkpoint 的规则对手：最近球的机器人以 0.15 m 滞回担任
+attacker，按距离选择 walk/dribble/shoot；另一台机器人封堵 learner-to-ball 通道，
+两者都带短距碰撞规避：
+
+```bash
+OPPONENT_MODE=rule_based ./isaaclab-rebuild/train_self_play.sh
+```
 
 最小端到端 smoke（包含一次有效 PPO 更新）可使用 4-step rollout：
 
@@ -388,8 +510,8 @@ $ISAAC_PY isaaclab-rebuild/scripts/train_self_play.py \
 恢复后产生了 51 个连续 TensorBoard update（450..500），并写出
 `logs/rsl_rl/dribblebot_as2_match_self_play/2026-08-27_20-17-40_resume_probe_501/model_500.pt`。
 该运行跨过 iteration 500 的同步 opponent snapshot 更新且正常退出，验证了 rollout
-后 actor cached distribution 的 detached deepcopy 修复。它不验证历史 opponent pool
-采样或策略质量。
+后 actor cached distribution 的 detached deepcopy 修复。运行时 pool 的分组推理、
+reset 重采样、checkpoint 写入均已接入；长期策略质量仍需完整训练验证。
 
 从 RSL-RL checkpoint 恢复时，`--max_iterations` 表示最终目标 iteration；脚本会恢复
 actor、optimizer 和 iteration，并只运行剩余部分：
@@ -431,6 +553,34 @@ $ISAAC_PY isaaclab-rebuild/scripts/random_agent.py \
   --device cuda:0 --steps 200 --headless
 ```
 
+### 6.5 可视化训练 checkpoint
+
+默认自动加载最近修改的 `model_*.pt`，在 Isaac Sim GUI 中观看 3 个 episode；
+学习队和对手使用同一个冻结 checkpoint：
+
+```bash
+./isaaclab-rebuild/play_self_play.sh
+```
+
+常用覆盖方式：
+
+```bash
+# 指定最终 checkpoint，观看 5 个 episode
+CHECKPOINT=$PWD/isaaclab-rebuild/logs/rsl_rl/dribblebot_as2_match_self_play/\
+2026-08-27_20-24-44_match_selfplay_resumed_20260827/model_4999.pt \
+EPISODES=5 ./isaaclab-rebuild/play_self_play.sh
+
+# 和静止的 zero opponent 对战；FRAME_DELAY 控制肉眼观看速度
+OPPONENT=zero FRAME_DELAY=0.08 EPISODES=3 \
+  ./isaaclab-rebuild/play_self_play.sh
+
+# 和无需 checkpoint 的规则对手对战
+OPPONENT=rule_based EPISODES=3 ./isaaclab-rebuild/play_self_play.sh
+```
+
+每个 episode 结束后，终端会输出累计 return、长度，以及四台机器人实际执行的
+walk/dribble/shoot 次数。关闭 Isaac Sim 窗口可以提前结束。
+
 ## 7. 验证、视频和 recorder
 
 列出注册环境：
@@ -468,7 +618,7 @@ $ISAAC_PY isaaclab-rebuild/scripts/run_match_screen.py \
   物理和 legacy observation/history parity；
 - `outputs/skill-behavior/20260825T042000Z/`：walk/dribble/shoot/switch 的冻结
   policy contract；
-- `outputs/macro-validation/match-contract.json`：24D action、fallback、34D/136D
+- `outputs/macro-validation/match-contract.json`：混合 action、fallback、34D/136D
   observation 和 128D world-model state；
 - `outputs/macro-validation/match-selfplay-snapshot2.json`：reset + 10 ticks 的
   canonical recorder snapshot。

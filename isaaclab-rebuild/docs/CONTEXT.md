@@ -1,10 +1,12 @@
 # MPC-MARL Quadruped Soccer — Current Context
 
-更新时间：2026-08-27
+更新时间：2026-09-02
 
 ## 项目目的
 
-本仓库实现四足机器人足球的分层多智能体强化学习系统，当前主线仍是 Isaac Gym Preview 4，迁移线位于 `isaaclab-rebuild/`。
+本仓库实现四足机器人足球的分层多智能体强化学习系统。`isaaclab-rebuild/` 的生产
+目标是在 IsaacLab 中 **from scratch 训练上层共享参数 MARL policy**。Isaac Gym
+Preview 4 是任务语义和已有低层技能的参考实现，不再是要求全量逐项复制的主线。
 
 系统包含：
 
@@ -16,6 +18,24 @@
 
 核心领域对象是：机器人、足球、球场、球门、球队、技能、技能命令、比赛状态、世界模型状态和 MPC rollout。
 
+## Isaac Gym 迁移选择原则
+
+只迁移会影响上层 MARL 学习问题定义或训练稳定性的内容：
+
+1. **MDP contract**：每个 agent 的 observation/action、时间尺度、reward、termination、
+   reset distribution 和 per-agent credit assignment。
+2. **Action consequence**：冻结 walk/dribble/shoot checkpoint 的输入/history、命令 frame、
+   skill affordance/fallback、切换语义和真实物理执行结果。
+3. **Multi-agent contract**：2v2 team frame、共享策略展开、对手接口、self-play pool、
+   snapshot/resume 和每个 match 的独立采样。
+4. **Training operability**：GPU vectorization、有限值检查、episode/reward/skill 统计、
+   TensorBoard、checkpoint 和可复现实验配置。
+
+不以其为当前阻塞项：Isaac Gym tensor/API 结构、低层技能从零训练的 reward/curriculum、
+旧 runner 的完整兼容、逐时刻全轨迹相等、world-model/MPC、视频增强和 USD 资产打包。
+物理 parity archive 保留为回归证据，但新增迁移需求必须先回答“它是否改变上层 MARL
+的学习信号或状态转移”；答案为否时默认不迁移。
+
 ## 稳定领域约定
 
 - 坐标：学习队攻击 `+x` 方向；对手队在 world frame 攻击 `-x`，输入到共享策略前旋转 `pi`。
@@ -26,8 +46,13 @@
 - 低层 legacy policy observation：walking 72D，带球技能 75D。
 - 低层 legacy history：15 帧，分别为 1080D/1125D，首个外部 reset 使用零填充。
 - match agent observation：34D；4 帧 coordinator history：136D。
+- MARL action：每个机器人 4D `[skill_index, parameter_x, parameter_y, parameter_yaw]`；
+  `skill_index` 为离散 `{0,1,2}`，后三项为连续 skill parameters。
 - 四机器人 world-model canonical state 当前编码为 128D。
 - invalid shoot request 必须安全降级为 walk，并暴露 `invalid_skill` 标记。
+- coordinator 的 ball command 使用 canonical/world field frame；新 dribble/shoot
+  checkpoint 使用 body frame，IsaacLab action adapter 必须根据 `wxyz` root yaw 在每个
+  low-level tick 转换。无 `ball_xy_frame` metadata 的旧 bundle 保持 world-frame。
 
 ## 当前实现的两条代码线
 
@@ -98,7 +123,7 @@ manager-based 结构如下：
 
 - Isaac Sim 5.1.0 + PhysX + RTX 4090 上，AS2 velocity/dribble 的 zero/sine physics 与 policy-contract parity archive 通过 4/4。
 - `Isaac-DribbleBot-AS2-Match-SelfPlay-Flat-Play-v0` 可以创建 4 个 AS2 articulation 和 1 个足球。
-- match manager action 为 24D，即 4 个机器人各 6D skill action。
+- match manager action 为 16D，即 4 个机器人各 4D hybrid skill action。
 - manager observation 为 `(4, 34)`；self-play wrapper 对外提供 `(2, 34)` observation 和 `(2, 136)` history。
 - coordinator macro smoke 能执行 10 个 low-level ticks，reward finite，done contract 正常。
 - invalid shooting request 的 geometric fallback 会执行 walk 并标记 invalid。
@@ -107,6 +132,18 @@ manager-based 结构如下：
 - frozen skill behavior matrix 的 walk/dribble/shoot/switch interface contract 已通过 10-tick gate。
 - 四机器人 CUDA PPO 已从 `model_450.pt` 恢复并完成 51 个连续 update（450..500）；
   iteration 500 的 detached opponent snapshot 同步刷新和 `model_500.pt` 写出均通过。
+- 2026-09-01 已从 Isaac Gym 同步 ball-skill frame adapter、随机/近球 reset、物理边界墙、
+  attacker 0.15 m 滞回、support 0.08 m deadband，以及 goal/progress/spacing/collision/
+  invalid/pass/approach/walk alignment/face-ball/face-goal/dribble control/shoot setup/
+  shoot launch rewards、
+  local role credit、rule-based opponent、场地贴图和球门 primitive。同步后尚未完成新的
+  长训练，因此旧 iteration 500 checkpoint 只代表同步前 baseline。
+- opponent pool 已接入 RSL checkpoint `infos` 持久化；compact actor-only state 和旧
+  ActorCritic state 的 simulator-free round-trip 均通过，checkpoint 写入已确认。
+- 2026-09-02 将 learner action 从三 logits + 三参数改为真正的 hybrid action：每个
+  agent 4D tensor transport、Categorical skill 和三维 Gaussian parameters。RTX4090
+  contract smoke 与一次 PPO optimizer update 已通过，日志位于
+  `logs/rsl_rl/dribblebot_as2_match_self_play/2026-09-02_01-28-47_hybrid_action_smoke_20260902/`。
 
 主要证据：
 
@@ -120,9 +157,10 @@ manager-based 结构如下：
 ### 未完成或不能过度解读的部分
 
 - frozen shooting smoke 已有 8/8 launch，但成功率为 0/8；射门行为质量仍未通过。
-- 历史 opponent pool 的持久化、采样和长期行为仍需验证；当前只验证了单个 detached
-  snapshot 在默认 iteration 500 cadence 的替换。
-- match-specific goal、possession、pass、collision 和 accidental termination 奖励尚未与 Isaac Gym 精确 parity。
+- opponent pool 已支持最多 8 个 detached snapshot、保留初始 anchor、每个 match/reset
+  重采样、50% latest 概率和 checkpoint 持久化；长期行为仍需验证。
+- 2026-09-01 最终 pool GPU restore gate 受到宿主机 inotify/OmniClient 资源耗尽导致的
+  Isaac Sim native crash 干扰；payload 写入和 actor-only/legacy state 重建已分别验证。
 - world-model collector/MPC 的 live end-to-end 接入尚未完成。
 - command curriculum 尚未完全迁移。
 - URDF 仍是当前运行资产来源，版本化 USD asset package 尚未完成。
@@ -149,17 +187,24 @@ manager-based 结构如下：
 
 ## 下一步优先级
 
-1. 修复并验证 Isaac Lab viewport/RGB video capture，保存一段四机器人 match MP4，并进行 standing pose/self-collision 可视检查。
-2. 对 frozen shooting 做 launch timing、post-strike decay、success distance/speed 和 reset distribution parity。
-3. 验证 match-specific reward parity，并实现历史 opponent pool 的持久化和采样。
-4. 将 `RecorderManager` transitions 接入现有 world-model dataset writer，再接入 MPC runtime/controller。
-5. 将 AS2、足球、场地和球门转换为版本化 USD，保存 asset identity/property manifest。
-6. 通过 clean Isaac Lab v2.3.2 release environment 后，逐步废弃 Isaac Gym training entry points。
+1. 启动新的 from-scratch MARL 基线，检查 reward/termination/skill-selection 分布、PPO
+   数值稳定性、吞吐量和早期 learning signal。
+2. 在随机 match reset 分布中分别验证 walk、dribble、shoot 的可达性、成功率和动作后果；
+   shooting 是上层动作之一，因此“可用”是训练 gate，但无需逐拍复制 Gym 轨迹。
+3. 根据训练统计调整 reward credit、reset/curriculum 和 opponent 难度，并验证长期
+   opponent pool 行为以及 GPU resume。
+4. 固化一套 MARL 回归 gate：observation/action shape、frame、macro rate、有限值、全部
+   termination、reward term 覆盖率和 checkpoint round-trip。
+5. 完成以上主线后再接 world-model/MPC、版本化 USD 和视频增强。
 
 ## 工作规则
 
-- 在 parity gate 完成前，不比较 Isaac Gym 与 Isaac Lab 的 learning curves。
+- 评估 IsaacLab from-scratch MARL 的绝对训练质量；不要求它复现 Isaac Gym 的相同
+  learning curve。
 - 不让训练脚本、world model 或 MPC 直接读取 simulator-specific tensor；访问必须经过 manager term 或 adapter seam。
-- 保持 checkpoint observation/action/history contract 的 shape、顺序、缩放和 reset 语义。
+- 保持冻结低层 checkpoint observation/action/history contract 的 shape、顺序、缩放和
+  reset 语义，因为它是上层 action consequence 的一部分。
+- 只有影响 MARL MDP、低层 action consequence、self-play 分布或训练可靠性的 Gym
+  更新才进入 IsaacLab 主线；其余更新记录为 optional/deferred。
 - `isaaclab-rebuild/` 当前被根目录 `.gitignore` 忽略；继续开发前应取消整目录 ignore，只忽略生成的 outputs、缓存和大型数据。
 - Isaac Lab 3.0/Newton 不属于当前生产迁移目标，应另开实验分支，不能与 PhysX parity 工作混合。

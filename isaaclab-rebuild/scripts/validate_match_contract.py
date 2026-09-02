@@ -40,7 +40,7 @@ def main() -> int:
         # Ask both learning-team robots to shoot while the deterministic reset
         # places the ball outside strike range.  The legacy geometric fallback
         # should execute walk and mark the request invalid.
-        action[:, 2] = 3.0
+        action[:, 0] = 2.0
         _, _, terminated, truncated, info = env.step(action)
         episode_data = raw_env.recorder_manager.get_episode(0).data["football"]["snapshot"]
         snapshot = {key: torch.stack(values) for key, values in episode_data.items()}
@@ -62,6 +62,8 @@ def main() -> int:
                 reset_obs["obs"].shape[-1] == 34
                 and reset_obs["obs"].shape[0] == 2
                 and reset_obs["obs_history"].shape == (2, 136)
+                and env.action_space.shape == (2, 4)
+                and raw_env.action_manager.total_action_dim == 16
                 and world_model_state.shape[-1] > 0
                 and torch.isfinite(world_model_state).all().item()
                 and all(term.requested_skill_ids.eq(2).all() for term in terms[:2])

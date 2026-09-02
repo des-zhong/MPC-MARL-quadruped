@@ -1,6 +1,6 @@
 # IsaacLab 四足足球 Match 环境：MDP 与 Reward 说明
 
-更新时间：2026-08-27
+更新时间：2026-09-02
 
 本文说明 `isaaclab-rebuild` 中四台 AS2 机器人、两支球队和一个足球组成的
 IsaacLab manager-based match 环境。重点是当前代码实际采用的 MDP、reward、
@@ -18,7 +18,7 @@ termination、reset 和 self-play 接口，而不是计划中的最终足球任�
 |---|---|
 | `Isaac-DribbleBot-AS2-Match-SelfPlay-Flat-v0` | 默认训练环境，外部只暴露学习队的两个 agent |
 | `Isaac-DribbleBot-AS2-Match-SelfPlay-Flat-Play-v0` | 小规模可视化和 smoke 环境 |
-| `Isaac-DribbleBot-AS2-Match-Macro-Flat-v0` | 暴露整场 24D 动作的 macro 环境 |
+| `Isaac-DribbleBot-AS2-Match-Macro-Flat-v0` | 暴露整场 16D 动作的 macro 环境 |
 | `Isaac-DribbleBot-AS2-Match-Macro-Flat-Play-v0` | macro 环境的可视化版本 |
 
 基础配置：
@@ -38,8 +38,8 @@ termination、reset 和 self-play 接口，而不是计划中的最终足球任�
 | 默认并行 match 数 | 128 |
 | PLAY 并行 match 数 | 2，可被 `--num_envs` 覆盖 |
 
-当前 scene 使用 8 m × 8 m 平坦 terrain。球门和边线由 MDP 中的坐标条件定义，
-并没有对应的实体球门、围栏或场地标线。
+当前 scene 使用 8 m × 5 m 平坦 terrain，包含实体边界墙和球门 primitive；终止与
+进球仍由 MDP 坐标条件判定。
 
 ## 2. 分层 MDP
 
@@ -47,11 +47,11 @@ termination、reset 和 self-play 接口，而不是计划中的最终足球任�
 一个冻结的低层技能并给出技能命令。
 
 ```text
-learning-team coordinator: 2 × 6D action
-opponent coordinator:      2 × 6D action
+learning-team coordinator: 2 × 4D hybrid action
+opponent coordinator:      2 × 4D hybrid action
                    │
                    ▼
-        four-robot manager action: 24D
+        four-robot manager action: 16D
                    │
                    ▼
     walk / dribble / shoot frozen TorchScript router
@@ -67,7 +67,7 @@ opponent coordinator:      2 × 6D action
 
 - agent：学习队的两台机器人，共享策略参数；
 - observation：每个 agent 当前 34D 局部观测和 4 帧历史；
-- action：每个 agent 6D skill action；
+- action：每个 agent 4D hybrid action `[skill_index, p_x, p_y, p_yaw]`；
 - transition：冻结低层技能执行 10 个 20 ms manager step；
 - reward：一个 match-level 标量，复制给学习队两个 agent；
 - opponent：另一个共享 coordinator callable，定期用训练策略快照更新。
@@ -82,29 +82,31 @@ opponent coordinator:      2 × 6D action
 Self-play 环境的外部 action shape 为：
 
 ```text
-(num_matches × 2 learning agents, 6)
+(num_matches × 2 learning agents, 4)
 ```
 
-wrapper 为对手队生成另外两个 6D action，再拼成 manager 接收的：
+wrapper 为对手队生成另外两个 4D action，再拼成 manager 接收的：
 
 ```text
-(num_matches, 4 robots × 6) = (num_matches, 24)
+(num_matches, 4 robots × 4) = (num_matches, 16)
 ```
 
 每台机器人动作定义为：
 
 ```text
-[walk_logit, dribble_logit, shoot_logit, command_0, command_1, command_2]
+[skill_index, parameter_x, parameter_y, parameter_yaw]
 ```
 
-技能选择和命令解码为：
+其中 `skill_index` 是离散动作，取值 `0/1/2`；后三项是连续 skill parameters。
+RSL-RL actor 使用 `Categorical(3) × Normal(3)` 联合分布，环境 transport tensor 的
+第一列保存采样得到的整数 skill index。动作解码为：
 
 ```math
-s = \operatorname*{argmax}_{i \in \{0,1,2\}} a_i
+s = \operatorname{round}(a_0) \in \{0,1,2\}
 ```
 
 ```math
-c = \tanh(a_{3:6}) \odot C_s
+c = \tanh(a_{1:4}) \odot C_s
 ```
 
 其中 command scale 为：
@@ -201,38 +203,31 @@ forward、球和其他机器人相对量会旋转 `π`，让两队共享的 coor
 
 ### 5.1 Reward terms
 
-当前 match 环境只注册四个 reward term：
+match 只计算上层 MARL objective，不继承低层 walk/dribble/shoot 的训练 reward。
+当前注册 14 项 team-level terms：
 
-| term | raw value | weight |
+| term | 作用 | weight |
 |---|---|---:|
-| `alive` | 恒为 1 | `+1.0` |
-| `goal` | 学习队进球 termination 的 0/1 指示量 | `+20.0` |
-| `opponent_goal` | 对手进球 termination 的 0/1 指示量 | `-20.0` |
-| `possession` | `exp(-2 d_min²)` | `+0.5` |
+| `goal` | 学习队进球事件 | `+500.0` |
+| `accidental_termination` | 对手进球、球出界或机器人跌倒 | `-200.0` |
+| `ball_goal_progress` | 球速朝攻击球门方向的投影 | `+2.0` |
+| `robot_spacing` | 队友有效间距与 support crowding | `+0.75` |
+| `robot_collision` | 当前/0.25 s 预测机器人碰撞 | `-2.0` |
+| `invalid_skill` | 非法 skill 请求 | `-3.0` |
+| `pass_ball` | 射门后球朝可接应队友运动 | `+2.0` |
+| `approach_ball` | attacker 用 walk 接近球 | `+1.0` |
+| `walk_command_alignment` | walk command 朝向球 | `+0.5` |
+| `face_ball_while_approaching` | 接近球时机身朝向球 | `+0.5` |
+| `face_goal_while_moving` | 朝球门且沿机身前向移动 | `+0.75` |
+| `dribble_ball_control` | dribble 时球速与 command 一致 | `+2.0` |
+| `shoot_setup` | 合法、对齐的射门选择 | `+5.0` |
+| `shoot_launch` | 射门导致球速沿 command 突增 | `+10.0` |
 
-注意：`AS2MatchRewardsCfg` 没有继承或重新注册 AS2 velocity/dribble 任务中的
-`track_lin_vel_xy_exp`、`track_ang_vel_z_exp`、`dof_torques_l2`、`action_rate_l2`、
-`ball_setup_position_exp` 等低层 reward。那些 reward 只在独立的 walk/dribble/shoot
-技能训练环境中使用；match 运行时低层策略被冻结，match manager 只计算上表四项。
-
-其中：
-
-```math
-d_{min} = \min_{i \in \{0,1,2,3\}} \|p_i^{robot} - p^{ball}\|_2
-```
-
-IsaacLab `RewardManager` 会把每个 term 的 `weight` 再乘 manager step 的
-`dt = 0.02 s`。所以一个低层 step 的总 reward 是：
-
-```math
-r_t = 0.02 \left[
-1 + 20 I_{goal} - 20 I_{opponent\_goal}
-+ 0.5 \exp(-2d_{min}^2)
-\right]
-```
-
-这解释了 smoke 日志里未进球时约 `0.0206` 的单步 reward：主要来自 alive，
-再叠加一个很小的 proximity/possession bonus。
+IsaacLab `RewardManager` 会把每个 term 的 weight 再乘 manager step 的 `dt=0.02 s`。
+`MacroActionWrapper` 最多执行 10 个低层 step，并将活动行的 reward 求和；随后
+self-play wrapper 将 team return 加上按 attacker/support 分配的 local role credit，
+复制给学习队两个 agent。`goal` 和终止惩罚是稀疏团队目标，其余项只作为 shaping，
+不能替代进球目标。
 
 `MacroActionWrapper` 最多执行 10 个低层 step，并只累计尚未结束的行：
 
@@ -243,32 +238,22 @@ R_k^{macro} = \sum_{j=0}^{n_k-1} r_{k,j}, \qquad 1 \le n_k \le 10
 Self-play wrapper 随后把同一个 match reward 复制给学习队的两个 agent。当前没有
 per-agent reward，也没有按球权贡献拆分 credit。
 
-### 5.2 Goal、失球和 possession 的精确定义
+### 5.2 Goal、失球和 role credit 的精确定义
 
 - 学习队进球：`ball_x >= 4.0` 且 `|ball_y| <= 1.0`；
 - 对手进球：`ball_x <= -4.0` 且 `|ball_y| <= 1.0`；
-- possession：只看四台机器人中离球最近的距离，不区分球队，也不判断控球朝向、
-  接触状态或球速。
-
-因此 `possession` 这个名字目前比实现语义更强。它实际是“任意机器人接近球”的
-全局 shaping。无论靠近球的是学习队还是对手队，该项都会增加学习队收到的 reward。
+- attacker 由每队离球最近机器人决定，并带 0.15 m hysteresis；support 不抢球，
+  使用带 0.08 m deadband 的支撑命令。
+- local role credit 只奖励学习队实际承担的 attacker/support 行为；终止行不重复
+  叠加状态差分 shaping。
 
 ### 5.3 当前 reward 的适用范围与缺口
 
-这套 reward 足以验证 manager、低层技能路由、macro 聚合和 PPO 数据流，但不适合
-直接作为成熟的 2v2 足球目标。主要缺口包括：
-
-- possession 没有 team sign，不能奖励我方控球、惩罚对方控球；
-- 没有球向对方球门推进、射门质量或防守阻挡 reward；
-- 没有 pass、接球、空间占位、角色分工或协作 credit；
-- 没有碰撞、跌倒前兆、技能切换和动作平滑成本；
-- alive 是持续正奖励，可能鼓励拖延而非进攻；
-- 两个学习 agent 收到完全相同的 team reward，尚未处理 individual credit assignment；
-- 进球完全由球坐标判断，没有实体球门碰撞或穿门平面事件。
-
-修改 reward 时，应优先保持 goal 作为稀疏团队目标，再添加带 team sign 的球权和
-推进 shaping，并分别检查 reward scale、`dt` 缩放和 macro 累加，避免把 50 Hz
-term weight 误当成 5 Hz coordinator reward。
+这套 reward 已覆盖 from-scratch MARL 的最小进攻、协作和安全信号，但仍需用训练
+统计校准权重。当前尚未把 world-model/MPC teacher 信号混入 objective，也不要求
+低层技能 reward/curriculum 进入 match。修改 reward 时应保持 goal 的稀疏团队目标，
+并分别检查 reward scale、`dt` 缩放和 macro 累加，避免把 50 Hz term weight 误当成
+5 Hz coordinator reward。
 
 ## 6. Termination 与 reset
 
@@ -285,9 +270,9 @@ term weight 误当成 5 Hz coordinator reward。
 Macro step 中一旦某个 match 结束，wrapper 会保存 termination/truncation，之后的
 子步只给该行传零动作，也不再累计 reward。`elapsed_low_level_steps` 记录实际执行步数。
 
-### 6.2 Deterministic match reset
+### 6.2 Match reset
 
-相对每个 environment origin，四台机器人被放置为：
+PLAY/smoke 配置相对每个 environment origin 使用固定布局：
 
 | robot | position `(x, y, z)` | yaw |
 |---|---|---:|
@@ -297,8 +282,11 @@ Macro step 中一旦某个 match 结束，wrapper 会保存 termination/truncati
 | `robot_3` | `(+1.0, +0.65, 0.34)` | π |
 | ball | `(0.0, 0.0, 0.10)` | — |
 
-reset 时机器人和球的 root velocity 清零，机器人关节回到默认位置。低层 15 帧历史、
-coordinator 4 帧历史、前次 action、skill id 和 invalid mask 也会重置。
+训练配置改用随机布局：学习队 `x∈[-3.4,0]`，对手队 `x∈[0,3.4]`，机器人
+`y∈[-1.9,1.9]`、yaw∈`[-π,π]`，球 `x∈[-3.2,2.8]`、`y∈[-1.7,1.7]`，并保持
+最小 0.75 m clearance；40% reset 将球放到随机机器人前方 0.4–0.95 m。所有 reset
+都会清零 root velocity、关节状态、低层/coordinator history、skill metadata 和
+attacker 滞回状态。
 
 ## 7. Self-play 与 PPO 接口
 
@@ -319,13 +307,18 @@ detached deterministic snapshot，并默认每 500 个 PPO iteration 更新一�
 - actor/critic MLP：`[512, 256, 128]`，ELU；
 - `gamma=0.99`，`lambda=0.95`；
 - learning rate：`1e-4`；
-- action clip：10；
+- action clip：10（连续 transport 值；skill index 由 categorical sample 产生）；
 - actor 输入：136D history；
 - critic 输入：当前 34D observation。
 
 GPU PPO lifecycle 已通过 1-iteration smoke，并已从 `model_450.pt` 恢复训练到
 iteration 500；默认 cadence 的 detached opponent snapshot 刷新和 `model_500.pt`
 写出均成功。历史 opponent pool 的持久化/采样和训练质量仍需正式 gate。
+
+新的 hybrid action 在 RTX4090 上完成了独立 4-step/1-iteration smoke；actor 的
+六个网络输出解释为三项 categorical logits 和三项 parameter means，环境只接收
+采样后的 4D action。checkpoint 中只保存三项 parameter std。旧 6D Gaussian
+checkpoint 可以经 adapter 做确定性推理，但不能恢复新 hybrid PPO optimizer。
 
 ## 8. Recorder 与 world-model state
 

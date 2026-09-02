@@ -31,15 +31,38 @@ def mirror_high_level_commands(commands: torch.Tensor, skill_ids: torch.Tensor) 
 def mirror_high_level_policy_actions(actions: torch.Tensor) -> torch.Tensor:
     """Convert canonical opponent policy outputs to world-executable actions."""
 
-    if actions.shape[-1] != 6:
-        raise ValueError(f"Expected high-level policy actions [..., 6], got {tuple(actions.shape)}")
+    if actions.shape[-1] not in (4, 6):
+        raise ValueError(
+            "Expected hybrid [..., 4] or legacy-logit [..., 6] policy actions, "
+            f"got {tuple(actions.shape)}"
+        )
     mirrored = actions.clone()
-    skill_ids = actions[..., :3].argmax(dim=-1)
+    if actions.shape[-1] == 4:
+        skill_ids = actions[..., 0].round().long()
+        parameter_slice = slice(1, 3)
+    else:
+        skill_ids = actions[..., :3].argmax(dim=-1)
+        parameter_slice = slice(3, 5)
     field_frame = (skill_ids != WALK_SKILL_ID).unsqueeze(-1)
     # Commands are decoded through tanh; tanh is odd, so negating raw values
     # gives the exact inverse transform without touching skill logits/yaw.
-    mirrored[..., 3:5] = torch.where(field_frame, -mirrored[..., 3:5], mirrored[..., 3:5])
+    mirrored[..., parameter_slice] = torch.where(
+        field_frame,
+        -mirrored[..., parameter_slice],
+        mirrored[..., parameter_slice],
+    )
     return mirrored
+
+
+def legacy_policy_action_to_hybrid(actions: torch.Tensor) -> torch.Tensor:
+    """Adapt archived ``[three logits, three parameters]`` policies to 4D."""
+
+    if actions.shape[-1] == 4:
+        return actions
+    if actions.shape[-1] != 6:
+        raise ValueError(f"Expected policy actions [..., 4|6], got {tuple(actions.shape)}")
+    skill_index = actions[..., :3].argmax(dim=-1, keepdim=True).to(actions.dtype)
+    return torch.cat((skill_index, actions[..., 3:6]), dim=-1)
 
 
 def team_signs(num_robots: int, team_size: int, *, device=None, dtype=None) -> torch.Tensor:
@@ -54,6 +77,7 @@ def team_signs(num_robots: int, team_size: int, *, device=None, dtype=None) -> t
 
 __all__ = [
     "WALK_SKILL_ID",
+    "legacy_policy_action_to_hybrid",
     "mirror_high_level_commands",
     "mirror_high_level_policy_actions",
     "team_signs",

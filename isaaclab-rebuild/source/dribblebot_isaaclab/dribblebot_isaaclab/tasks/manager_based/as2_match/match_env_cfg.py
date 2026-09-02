@@ -12,12 +12,21 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.managers import RecorderManagerBaseCfg
 from isaaclab.managers import DatasetExportMode
-from isaaclab.assets import ArticulationCfg
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.utils import configclass
 
-from ....assets import AS2_CFG
-from ....policies import REPRODUCTION_COMMAND_SCALES
+from ....assets import (
+    AS2_CFG,
+    GOAL_EAST_CROSSBAR_CFG,
+    GOAL_EAST_NORTH_CFG,
+    GOAL_EAST_SOUTH_CFG,
+    GOAL_WEST_CROSSBAR_CFG,
+    GOAL_WEST_NORTH_CFG,
+    GOAL_WEST_SOUTH_CFG,
+    SOCCER_FIELD_VISUAL_CFG,
+)
+from ....policies import REPRODUCTION_COMMAND_SCALES, ball_skill_command_frame
 from ..as2_dribble.dribble_env_cfg import AS2DribbleSceneCfg
 from ..as2_velocity.velocity_env_cfg import FLAT_TERRAIN_CFG
 from ..football import mdp
@@ -26,6 +35,12 @@ from ..football.frozen_skill_cfg import make_frozen_skill_action_cfg
 
 ROBOT_NAMES = ("robot_0", "robot_1", "robot_2", "robot_3")
 TEAM_SIZE = 2
+TEAM_0_NAMES = ROBOT_NAMES[:TEAM_SIZE]
+TEAM_1_NAMES = ROBOT_NAMES[TEAM_SIZE:]
+# The checked-in reproduction dribble/shoot configs have no ball_xy_frame
+# metadata and retain the legacy world-frame contract. Set this to "body"
+# only when all installed ball-skill checkpoints declare that contract.
+BALL_SKILL_CHECKPOINT_FRAME = ball_skill_command_frame()
 
 
 @configclass
@@ -37,6 +52,55 @@ class AS2MatchSceneCfg(AS2DribbleSceneCfg):
     robot_1: ArticulationCfg = AS2_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot_1")
     robot_2: ArticulationCfg = AS2_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot_2")
     robot_3: ArticulationCfg = AS2_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot_3")
+    field_visual: AssetBaseCfg = SOCCER_FIELD_VISUAL_CFG
+    goal_east_north: AssetBaseCfg = GOAL_EAST_NORTH_CFG
+    goal_east_south: AssetBaseCfg = GOAL_EAST_SOUTH_CFG
+    goal_east_crossbar: AssetBaseCfg = GOAL_EAST_CROSSBAR_CFG
+    goal_west_north: AssetBaseCfg = GOAL_WEST_NORTH_CFG
+    goal_west_south: AssetBaseCfg = GOAL_WEST_SOUTH_CFG
+    goal_west_crossbar: AssetBaseCfg = GOAL_WEST_CROSSBAR_CFG
+    # Physical perimeter copied from the current Isaac Gym match. End walls
+    # are split around the 2 m goal mouth so scoring remains possible.
+    wall_north: AssetBaseCfg = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/WallNorth",
+        spawn=sim_utils.CuboidCfg(
+            size=(8.34, 0.12, 0.50),
+            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                static_friction=0.35, dynamic_friction=0.35, restitution=0.85
+            ),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.15, 0.15, 0.15)),
+        ),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 2.61, 0.25)),
+    )
+    wall_south: AssetBaseCfg = wall_north.replace(
+        prim_path="{ENV_REGEX_NS}/WallSouth",
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, -2.61, 0.25)),
+    )
+    wall_east_north: AssetBaseCfg = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/WallEastNorth",
+        spawn=sim_utils.CuboidCfg(
+            size=(0.12, 1.55, 0.50),
+            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                static_friction=0.35, dynamic_friction=0.35, restitution=0.85
+            ),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.15, 0.15, 0.15)),
+        ),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(4.11, 1.775, 0.25)),
+    )
+    wall_east_south: AssetBaseCfg = wall_east_north.replace(
+        prim_path="{ENV_REGEX_NS}/WallEastSouth",
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(4.11, -1.775, 0.25)),
+    )
+    wall_west_north: AssetBaseCfg = wall_east_north.replace(
+        prim_path="{ENV_REGEX_NS}/WallWestNorth",
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(-4.11, 1.775, 0.25)),
+    )
+    wall_west_south: AssetBaseCfg = wall_east_north.replace(
+        prim_path="{ENV_REGEX_NS}/WallWestSouth",
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(-4.11, -1.775, 0.25)),
+    )
 
 
 def _velocity_command(asset_name: str):
@@ -90,6 +154,12 @@ class AS2MatchCommandsCfg:
 
 @configclass
 class AS2MatchActionsCfg:
+    """Four 4D hybrid skill actions, one per physical robot.
+
+    Each action is ``[skill_index, parameter_x, parameter_y, parameter_yaw]``;
+    the self-play wrapper exposes the first two robots as two learning agents.
+    """
+
     skill_policy_0 = make_frozen_skill_action_cfg(
         asset_name="robot_0",
         action_term_name="skill_policy_0",
@@ -97,6 +167,11 @@ class AS2MatchActionsCfg:
         gait_command_name="gait_parameters_0",
         command_scales=REPRODUCTION_COMMAND_SCALES,
         geometric_skill_fallback=True,
+        ball_skill_checkpoint_frame=BALL_SKILL_CHECKPOINT_FRAME,
+        role_aware_fallback=True,
+        team_robot_names=TEAM_0_NAMES,
+        team_index=0,
+        team_slot=0,
     )
     skill_policy_1 = make_frozen_skill_action_cfg(
         asset_name="robot_1",
@@ -105,6 +180,11 @@ class AS2MatchActionsCfg:
         gait_command_name="gait_parameters_1",
         command_scales=REPRODUCTION_COMMAND_SCALES,
         geometric_skill_fallback=True,
+        ball_skill_checkpoint_frame=BALL_SKILL_CHECKPOINT_FRAME,
+        role_aware_fallback=True,
+        team_robot_names=TEAM_0_NAMES,
+        team_index=0,
+        team_slot=1,
     )
     skill_policy_2 = make_frozen_skill_action_cfg(
         asset_name="robot_2",
@@ -113,6 +193,11 @@ class AS2MatchActionsCfg:
         gait_command_name="gait_parameters_2",
         command_scales=REPRODUCTION_COMMAND_SCALES,
         geometric_skill_fallback=True,
+        ball_skill_checkpoint_frame=BALL_SKILL_CHECKPOINT_FRAME,
+        role_aware_fallback=True,
+        team_robot_names=TEAM_1_NAMES,
+        team_index=1,
+        team_slot=0,
     )
     skill_policy_3 = make_frozen_skill_action_cfg(
         asset_name="robot_3",
@@ -121,6 +206,11 @@ class AS2MatchActionsCfg:
         gait_command_name="gait_parameters_3",
         command_scales=REPRODUCTION_COMMAND_SCALES,
         geometric_skill_fallback=True,
+        ball_skill_checkpoint_frame=BALL_SKILL_CHECKPOINT_FRAME,
+        role_aware_fallback=True,
+        team_robot_names=TEAM_1_NAMES,
+        team_index=1,
+        team_slot=1,
     )
 
 
@@ -157,7 +247,21 @@ class AS2MatchEventsCfg:
     reset_match = EventTerm(
         func=mdp.reset_match_scene,
         mode="reset",
-        params={"robot_names": ROBOT_NAMES, "team_size": TEAM_SIZE, "ball_name": "ball"},
+        params={
+            "robot_names": ROBOT_NAMES,
+            "team_size": TEAM_SIZE,
+            "ball_name": "ball",
+            "randomize": True,
+            "team_0_x_range": (-3.4, 0.0),
+            "team_1_x_range": (0.0, 3.4),
+            "robot_y_range": (-1.9, 1.9),
+            "ball_x_range": (-3.2, 2.8),
+            "ball_y_range": (-1.7, 1.7),
+            "min_clearance": 0.75,
+            "near_ball_probability": 0.4,
+            "near_ball_distance_range": (0.4, 0.95),
+            "near_ball_angle_range": (-0.35, 0.35),
+        },
     )
     robot_0_com = EventTerm(
         func=mdp.set_rigid_body_com,
@@ -203,13 +307,99 @@ class AS2MatchEventsCfg:
 
 @configclass
 class AS2MatchRewardsCfg:
-    alive = RewTerm(func=mdp.match_alive, weight=1.0)
-    goal = RewTerm(func=mdp.match_goal_event, weight=20.0)
-    opponent_goal = RewTerm(func=mdp.match_opponent_goal_event, weight=-20.0)
-    possession = RewTerm(
-        func=mdp.match_possession,
-        weight=0.5,
+    # IsaacLab multiplies these weights by the 0.02 s manager step, matching
+    # the current Isaac Gym high-level reward scaling convention.
+    goal = RewTerm(func=mdp.match_goal_event, weight=500.0)
+    accidental_termination = RewTerm(func=mdp.match_accidental_termination_event, weight=-200.0)
+    ball_goal_progress = RewTerm(func=mdp.match_ball_goal_progress, weight=2.0)
+    robot_spacing = RewTerm(
+        func=mdp.match_robot_spacing,
+        weight=0.75,
         params={"robot_names": ROBOT_NAMES},
+    )
+    robot_collision = RewTerm(
+        func=mdp.match_robot_collision,
+        weight=-2.0,
+        params={"robot_names": ROBOT_NAMES, "collision_distance": 0.65, "lookahead": 0.25},
+    )
+    invalid_skill = RewTerm(
+        func=mdp.match_invalid_skill,
+        weight=-3.0,
+        params={"action_names": ("skill_policy_0", "skill_policy_1")},
+    )
+    pass_ball = RewTerm(
+        func=mdp.match_pass,
+        weight=2.0,
+        params={
+            "robot_names": TEAM_0_NAMES,
+            "action_names": ("skill_policy_0", "skill_policy_1"),
+        },
+    )
+    approach_ball = RewTerm(
+        func=mdp.match_approach_ball,
+        weight=1.0,
+        params={
+            "robot_names": TEAM_0_NAMES,
+            "action_names": ("skill_policy_0", "skill_policy_1"),
+        },
+    )
+    walk_command_alignment = RewTerm(
+        func=mdp.match_walk_command_alignment,
+        weight=0.5,
+        params={
+            "robot_names": TEAM_0_NAMES,
+            "action_names": ("skill_policy_0", "skill_policy_1"),
+        },
+    )
+    face_ball_while_approaching = RewTerm(
+        func=mdp.match_face_ball_while_approaching,
+        weight=0.5,
+        params={
+            "robot_names": TEAM_0_NAMES,
+            "action_names": ("skill_policy_0", "skill_policy_1"),
+            "dribble_distance": 1.0,
+            "target_speed": 0.9,
+        },
+    )
+    face_goal_while_moving = RewTerm(
+        func=mdp.match_face_goal_while_moving,
+        weight=0.75,
+        params={
+            "robot_names": TEAM_0_NAMES,
+            "action_names": ("skill_policy_0", "skill_policy_1"),
+            "goal_x": 4.0,
+            "target_speed": 0.5,
+        },
+    )
+    dribble_ball_control = RewTerm(
+        func=mdp.match_dribble_ball_control,
+        weight=2.0,
+        params={
+            "robot_names": TEAM_0_NAMES,
+            "action_names": ("skill_policy_0", "skill_policy_1"),
+        },
+    )
+    shoot_setup = RewTerm(
+        func=mdp.match_shoot_setup,
+        weight=5.0,
+        params={
+            "robot_names": TEAM_0_NAMES,
+            "action_names": ("skill_policy_0", "skill_policy_1"),
+        },
+    )
+    shoot_launch = RewTerm(
+        func=mdp.MatchShootLaunchReward,
+        weight=10.0,
+        params={
+            "robot_names": TEAM_0_NAMES,
+            "action_names": ("skill_policy_0", "skill_policy_1"),
+            "shoot_distance": 0.75,
+            "min_command_speed": 0.2,
+            "min_ball_speed": 0.8,
+            "min_delta_speed": 0.25,
+            "target_delta_speed": 1.5,
+            "min_command_alignment": 0.6,
+        },
     )
 
 
@@ -259,8 +449,11 @@ class AS2MatchFlatEnvCfg(ManagerBasedRLEnvCfg):
     team_size: int = TEAM_SIZE
     coordinator_history_length: int = 4
     opponent_snapshot_interval: int = 500
+    opponent_pool_size: int = 8
+    opponent_latest_probability: float = 0.5
     opponent_checkpoint_root: str | None = None
     opponent_policy_device: str = "cpu"
+    opponent_mode: str = "zero"
 
     def __post_init__(self) -> None:
         self.sim.dt = 0.005
@@ -282,3 +475,4 @@ class AS2MatchFlatEnvCfg_PLAY(AS2MatchFlatEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.scene.num_envs = 2
+        self.events.reset_match.params["randomize"] = False

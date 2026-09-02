@@ -147,7 +147,7 @@ class AS2VelocityRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         # the leg-major FL/FR/RL/RR order, so resolve both the action and
         # compatibility observations against the explicit canonical list.
         # The Skill task intentionally replaces the regular joint action group
-        # with a six-dimensional coordinator term, so there is no
+        # with a hybrid coordinator term, so there is no
         # ``joint_pos`` member to configure in that subclass.
         joint_pos_action = getattr(self.actions, "joint_pos", None)
         if joint_pos_action is not None:

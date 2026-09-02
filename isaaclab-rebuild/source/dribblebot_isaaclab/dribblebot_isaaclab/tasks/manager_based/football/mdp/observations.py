@@ -452,11 +452,29 @@ def match_local_observation(
 
     skill_ids = []
     commands = []
+    stored_attacker = []
     for slot in range(roots.shape[1]):
         term = env.action_manager.get_term(f"skill_policy_{slot}")
         skill_ids.append(term.skill_ids)
         commands.append(term.skill_commands)
+        stored_attacker.append(term.attacker_mask)
     skill_ids_tensor = torch.stack(skill_ids, dim=1)
+    stored_attacker_tensor = torch.stack(stored_attacker, dim=1)
+    attacker_role = torch.zeros_like(teammate_mask)
+    # The current Isaac Gym observation reuses the old constant teammate bit
+    # as a role bit without changing the archived 34D interface. During the
+    # first observation after reset, before action terms have selected roles,
+    # nearest-to-ball is the deterministic fallback.
+    for team in range(2):
+        start = team * int(team_size)
+        end = start + int(team_size)
+        stored = stored_attacker_tensor[:, start:end]
+        valid = stored.long().sum(dim=1) == 1
+        nearest = torch.nn.functional.one_hot(
+            ball_distance[:, start:end].argmin(dim=1), num_classes=int(team_size)
+        ).bool()
+        selected = torch.where(valid[:, None], stored, nearest)
+        attacker_role[:, start:end, 0] = selected.float()
     command_tensor = torch.stack(commands, dim=1) / roots.new_tensor(command_obs_scale).clamp_min(1.0e-6)
     skill_one_hot = torch.nn.functional.one_hot(skill_ids_tensor, num_classes=3).float()
     observation = torch.cat(
@@ -470,7 +488,7 @@ def match_local_observation(
             ball_distance_norm,
             goal_rel,
             teammate_rel,
-            teammate_mask,
+            attacker_role,
             opponent_rel,
             opponent_vel,
             opponent_mask,

@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 CHECKPOINT_ROOT_ENV = "DRIBBLEBOT_CHECKPOINT_ROOT"
+BALL_SKILL_COMMAND_FRAME_ENV = "DRIBBLEBOT_BALL_SKILL_COMMAND_FRAME"
 
 
 def default_checkpoint_root() -> Path:
@@ -20,6 +21,17 @@ def checkpoint_root() -> Path:
 
     override = os.environ.get(CHECKPOINT_ROOT_ENV)
     return Path(override).expanduser().resolve() if override else default_checkpoint_root()
+
+
+def ball_skill_command_frame() -> str:
+    """Return the installed dribble/shoot checkpoint command contract."""
+
+    frame = os.environ.get(BALL_SKILL_COMMAND_FRAME_ENV, "world").lower()
+    if frame not in {"body", "world"}:
+        raise ValueError(
+            f"{BALL_SKILL_COMMAND_FRAME_ENV} must be 'body' or 'world', got {frame!r}"
+        )
+    return frame
 
 
 def skill_checkpoint_path(skill: str, filename: str) -> Path:

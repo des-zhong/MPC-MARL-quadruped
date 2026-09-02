@@ -28,6 +28,7 @@ REPRODUCTION_COMMAND_SCALES = (
     (1.5, 1.5, 1.0),
     (3.0, 3.0, 0.0),
 )
+HYBRID_COORDINATOR_ACTION_DIM = 4
 
 
 @dataclass(frozen=True)
@@ -185,7 +186,54 @@ class FrozenSkillPolicySet:
         return actions
 
 
-def decode_high_level_action(
+def decode_hybrid_action(
+    action: torch.Tensor,
+    command_scales: torch.Tensor,
+    input_clip: float = 10.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Decode ``[skill_index, parameter_x, parameter_y, parameter_yaw]``.
+
+    The first component is a categorical action emitted by the MARL policy and
+    is represented as an integer-valued scalar in the simulator tensor. The
+    remaining components are continuous samples; the environment applies
+    ``tanh`` and the selected skill's command scales.
+    """
+
+    if action.ndim != 2 or action.shape[1] != HYBRID_COORDINATOR_ACTION_DIM:
+        raise ValueError(
+            "Hybrid high-level action must have shape "
+            f"(N, {HYBRID_COORDINATOR_ACTION_DIM})."
+        )
+    if command_scales.shape != (3, 3):
+        raise ValueError("command_scales must have shape (3, 3).")
+    if not math.isfinite(input_clip) or input_clip <= 0.0:
+        raise ValueError("input_clip must be finite and positive.")
+    valid_input = torch.isfinite(action).all(dim=-1)
+    safe_action = torch.nan_to_num(
+        action,
+        nan=0.0,
+        posinf=input_clip,
+        neginf=-input_clip,
+    ).clamp(-input_clip, input_clip)
+    raw_skill = safe_action[:, 0]
+    rounded_skill = raw_skill.round()
+    valid_skill = (
+        (raw_skill - rounded_skill).abs() <= 1.0e-6
+    ) & (rounded_skill >= WALK_SKILL_ID) & (rounded_skill <= SHOOT_SKILL_ID)
+    valid_input &= valid_skill
+    skill_ids = torch.where(valid_skill, rounded_skill, torch.zeros_like(rounded_skill)).long()
+    scales = command_scales.to(device=action.device, dtype=action.dtype)[skill_ids]
+    commands = torch.tanh(safe_action[:, 1:4]) * scales
+    commands[:, 2] = torch.where(
+        skill_ids == SHOOT_SKILL_ID,
+        torch.zeros_like(commands[:, 2]),
+        commands[:, 2],
+    )
+    commands[~valid_input] = 0.0
+    return skill_ids, commands, ~valid_input
+
+
+def decode_legacy_high_level_action(
     action: torch.Tensor,
     command_scales: torch.Tensor,
     input_clip: float = 10.0,
@@ -215,6 +263,22 @@ def decode_high_level_action(
     )
     commands[~valid_input] = 0.0
     return skill_ids, commands, ~valid_input
+
+
+def decode_high_level_action(
+    action: torch.Tensor,
+    command_scales: torch.Tensor,
+    input_clip: float = 10.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Decode the hybrid contract, retaining six-value legacy trace support."""
+
+    if action.ndim != 2:
+        raise ValueError("High-level action must be a rank-2 tensor.")
+    if action.shape[1] == HYBRID_COORDINATOR_ACTION_DIM:
+        return decode_hybrid_action(action, command_scales, input_clip=input_clip)
+    if action.shape[1] == 6:
+        return decode_legacy_high_level_action(action, command_scales, input_clip=input_clip)
+    raise ValueError("High-level action must have shape (N, 4) for hybrid or (N, 6) for legacy.")
 
 
 def decode_fixed_skill_action(

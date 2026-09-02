@@ -31,6 +31,9 @@ parser.add_argument(
 )
 parser.add_argument("--opponent_checkpoint_root", default=None)
 parser.add_argument("--opponent_policy_device", default="cpu")
+parser.add_argument("--opponent_mode", choices=("zero", "rule_based", "checkpoint"), default="zero")
+parser.add_argument("--opponent_pool_size", type=int, default=8)
+parser.add_argument("--opponent_latest_probability", type=float, default=0.5)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 if not args_cli.experience:
@@ -40,10 +43,11 @@ app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 import gymnasium as gym  # noqa: E402
-from rsl_rl.runners import OnPolicyRunner  # noqa: E402
-
+import torch  # noqa: E402
 import dribblebot_isaaclab  # noqa: E402, F401
 from dribblebot_isaaclab.tasks.manager_based.football.rsl import (  # noqa: E402
+    FrozenRslRlOpponentPolicy,
+    HybridOnPolicyRunner,
     MatchSelfPlayRslRlVecEnvWrapper,
     install_opponent_snapshot_schedule,
 )
@@ -81,6 +85,17 @@ def main() -> None:
     if args_cli.opponent_checkpoint_root:
         env_cfg.opponent_checkpoint_root = args_cli.opponent_checkpoint_root
         env_cfg.opponent_policy_device = args_cli.opponent_policy_device
+        env_cfg.opponent_mode = "checkpoint"
+    else:
+        if args_cli.opponent_mode == "checkpoint":
+            raise ValueError("--opponent_mode checkpoint requires --opponent_checkpoint_root")
+        env_cfg.opponent_mode = args_cli.opponent_mode
+    if args_cli.opponent_pool_size < 1:
+        raise ValueError("--opponent_pool_size must be at least 1")
+    if not 0.0 <= args_cli.opponent_latest_probability <= 1.0:
+        raise ValueError("--opponent_latest_probability must be in [0, 1]")
+    env_cfg.opponent_pool_size = args_cli.opponent_pool_size
+    env_cfg.opponent_latest_probability = args_cli.opponent_latest_probability
 
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     if agent_cfg.run_name:
@@ -105,13 +120,32 @@ def main() -> None:
         f"wrapper 初始化完成（training samples={env.num_envs}, "
         f"rollout steps={agent_cfg.num_steps_per_env}）"
     )
-    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=str(log_dir), device=agent_cfg.device)
+    runner = HybridOnPolicyRunner(env, agent_cfg.to_dict(), log_dir=str(log_dir), device=agent_cfg.device)
     _stage("PPO runner 初始化完成")
+    snapshot_template = None
+    if args_cli.resume_checkpoint is not None:
+        # Clone before runner.load. Some RSL-RL modules cache inference
+        # distribution tensors after state restoration, making a subsequent
+        # deepcopy unexpectedly expensive or unsafe.
+        snapshot_template = FrozenRslRlOpponentPolicy(
+            runner.alg.policy, device=args_cli.opponent_policy_device
+        )
+    checkpoint_infos = None
     if args_cli.resume_checkpoint is not None:
         checkpoint = args_cli.resume_checkpoint.expanduser().resolve()
         if not checkpoint.is_file():
             raise FileNotFoundError(f"resume checkpoint does not exist: {checkpoint}")
-        runner.load(str(checkpoint), load_optimizer=True, map_location=agent_cfg.device)
+        checkpoint_payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        checkpoint_state = checkpoint_payload.get("model_state_dict", {})
+        stored_noise = checkpoint_state.get("std", checkpoint_state.get("log_std"))
+        if stored_noise is None or stored_noise.numel() != 3:
+            raise ValueError(
+                "--resume_checkpoint must use the 4D hybrid action contract "
+                "(Categorical skill + three Gaussian parameters). Legacy 6D "
+                "Gaussian coordinator checkpoints are inference-only adapters "
+                "and cannot resume the hybrid PPO optimizer."
+            )
+        checkpoint_infos = runner.load(str(checkpoint), load_optimizer=True, map_location=agent_cfg.device)
         _stage(f"已恢复 checkpoint={checkpoint.name}, iteration={runner.current_learning_iteration}")
     _stage("安装 opponent snapshot schedule")
     runner.add_git_repo_to_log(__file__)
@@ -126,6 +160,8 @@ def main() -> None:
         # during Isaac Sim startup.  A resumed job snapshots its restored actor
         # immediately so it does not silently switch back to a zero opponent.
         initial_snapshot=args_cli.resume_checkpoint is not None,
+        checkpoint_infos=checkpoint_infos,
+        snapshot_template=snapshot_template,
     )
     _stage("对手快照 schedule 已安装")
     dump_yaml(str(log_dir / "params" / "env.yaml"), env_cfg)

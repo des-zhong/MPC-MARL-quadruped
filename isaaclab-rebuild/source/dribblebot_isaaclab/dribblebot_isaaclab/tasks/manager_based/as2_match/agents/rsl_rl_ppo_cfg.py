@@ -16,6 +16,7 @@ class AS2MatchSelfPlayPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     # warnings and makes the 136D history contract explicit.
     obs_groups = {"policy": ["policy"], "critic": ["critic"]}
     policy = RslRlPpoActorCriticCfg(
+        class_name="HybridActorCritic",
         init_noise_std=0.5,
         actor_obs_normalization=False,
         critic_obs_normalization=False,
@@ -31,9 +32,12 @@ class AS2MatchSelfPlayPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=1.0e-4,
-        schedule="adaptive",
+        # The standard RSL-RL adaptive KL assumes every action dimension is
+        # Gaussian. Skill index is categorical, so the hybrid policy uses the
+        # PPO objective without that invalid Gaussian KL adaptation.
+        schedule="fixed",
         gamma=0.99,
         lam=0.95,
-        desired_kl=0.01,
+        desired_kl=None,
         max_grad_norm=1.0,
     )

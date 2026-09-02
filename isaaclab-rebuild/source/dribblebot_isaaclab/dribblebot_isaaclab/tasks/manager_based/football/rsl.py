@@ -8,44 +8,84 @@ from typing import Any
 import torch
 from tensordict import TensorDict
 from rsl_rl.env import VecEnv
+from rsl_rl.runners import OnPolicyRunner
+
+from .hybrid_actor_critic import HYBRID_ACTION_DIM, HybridActorCritic, actor_output_to_hybrid_action
+
+
+class HybridOnPolicyRunner(OnPolicyRunner):
+    """Resolve the project hybrid policy without modifying RSL-RL on disk."""
+
+    def _construct_algorithm(self, obs):
+        # RSL-RL 3.0.1 resolves ``policy.class_name`` with eval() in this
+        # module's parent implementation. Keep that external-version quirk in
+        # one adapter seam rather than leaking registration into launchers.
+        import rsl_rl.runners.on_policy_runner as rsl_on_policy_runner
+
+        rsl_on_policy_runner.HybridActorCritic = HybridActorCritic
+        return super()._construct_algorithm(obs)
 
 
 class FrozenRslRlOpponentPolicy:
     """Detached deterministic actor snapshot with the self-play callable API."""
 
     def __init__(self, actor, device: str | torch.device = "cpu"):
-        # RSL-RL caches a ``Normal`` distribution whose mean/std tensors are
-        # produced by the latest forward pass.  Python deepcopy rejects those
-        # non-leaf tensors after the first PPO rollout.  The distribution is
-        # transient inference state, so exclude it while cloning the module.
-        cached_distribution = getattr(actor, "distribution", None)
-        if hasattr(actor, "distribution"):
-            actor.distribution = None
-        try:
-            self.actor = copy.deepcopy(actor).to(device).eval()
-        finally:
-            if hasattr(actor, "distribution"):
-                actor.distribution = cached_distribution
+        # Self-play inference does not need the critic or stochastic action
+        # distribution. Keeping only these two modules mirrors the Isaac Gym
+        # FrozenOpponentPolicy and avoids copying cached non-leaf tensors.
+        self.actor_body = copy.deepcopy(actor.actor).to(device).eval()
+        self.actor_obs_normalizer = copy.deepcopy(actor.actor_obs_normalizer).to(device).eval()
         self.device = torch.device(device)
-        for parameter in self.actor.parameters():
+        for parameter in self.actor_body.parameters():
+            parameter.requires_grad_(False)
+        for parameter in self.actor_obs_normalizer.parameters():
             parameter.requires_grad_(False)
 
     def __call__(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
         history = observation["obs_history"].to(self.device)
-        privileged = observation.get("privileged_obs", history[..., :34]).to(self.device)
-        tensor_dict = TensorDict(
-            {"policy": history, "critic": privileged},
-            batch_size=[history.shape[0]],
-            device=self.device,
-        )
         with torch.inference_mode():
-            if hasattr(self.actor, "act_inference"):
-                actions = self.actor.act_inference(tensor_dict)
-            else:
-                actions = self.actor(tensor_dict, stochastic_output=False)
-        if actions.ndim != 2 or actions.shape[-1] != 6:
-            raise RuntimeError(f"RSL-RL opponent actor returned shape {tuple(actions.shape)}, expected (N,6)")
+            actions = self.actor_body(self.actor_obs_normalizer(history))
+        if actions.ndim != 2:
+            raise RuntimeError(f"RSL-RL opponent actor returned shape {tuple(actions.shape)}")
+        if actions.shape[-1] != 6:
+            raise RuntimeError(
+                f"RSL-RL opponent actor returned shape {tuple(actions.shape)}, expected actor output (N,6)"
+            )
+        # Both archived Gaussian-logit actors and the hybrid actor use the same
+        # deterministic six-output head: three skill logits plus three means.
+        actions = actor_output_to_hybrid_action(actions)
+        if actions.shape[-1] != HYBRID_ACTION_DIM:
+            raise RuntimeError(f"Opponent action adapter returned shape {tuple(actions.shape)}, expected (N,4)")
         return torch.nan_to_num(actions, nan=0.0, posinf=10.0, neginf=-10.0)
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        payload = {
+            f"actor.{key}": value.detach().cpu()
+            for key, value in self.actor_body.state_dict().items()
+        }
+        payload.update(
+            {
+                f"actor_obs_normalizer.{key}": value.detach().cpu()
+                for key, value in self.actor_obs_normalizer.state_dict().items()
+            }
+        )
+        return payload
+
+    def load_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
+        actor_state = {
+            key.removeprefix("actor."): value
+            for key, value in state_dict.items()
+            if key.startswith("actor.")
+        }
+        normalizer_state = {
+            key.removeprefix("actor_obs_normalizer."): value
+            for key, value in state_dict.items()
+            if key.startswith("actor_obs_normalizer.")
+        }
+        if not actor_state:
+            raise ValueError("Opponent snapshot contains no actor.* weights")
+        self.actor_body.load_state_dict(actor_state, strict=True)
+        self.actor_obs_normalizer.load_state_dict(normalizer_state, strict=True)
 
 
 class MatchSelfPlayRslRlVecEnvWrapper(VecEnv):
@@ -147,6 +187,8 @@ def install_opponent_snapshot_schedule(
     interval: int = 500,
     policy_device: str = "cpu",
     initial_snapshot: bool = True,
+    checkpoint_infos: dict[str, Any] | None = None,
+    snapshot_template: FrozenRslRlOpponentPolicy | None = None,
 ) -> None:
     """Attach a detached actor snapshot callback to an RSL-RL runner.
 
@@ -168,9 +210,44 @@ def install_opponent_snapshot_schedule(
 
     raw_self_play = env.env
     next_iteration = int(getattr(runner, "current_learning_iteration", 0))
-    if initial_snapshot and getattr(raw_self_play, "opponent_policy_callable", None) is None:
+    pool_payload = None
+    if isinstance(checkpoint_infos, dict):
+        pool_payload = checkpoint_infos.get("dribblebot_opponent_pool")
+    # An explicitly configured rule/checkpoint opponent has higher priority
+    # than a learned pool embedded in the resumed learner checkpoint.
+    if str(getattr(raw_self_play.cfg, "opponent_mode", "zero")) != "zero":
+        pool_payload = None
+        initial_snapshot = False
+    if pool_payload is not None:
+        policies_state = pool_payload.get("policies", [])
+        iterations = pool_payload.get("iterations", [])
+        if len(policies_state) != len(iterations) or not policies_state:
+            raise ValueError("Checkpoint opponent pool is empty or malformed")
+        print(
+            f"[SELFPLAY] restoring opponent pool entries={len(policies_state)} "
+            f"iterations={list(iterations)}",
+            flush=True,
+        )
+        reconstructed = []
+        for index, state_dict in enumerate(policies_state):
+            print(f"[SELFPLAY] cloning opponent template {index + 1}/{len(policies_state)}", flush=True)
+            if snapshot_template is None:
+                snapshot = FrozenRslRlOpponentPolicy(current_policy(), device=policy_device)
+            elif index == 0:
+                snapshot = snapshot_template
+            else:
+                snapshot = copy.deepcopy(snapshot_template)
+            print(f"[SELFPLAY] loading opponent weights {index + 1}/{len(policies_state)}", flush=True)
+            snapshot.load_state_dict(state_dict)
+            reconstructed.append(snapshot)
+        raw_self_play.restore_opponent_pool(reconstructed, [int(value) for value in iterations])
+        print("[SELFPLAY] opponent pool restore complete", flush=True)
+    elif initial_snapshot and getattr(raw_self_play, "opponent_policy_callable", None) is None:
+        snapshot = snapshot_template or FrozenRslRlOpponentPolicy(current_policy(), device=policy_device)
+        if snapshot_template is not None:
+            snapshot.load_state_dict(current_policy().state_dict())
         raw_self_play.update_opponent_snapshot(
-            FrozenRslRlOpponentPolicy(current_policy(), device=policy_device),
+            snapshot,
             iteration=next_iteration,
             force=True,
         )
@@ -191,9 +268,21 @@ def install_opponent_snapshot_schedule(
 
     runner.alg.update = update_with_opponent_snapshot
 
+    original_save = runner.save
+
+    def save_with_opponent_pool(path: str, infos=None):
+        payload = dict(infos) if isinstance(infos, dict) else {}
+        pool_state = raw_self_play.opponent_pool_state_dict()
+        if pool_state is not None:
+            payload["dribblebot_opponent_pool"] = pool_state
+        return original_save(path, infos=payload or None)
+
+    runner.save = save_with_opponent_pool
+
 
 __all__ = [
     "FrozenRslRlOpponentPolicy",
+    "HybridOnPolicyRunner",
     "MatchSelfPlayRslRlVecEnvWrapper",
     "install_opponent_snapshot_schedule",
 ]
