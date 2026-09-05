@@ -12,11 +12,12 @@ cd "${PROJECT_ROOT}"
 ISAAC_PYTHON="${ISAAC_PYTHON:-${REBUILD_ROOT}/.venv/bin/python}"
 TASK="${TASK:-Isaac-DribbleBot-AS2-Match-SelfPlay-Flat-v0}"
 DEVICE="${DEVICE:-cuda:0}"
-NUM_ENVS="${NUM_ENVS:-8}"
+NUM_ENVS="${NUM_ENVS:-128}"
 NUM_STEPS_PER_ENV="${NUM_STEPS_PER_ENV:-24}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-5000}"
 SEED="${SEED:-42}"
 RUN_NAME="${RUN_NAME:-match_selfplay_$(date +%Y%m%d_%H%M%S)}"
+LOG_DIR="${LOG_DIR:-}"
 HEADLESS="${HEADLESS:-1}"
 RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
 OPPONENT_CHECKPOINT_ROOT="${OPPONENT_CHECKPOINT_ROOT:-}"
@@ -57,6 +58,9 @@ if [[ "${HEADLESS}" == "1" || "${HEADLESS}" == "true" ]]; then
 fi
 if [[ -n "${RESUME_CHECKPOINT}" ]]; then
   command+=(--resume_checkpoint "${RESUME_CHECKPOINT}")
+fi
+if [[ -n "${LOG_DIR}" ]]; then
+  command+=(--log_dir "${LOG_DIR}")
 fi
 if [[ -n "${OPPONENT_CHECKPOINT_ROOT}" ]]; then
   command+=(--opponent_checkpoint_root "${OPPONENT_CHECKPOINT_ROOT}")

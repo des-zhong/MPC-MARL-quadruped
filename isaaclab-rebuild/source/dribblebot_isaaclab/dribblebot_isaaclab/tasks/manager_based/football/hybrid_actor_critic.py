@@ -51,6 +51,10 @@ class HybridActorCritic(nn.Module):
         init_noise_std=1.0,
         noise_std_type: str = "scalar",
         state_dependent_std: bool = False,
+        min_parameter_std: float = 0.05,
+        max_parameter_std: float = 0.8,
+        skill_entropy_scale: float = 1.0,
+        parameter_entropy_scale: float = 0.05,
         **kwargs,
     ) -> None:
         if kwargs:
@@ -65,6 +69,10 @@ class HybridActorCritic(nn.Module):
             )
         if state_dependent_std:
             raise ValueError("HybridActorCritic does not support state-dependent parameter std")
+        if not 0.0 < float(min_parameter_std) <= float(max_parameter_std):
+            raise ValueError("parameter std bounds must satisfy 0 < min <= max")
+        if float(skill_entropy_scale) < 0.0 or float(parameter_entropy_scale) < 0.0:
+            raise ValueError("entropy scales must be non-negative")
 
         self.obs_groups = obs_groups
         num_actor_obs = sum(obs[name].shape[-1] for name in obs_groups["policy"])
@@ -89,6 +97,10 @@ class HybridActorCritic(nn.Module):
             else nn.Identity()
         )
         self.noise_std_type = str(noise_std_type)
+        self.min_parameter_std = float(min_parameter_std)
+        self.max_parameter_std = float(max_parameter_std)
+        self.skill_entropy_scale = float(skill_entropy_scale)
+        self.parameter_entropy_scale = float(parameter_entropy_scale)
         if self.noise_std_type == "scalar":
             self.std = nn.Parameter(float(init_noise_std) * torch.ones(NUM_SKILL_PARAMETERS))
         elif self.noise_std_type == "log":
@@ -119,8 +131,12 @@ class HybridActorCritic(nn.Module):
 
     def _parameter_std(self, mean: torch.Tensor) -> torch.Tensor:
         if self.noise_std_type == "scalar":
-            return self.std.abs().clamp_min(1.0e-4).expand_as(mean)
-        return torch.exp(self.log_std).expand_as(mean)
+            raw_std = self.std.abs()
+        else:
+            raw_std = torch.exp(self.log_std)
+        # Keep exploration in the command range where tanh is informative;
+        # otherwise entropy optimization drives parameters into saturation.
+        return raw_std.clamp(self.min_parameter_std, self.max_parameter_std).expand_as(mean)
 
     def update_distribution(self, actor_obs: torch.Tensor) -> None:
         output = self.actor(actor_obs)
@@ -178,7 +194,20 @@ class HybridActorCritic(nn.Module):
     @property
     def entropy(self) -> torch.Tensor:
         skill_distribution, parameter_distribution = self._require_distribution()
-        return skill_distribution.entropy() + parameter_distribution.entropy().sum(dim=-1)
+        return (
+            self.skill_entropy_scale * skill_distribution.entropy()
+            + self.parameter_entropy_scale * parameter_distribution.entropy().sum(dim=-1)
+        )
+
+    @property
+    def skill_entropy(self) -> torch.Tensor:
+        skill_distribution, _ = self._require_distribution()
+        return skill_distribution.entropy()
+
+    @property
+    def parameter_entropy(self) -> torch.Tensor:
+        _, parameter_distribution = self._require_distribution()
+        return parameter_distribution.entropy().sum(dim=-1)
 
     def update_normalization(self, obs) -> None:
         if self.actor_obs_normalization:
@@ -196,6 +225,12 @@ class HybridActorCritic(nn.Module):
             value = state_dict.get(key)
             if value is not None and value.numel() == NUM_SKILLS + NUM_SKILL_PARAMETERS:
                 state_dict[key] = value[-NUM_SKILL_PARAMETERS:]
+        # Permit deterministic evaluation of older scalar-std checkpoints
+        # after the new training config switches to log-std parameterization.
+        if self.noise_std_type == "log" and "std" in state_dict and "log_std" not in state_dict:
+            state_dict["log_std"] = state_dict.pop("std").abs().clamp_min(1.0e-6).log()
+        elif self.noise_std_type == "scalar" and "log_std" in state_dict and "std" not in state_dict:
+            state_dict["std"] = state_dict.pop("log_std").exp()
         super().load_state_dict(state_dict, strict=strict)
         return True
 

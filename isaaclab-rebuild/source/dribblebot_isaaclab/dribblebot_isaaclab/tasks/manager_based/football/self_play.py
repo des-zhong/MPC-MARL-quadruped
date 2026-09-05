@@ -86,6 +86,11 @@ class MatchSelfPlayWrapper(gym.Wrapper):
         )
         self._cached: dict[str, torch.Tensor] | None = None
         self._last_team_actions = torch.zeros(self.num_envs, self.num_actions, device=self.device)
+        self._requested_skill_counts = torch.zeros(self.match_count, 3, dtype=torch.long, device=self.device)
+        self._executed_skill_counts = torch.zeros_like(self._requested_skill_counts)
+        self._fallback_count = torch.zeros(self.match_count, dtype=torch.long, device=self.device)
+        self._invalid_count = torch.zeros_like(self._fallback_count)
+        self._action_count = torch.zeros(self.match_count, dtype=torch.long, device=self.device)
 
     @property
     def cfg(self):
@@ -175,6 +180,11 @@ class MatchSelfPlayWrapper(gym.Wrapper):
         observation, info = self.env.reset(**kwargs)
         self._history.zero_()
         self._last_team_actions.zero_()
+        self._requested_skill_counts.zero_()
+        self._executed_skill_counts.zero_()
+        self._fallback_count.zero_()
+        self._invalid_count.zero_()
+        self._action_count.zero_()
         self._sample_opponent_assignments()
         if self.opponent_action_provider is not None and hasattr(self.opponent_action_provider, "reset"):
             self.opponent_action_provider.reset()
@@ -206,6 +216,33 @@ class MatchSelfPlayWrapper(gym.Wrapper):
             term.preserve_external_actions = preserve_provider and slot >= self.team_size
         observation, rewards, terminated, truncated, info = self.env.step(joint_actions)
         done = terminated | truncated
+        # Track the requested skill separately from the skill actually routed
+        # to a frozen low-level policy. Geometric/role-aware fallback can
+        # rewrite dribble/shoot requests and otherwise hides credit issues.
+        terms = [self.env.env.action_manager.get_term(f"skill_policy_{slot}") for slot in range(self.team_size)]
+        requested = torch.stack([term.requested_skill_ids for term in terms], dim=1)
+        executed = torch.stack([term.skill_ids for term in terms], dim=1)
+        invalid = torch.stack([term.invalid_skill_mask for term in terms], dim=1)
+        for skill_id in range(3):
+            self._requested_skill_counts[:, skill_id] += (requested == skill_id).sum(dim=1)
+            self._executed_skill_counts[:, skill_id] += (executed == skill_id).sum(dim=1)
+        self._fallback_count += (requested != executed).sum(dim=1)
+        self._invalid_count += invalid.sum(dim=1)
+        self._action_count += self.team_size
+        if torch.any(done):
+            done_ids = done.nonzero(as_tuple=False).flatten()
+            log = info.setdefault("log", {})
+            denominator = self._action_count[done_ids].clamp_min(1).float()
+            for prefix, counts in (("requested", self._requested_skill_counts), ("executed", self._executed_skill_counts)):
+                for skill_id, name in enumerate(("walk", "dribble", "shoot")):
+                    log[f"Episode_Action/{prefix}_{name}"] = (counts[done_ids, skill_id].float() / denominator).mean()
+            log["Episode_Action/fallback_rate"] = (self._fallback_count[done_ids].float() / denominator).mean()
+            log["Episode_Action/invalid_rate"] = (self._invalid_count[done_ids].float() / denominator).mean()
+            self._requested_skill_counts[done_ids] = 0
+            self._executed_skill_counts[done_ids] = 0
+            self._fallback_count[done_ids] = 0
+            self._invalid_count[done_ids] = 0
+            self._action_count[done_ids] = 0
         self._sample_opponent_assignments(done)
         if self.opponent_action_provider is not None and hasattr(self.opponent_action_provider, "reset"):
             self.opponent_action_provider.reset(done.nonzero(as_tuple=False).flatten())

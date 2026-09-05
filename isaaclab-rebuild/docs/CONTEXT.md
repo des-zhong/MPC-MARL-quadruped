@@ -144,6 +144,18 @@ manager-based 结构如下：
   agent 4D tensor transport、Categorical skill 和三维 Gaussian parameters。RTX4090
   contract smoke 与一次 PPO optimizer update 已通过，日志位于
   `logs/rsl_rl/dribblebot_as2_match_self_play/2026-09-02_01-28-47_hybrid_action_smoke_20260902/`。
+- 已增加 `train_self_play_eval.sh` 分段训练/eval 编排和 `play_self_play.py` 的
+  `--metrics_output`/`--video_output` 接口；eval 在训练 chunk 完整退出后单独启动，避免
+  两个 Isaac Sim/OmniClient 进程同时抢占 GPU 资源。视频模式使用独立 TiledCamera、USD
+  同步和非渲染 reset；RTX4090 上已验证可生成有效 H.264 MP4。
+- 新的 reward-rebalanced run（`reward_rebalanced_marl_v2_20260903`）从零开始，不恢复旧
+  optimizer：goal/timeout、位置进展、time pressure 和“只惩罚拥挤”的 spacing 已启用；
+  hybrid PPO 的参数 std 限制在 `[0.15, 0.6]`，entropy bonus 只作用于 categorical
+  skill，并单独记录 skill/parameter entropy、
+  requested/executed/fallback action 统计。
+- 该 run 的指标表明固定难度仍会把策略推向高风险追球（摔倒/出界上升），因此新增
+  `AS2MatchCurriculumCfg`：按约 500/2000 PPO iteration 分三阶段调整 near-ball 起点、
+  场地范围、终止惩罚和 shoot/goal shaping；PLAY 配置关闭 curriculum，保持固定布局。
 
 主要证据：
 
@@ -162,7 +174,7 @@ manager-based 结构如下：
 - 2026-09-01 最终 pool GPU restore gate 受到宿主机 inotify/OmniClient 资源耗尽导致的
   Isaac Sim native crash 干扰；payload 写入和 actor-only/legacy state 重建已分别验证。
 - world-model collector/MPC 的 live end-to-end 接入尚未完成。
-- command curriculum 尚未完全迁移。
+- velocity command curriculum 尚未迁移；match reset/reward curriculum 已接入。
 - URDF 仍是当前运行资产来源，版本化 USD asset package 尚未完成。
 - Isaac Gym Preview 4 的 Torch 1.10/cu113 runtime 在 RTX 4090 上触发 NVRTC `sm_89` 不兼容，因此不能直接用该机器完成新的 Gym-vs-Lab behavior 结论。
 - 最近的可视化尝试可以初始化 Isaac Sim、RTX 4090、四机器人 scene 和所有 manager，但 viewport RGB frame 没有成功写入有效 MP4；视频 capture seam 仍需单独修复，不能把该次尝试当作视频验收通过。

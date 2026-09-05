@@ -24,10 +24,21 @@ parser.add_argument(
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--run_name", default="")
 parser.add_argument(
+    "--log_dir",
+    type=Path,
+    default=None,
+    help="Optional fixed run directory, used by segmented train/eval orchestration.",
+)
+parser.add_argument(
     "--resume_checkpoint",
     type=Path,
     default=None,
     help="Resume actor, optimizer, and iteration state from an RSL-RL model_*.pt checkpoint.",
+)
+parser.add_argument(
+    "--resume_next_iteration",
+    action="store_true",
+    help="Continue after the checkpoint's named iteration; used by segmented train/eval runs.",
 )
 parser.add_argument("--opponent_checkpoint_root", default=None)
 parser.add_argument("--opponent_policy_device", default="cpu")
@@ -97,12 +108,16 @@ def main() -> None:
     env_cfg.opponent_pool_size = args_cli.opponent_pool_size
     env_cfg.opponent_latest_probability = args_cli.opponent_latest_probability
 
-    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    if agent_cfg.run_name:
-        stamp = f"{stamp}_{agent_cfg.run_name}"
     project_root = Path(__file__).resolve().parents[1]
-    log_dir = project_root / "logs" / "rsl_rl" / agent_cfg.experiment_name / stamp
-    log_dir.mkdir(parents=True, exist_ok=False)
+    if args_cli.log_dir is None:
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        if agent_cfg.run_name:
+            stamp = f"{stamp}_{agent_cfg.run_name}"
+        log_dir = project_root / "logs" / "rsl_rl" / agent_cfg.experiment_name / stamp
+        log_dir.mkdir(parents=True, exist_ok=False)
+    else:
+        log_dir = args_cli.log_dir.expanduser().resolve()
+        log_dir.mkdir(parents=True, exist_ok=True)
     env_cfg.log_dir = str(log_dir)
 
     _stage(f"创建四机环境（physical matches={env_cfg.scene.num_envs}）")
@@ -146,6 +161,8 @@ def main() -> None:
                 "and cannot resume the hybrid PPO optimizer."
             )
         checkpoint_infos = runner.load(str(checkpoint), load_optimizer=True, map_location=agent_cfg.device)
+        if args_cli.resume_next_iteration:
+            runner.current_learning_iteration += 1
         _stage(f"已恢复 checkpoint={checkpoint.name}, iteration={runner.current_learning_iteration}")
     _stage("安装 opponent snapshot schedule")
     runner.add_git_repo_to_log(__file__)

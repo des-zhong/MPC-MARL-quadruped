@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import isaaclab.sim as sim_utils
 from isaaclab.envs import mdp as env_mdp
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -258,7 +259,9 @@ class AS2MatchEventsCfg:
             "ball_x_range": (-3.2, 2.8),
             "ball_y_range": (-1.7, 1.7),
             "min_clearance": 0.75,
-            "near_ball_probability": 0.4,
+            # Increase valid dribble/shoot exposure during from-scratch MARL
+            # training without removing full-field randomized starts.
+            "near_ball_probability": 0.65,
             "near_ball_distance_range": (0.4, 0.95),
             "near_ball_angle_range": (-0.35, 0.35),
         },
@@ -309,22 +312,35 @@ class AS2MatchEventsCfg:
 class AS2MatchRewardsCfg:
     # IsaacLab multiplies these weights by the 0.02 s manager step, matching
     # the current Isaac Gym high-level reward scaling convention.
-    goal = RewTerm(func=mdp.match_goal_event, weight=500.0)
-    accidental_termination = RewTerm(func=mdp.match_accidental_termination_event, weight=-200.0)
-    ball_goal_progress = RewTerm(func=mdp.match_ball_goal_progress, weight=2.0)
+    # Terminal outcome must dominate the dense shaping accumulated during a
+    # 30-second episode; the old 500 weight admitted a safe-timeout optimum.
+    goal = RewTerm(func=mdp.match_goal_event, weight=3000.0)
+    accidental_termination = RewTerm(func=mdp.match_accidental_termination_event, weight=-180.0)
+    timeout = RewTerm(func=mdp.match_timeout_event, weight=-180.0)
+    time_pressure = RewTerm(func=mdp.match_time_pressure, weight=0.3)
+    ball_goal_progress = RewTerm(func=mdp.match_ball_goal_progress, weight=1.0)
+    ball_position_progress = RewTerm(func=mdp.MatchBallGoalProgressDelta, weight=6.0)
     robot_spacing = RewTerm(
         func=mdp.match_robot_spacing,
-        weight=0.75,
+        weight=-0.5,
         params={"robot_names": ROBOT_NAMES},
     )
     robot_collision = RewTerm(
         func=mdp.match_robot_collision,
-        weight=-2.0,
+        weight=-1.5,
         params={"robot_names": ROBOT_NAMES, "collision_distance": 0.65, "lookahead": 0.25},
     )
     invalid_skill = RewTerm(
         func=mdp.match_invalid_skill,
-        weight=-3.0,
+        # Fallback and per-role credit already penalize an invalid request.
+        # Keep this term diagnostic/guiding rather than large enough to force
+        # the categorical policy into an all-walk local optimum.
+        weight=-0.5,
+        params={"action_names": ("skill_policy_0", "skill_policy_1")},
+    )
+    aggressive_command = RewTerm(
+        func=mdp.match_aggressive_command,
+        weight=-1.0,
         params={"action_names": ("skill_policy_0", "skill_policy_1")},
     )
     pass_ball = RewTerm(
@@ -337,7 +353,7 @@ class AS2MatchRewardsCfg:
     )
     approach_ball = RewTerm(
         func=mdp.match_approach_ball,
-        weight=1.0,
+        weight=0.75,
         params={
             "robot_names": TEAM_0_NAMES,
             "action_names": ("skill_policy_0", "skill_policy_1"),
@@ -345,7 +361,7 @@ class AS2MatchRewardsCfg:
     )
     walk_command_alignment = RewTerm(
         func=mdp.match_walk_command_alignment,
-        weight=0.5,
+        weight=0.2,
         params={
             "robot_names": TEAM_0_NAMES,
             "action_names": ("skill_policy_0", "skill_policy_1"),
@@ -353,7 +369,7 @@ class AS2MatchRewardsCfg:
     )
     face_ball_while_approaching = RewTerm(
         func=mdp.match_face_ball_while_approaching,
-        weight=0.5,
+        weight=0.1,
         params={
             "robot_names": TEAM_0_NAMES,
             "action_names": ("skill_policy_0", "skill_policy_1"),
@@ -363,7 +379,7 @@ class AS2MatchRewardsCfg:
     )
     face_goal_while_moving = RewTerm(
         func=mdp.match_face_goal_while_moving,
-        weight=0.75,
+        weight=0.4,
         params={
             "robot_names": TEAM_0_NAMES,
             "action_names": ("skill_policy_0", "skill_policy_1"),
@@ -373,7 +389,7 @@ class AS2MatchRewardsCfg:
     )
     dribble_ball_control = RewTerm(
         func=mdp.match_dribble_ball_control,
-        weight=2.0,
+        weight=3.5,
         params={
             "robot_names": TEAM_0_NAMES,
             "action_names": ("skill_policy_0", "skill_policy_1"),
@@ -381,7 +397,7 @@ class AS2MatchRewardsCfg:
     )
     shoot_setup = RewTerm(
         func=mdp.match_shoot_setup,
-        weight=5.0,
+        weight=14.0,
         params={
             "robot_names": TEAM_0_NAMES,
             "action_names": ("skill_policy_0", "skill_policy_1"),
@@ -389,7 +405,7 @@ class AS2MatchRewardsCfg:
     )
     shoot_launch = RewTerm(
         func=mdp.MatchShootLaunchReward,
-        weight=10.0,
+        weight=30.0,
         params={
             "robot_names": TEAM_0_NAMES,
             "action_names": ("skill_policy_0", "skill_policy_1"),
@@ -425,6 +441,21 @@ class AS2MatchTerminationsCfg:
 
 
 @configclass
+class AS2MatchCurriculumCfg:
+    """Difficulty schedule for from-scratch coordinator training."""
+
+    training_difficulty = CurrTerm(
+        func=mdp.match_training_curriculum,
+        params={
+            # At 128 matches and a 10-step macro action, these correspond to
+            # roughly 500 and 2,000 PPO iterations respectively.
+            "warmup_steps": 120_000,
+            "expansion_steps": 480_000,
+        },
+    )
+
+
+@configclass
 class AS2MatchRecordersCfg(RecorderManagerBaseCfg):
     """Keep canonical snapshots in memory for collectors by default."""
 
@@ -442,7 +473,7 @@ class AS2MatchFlatEnvCfg(ManagerBasedRLEnvCfg):
     rewards: AS2MatchRewardsCfg = AS2MatchRewardsCfg()
     terminations: AS2MatchTerminationsCfg = AS2MatchTerminationsCfg()
     recorders: AS2MatchRecordersCfg = AS2MatchRecordersCfg()
-    curriculum = None
+    curriculum: AS2MatchCurriculumCfg = AS2MatchCurriculumCfg()
     episode_length_s: float = 30.0
     decimation: int = 4
     macro_control_interval: int = 10
@@ -476,3 +507,6 @@ class AS2MatchFlatEnvCfg_PLAY(AS2MatchFlatEnvCfg):
         super().__post_init__()
         self.scene.num_envs = 2
         self.events.reset_match.params["randomize"] = False
+        # Evaluation always uses the mature objective; training curricula are
+        # driven by optimizer-time steps and must not alter fixed PLAY resets.
+        self.curriculum = None

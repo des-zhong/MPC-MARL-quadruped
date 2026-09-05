@@ -337,24 +337,28 @@ walk command 保持 body-frame，dribble/shoot 平面 command 在送入 action t
 
 ### 5.2 Reward
 
-match 已同步当前 Isaac Gym 上层 MARL 进攻链路中的主要 team-level terms（14 项）：
+match 使用 18 个 team-level terms；reward 权重和 reset 分布按训练阶段动态调度：
 
 | term | raw value | weight |
 |---|---|---:|
-| `goal` | 学习队进球事件 | `+500.0` |
-| `accidental_termination` | 对手进球、球出界或机器人跌倒 | `-200.0` |
-| `ball_goal_progress` | 球速在对方球门方向的投影，clip 到 `[-1,1]` | `+2.0` |
-| `robot_spacing` | 有效队友间距，拥挤和 support 抢球为负 | `+0.75` |
-| `robot_collision` | 当前/未来 0.25 s 内、0.65 m 阈值的最坏 pair overlap² | `-2.0` |
-| `invalid_skill` | 学习队任一机器人请求非法 skill | `-3.0` |
+| `goal` | 学习队进球事件 | `+3000.0`（成熟阶段） |
+| `accidental_termination` | 对手进球、球出界或机器人跌倒 | `-180.0`（成熟阶段） |
+| `timeout` | 到达时间上限的终止惩罚 | `-180.0`（成熟阶段） |
+| `time_pressure` | 随 episode 时间增加的轻微惩罚 | `+0.3`（函数为负） |
+| `ball_goal_progress` | 球速在对方球门方向的投影，clip 到 `[-1,1]` | `+1.0` |
+| `ball_position_progress` | reset-safe 的球位置增量（朝球门方向） | `+6.0` |
+| `robot_spacing` | 仅惩罚队友重叠和 support 抢球 | `-0.5`（成熟阶段） |
+| `robot_collision` | 当前/未来 0.25 s 内、0.65 m 阈值的最坏 pair overlap² | `-1.5`（成熟阶段） |
+| `invalid_skill` | 学习队任一机器人请求非法 skill（fallback/local credit 已另行处理） | `-0.5`（成熟阶段） |
+| `aggressive_command` | walk/dribble 超出稳定速度上限 | `-1.0`（成熟阶段） |
 | `pass_ball` | shoot 后球朝可接应队友运动 | `+2.0` |
-| `approach_ball` | attacker 使用 walk 时朝球的速度投影 | `+1.0` |
-| `walk_command_alignment` | attacker walk command 与球方向一致性 | `+0.5` |
-| `face_ball_while_approaching` | attacker 行走时朝向足球，且按命令速度门控 | `+0.5` |
-| `face_goal_while_moving` | attacker 同时朝球门方向和机身前向移动 | `+0.75` |
-| `dribble_ball_control` | 近球 dribble 时球速与 field command 一致性 | `+2.0` |
-| `shoot_setup` | 近球 shoot 时机器人—球—球门对齐 | `+5.0` |
-| `shoot_launch` | 有效 shoot 使球沿 command 突增到发射速度 | `+10.0` |
+| `approach_ball` | attacker 使用 walk 时朝球的速度投影 | `+0.75` |
+| `walk_command_alignment` | attacker walk command 与球方向一致性 | `+0.2` |
+| `face_ball_while_approaching` | attacker 实际朝球运动且面向足球 | `+0.1` |
+| `face_goal_while_moving` | attacker 同时朝球门方向和机身前向移动 | `+0.5` |
+| `dribble_ball_control` | 近球 dribble 且球速朝向球门 | `+3.5` |
+| `shoot_setup` | 近球 shoot 时机器人—球—球门对齐 | `+14.0` |
+| `shoot_launch` | 有效 shoot 使球沿 command 突增到发射速度 | `+30.0` |
 
 IsaacLab `RewardManager` 会再乘 manager step `dt=0.02`：
 
@@ -365,6 +369,17 @@ r_t = 0.02 * sum(weight_i * term_i)
 每个 macro step 累加最多 10 个低层 reward，self-play 再把 match-level reward 复制
 给学习队两个 agent。attacker/support local credit 会再按 agent 单独叠加；pass 和
 shoot-launch 已同步，其中 launch term 持有 reset-safe 的前一拍球速/距离状态。
+
+Curriculum 分三个阶段：前约 500 个 PPO iteration 只在较小场地、我方近球起点和较轻
+终止惩罚下学习稳定控球；约 500–2000 iteration 扩大起始分布并增加 shoot/goal 权重；
+之后使用完整随机场地和成熟 reward。每次 reset 会写入
+`Curriculum/training_difficulty/{phase,near_ball_probability,difficulty}`。
+Hybrid PPO 的连续参数 std 被限制在 `[0.15,0.6]`；entropy bonus 只用于 categorical
+skill，避免上一轮出现参数噪声变大、随后 skill entropy 塌缩的现象。
+
+训练同时记录 `Episode_Action/requested_*`、`Episode_Action/executed_*`、
+`Episode_Action/fallback_rate` 和 `Episode_Action/invalid_rate`，用于确认策略是否
+真的选择了 dribble/shoot，而不是被几何 fallback 改写。
 
 低层 walk/dribble/shoot 任务中的 locomotion reward 不会自动继承到 match；低层
 policy 在 match 中是冻结推理模块。
@@ -379,8 +394,9 @@ policy 在 match 中是冻结推理模块。
 
 训练 reset 使用 8 m × 5 m 球场内的随机布局：学习队在 `x∈[-3.4,0]`，对手在
 `x∈[0,3.4]`，所有机器人 `y∈[-1.9,1.9]`、yaw 为 `[-π,π]`，机器人和球默认保持
-0.75 m clearance；球范围为 `x∈[-3.2,2.8]`、`y∈[-1.7,1.7]`，40% reset 会把球
-放到随机一台机器人前方 0.4–0.95 m。PLAY 配置仍使用固定的
+0.75 m clearance；成熟阶段球范围为 `x∈[-3.2,2.8]`、`y∈[-1.7,1.7]`。
+near-ball reset 比例按 curriculum 从 90%（仅我方）降到 70%（仅我方），最后为
+50%（双方机器人）。PLAY 配置仍使用固定的
 `(-1,±0.65)` / `(+1,±0.65)` 布局，便于复现和录制。
 
 场地外围包含 6 段 0.5 m 高碰撞墙，两端在 `|y|≤1.0` 留球门开口；两侧有白色
@@ -393,7 +409,8 @@ reset 同时清零 root velocity、关节
 
 ### 6.0 一键训练脚本
 
-默认使用 8 个并行 match、24-step rollout、5000 iterations 和 `cuda:0`：
+默认使用 128 个并行 match（256 个学习 agent 样本）、24-step rollout、
+5000 iterations 和 `cuda:0`：
 
 ```bash
 ./isaaclab-rebuild/train_self_play.sh
@@ -422,7 +439,53 @@ DEVICE=cuda:1 DRY_RUN=1 ./isaaclab-rebuild/train_self_play.sh
 和 `DRIBBLEBOT_BALL_SKILL_COMMAND_FRAME`。
 额外 CLI 参数会原样追加到 Python 训练入口。
 
-### 6.1 GUI 训练 smoke（推荐先运行）
+### 6.1 定期 eval 与视频
+
+推荐使用分段编排脚本。它每训练 `EVAL_INTERVAL` 个 iteration 就关闭训练用的
+Isaac Sim，启动独立的评估仿真，保存 JSON 指标和 MP4，然后从 checkpoint 继续；
+这样不会同时运行两个 Kit/PhysX 进程。
+
+```bash
+EVAL_INTERVAL=500 \
+EVAL_EPISODES=1 \
+EVAL_OPPONENT=self \
+EVAL_VIDEO=1 \
+MAX_ITERATIONS=5000 \
+RUN_NAME=hybrid_marl_eval \
+./isaaclab-rebuild/train_self_play_eval.sh
+```
+
+产物位于：
+
+```text
+isaaclab-rebuild/logs/rsl_rl/dribblebot_as2_match_self_play/<RUN_NAME>/
+├── model_*.pt
+└── eval/
+    ├── iter_499.json
+    ├── iter_499.mp4
+    └── ...
+```
+
+`Eval/mean_return`、`Eval/mean_length` 和 walk/dribble/shoot 选择比例会写入同一
+TensorBoard run。`EVAL_VIDEO=0` 可只保存指标；评估默认只使用 1 个 match，避免
+视频渲染显著拖慢训练。
+
+评估脚本的 `--video_output` 会创建独立的场景相机并写出 H.264 MP4（不依赖 Kit
+viewport）。例如只评估已有 checkpoint：
+
+```bash
+$ISAAC_PY isaaclab-rebuild/scripts/play_self_play.py \
+  --checkpoint /absolute/path/to/model_499.pt \
+  --episodes 1 --num_envs 1 --opponent self --headless \
+  --video_output isaaclab-rebuild/outputs/videos/eval-499.mp4 \
+  --metrics_output isaaclab-rebuild/outputs/videos/eval-499.json
+```
+
+视频评估会自动使用 USD 同步模式和非渲染 reset；在无 X display 的服务器上也可运行，
+但每次评估会比纯 metrics 模式慢一些。周期性流程会在每个 checkpoint 下生成
+`eval/iter_<N>.mp4` 与同名 JSON。
+
+### 6.2 GUI 训练 smoke（推荐先运行）
 
 GUI 模式不要传 `--headless`。先使用 1 个 match、20 个 iteration 验证训练链路：
 
@@ -464,7 +527,7 @@ $ISAAC_PY isaaclab-rebuild/scripts/train_self_play.py \
 
 GUI 会降低吞吐率；正式吞吐训练建议使用 `--headless --num_envs 128`。
 
-### 6.2 使用已有 high-level opponent checkpoint
+### 6.3 使用已有 high-level opponent checkpoint
 
 低层三技能路径由 `DRIBBLEBOT_CHECKPOINT_ROOT` 控制；对手 coordinator 使用单独
 的 `--opponent_checkpoint_root`，它应直接指向 `high_level/`：
@@ -524,7 +587,7 @@ $ISAAC_PY isaaclab-rebuild/scripts/train_self_play.py \
   --resume_checkpoint /absolute/path/to/model_500.pt
 ```
 
-### 6.3 TensorBoard
+### 6.4 TensorBoard
 
 训练日志默认写到：
 
@@ -542,7 +605,7 @@ isaaclab-rebuild/logs/rsl_rl/dribblebot_as2_match_self_play/
 
 浏览器打开 `http://localhost:6006`。runner 默认每 50 iteration 保存一次模型。
 
-### 6.4 单机器人三技能 inference smoke
+### 6.5 单机器人三技能 inference smoke
 
 这个环境验证三个低层 ckpt 的加载、路由和 12D joint target，不是 coordinator PPO
 训练任务：
@@ -553,7 +616,7 @@ $ISAAC_PY isaaclab-rebuild/scripts/random_agent.py \
   --device cuda:0 --steps 200 --headless
 ```
 
-### 6.5 可视化训练 checkpoint
+### 6.6 可视化训练 checkpoint
 
 默认自动加载最近修改的 `model_*.pt`，在 Isaac Sim GUI 中观看 3 个 episode；
 学习队和对手使用同一个冻结 checkpoint：

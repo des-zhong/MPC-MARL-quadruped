@@ -35,10 +35,10 @@ transport does not turn the skill index into a Gaussian action.
 | `BaseTask.create_sim/_create_envs` | `InteractiveSceneCfg` | AS2, plane and ball implemented |
 | `_compute_torques` | `ActionManager` + `IdealPDActuatorCfg` | Legacy PD law and static effort clipping implemented |
 | custom `Sensor` classes | `ObservationManager` terms | Core terms plus exact 72D/75D legacy groups implemented |
-| `SoccerRewards` method discovery | `RewardManager` terms | 14 upper-level MARL match terms implemented; low-level training rewards are non-blocking |
+| `SoccerRewards` method discovery | `RewardManager` terms | 18 upper-level MARL match terms plus staged weight schedule implemented; low-level training rewards are non-blocking |
 | `check_termination` | `TerminationManager` terms | ball limits and shooting phase state implemented |
 | `reset_idx` and randomizers | `EventManager` + custom command term | dribble reset and command-relative shooting reset implemented |
-| command curriculum | `CommandManager` / `CurriculumManager` | velocity and shooting commands implemented; curriculum pending |
+| command curriculum | `CommandManager` / `CurriculumManager` | staged match reset/reward curriculum implemented; velocity/gait curriculum pending |
 | named physics rollout export | `parity/` plus Gym/Lab recorder adapters | schema-v2 physics + policy observation matrix passes 4/4 |
 | `HistoryWrapper` | custom stateful observation term | 15-frame zero-padding and host rollout parity verified |
 | `HighLevelSkillWrapper` | frozen-policy action term plus skill router | single-AS2 smoke works; 10-tick behavior matrix passes |
@@ -100,6 +100,12 @@ Still required before claiming a learnable from-scratch MARL baseline:
 3. Run a fresh from-scratch MARL PPO baseline and inspect early learning signal, throughput,
    episode statistics, and reward-term distributions.
 4. Use longer opponent-pool/resume tests after the baseline is numerically stable.
+
+Periodic evaluation is provided by `train_self_play_eval.sh`. It deliberately
+segments training and starts a fresh evaluator after each chunk, writing
+`eval/iter_<k>.json` and (when enabled) `eval/iter_<k>.mp4`, plus `Eval/*`
+TensorBoard scalars. This is the supported path for in-training evaluation;
+launching a second Isaac Sim concurrently with PPO is not supported.
 
 The existing standing-pose/self-collision and randomized rolling/contact comparisons remain
 valuable regression diagnostics, but they do not block the first MARL training run unless they

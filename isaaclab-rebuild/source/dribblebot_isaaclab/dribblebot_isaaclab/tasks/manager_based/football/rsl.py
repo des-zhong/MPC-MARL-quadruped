@@ -25,6 +25,23 @@ class HybridOnPolicyRunner(OnPolicyRunner):
         rsl_on_policy_runner.HybridActorCritic = HybridActorCritic
         return super()._construct_algorithm(obs)
 
+    def log(self, locs: dict, width: int = 80, pad: int = 35):
+        """Add hybrid-action diagnostics to the stock RSL-RL log."""
+
+        super().log(locs, width=width, pad=pad)
+        policy = self.alg.policy
+        if self.writer is None or policy.skill_distribution is None:
+            return
+        step = locs["it"]
+        self.writer.add_scalar("Policy/skill_entropy", policy.skill_entropy.mean().item(), step)
+        self.writer.add_scalar("Policy/parameter_entropy", policy.parameter_entropy.mean().item(), step)
+        parameter_std = policy.parameter_distribution.stddev.mean(dim=0)
+        for index, name in enumerate(("x", "y", "yaw")):
+            self.writer.add_scalar(f"Policy/parameter_std/{name}", parameter_std[index].item(), step)
+        skill_probs = policy.skill_distribution.probs.mean(dim=0)
+        for index, name in enumerate(("walk", "dribble", "shoot")):
+            self.writer.add_scalar(f"Policy/skill_probability/{name}", skill_probs[index].item(), step)
+
 
 class FrozenRslRlOpponentPolicy:
     """Detached deterministic actor snapshot with the self-play callable API."""

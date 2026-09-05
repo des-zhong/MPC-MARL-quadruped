@@ -114,6 +114,184 @@ def match_ball_goal_progress(env: ManagerBasedRLEnv, goal_x: float = 4.0) -> tor
     return speed.clamp(-1.0, 1.0)
 
 
+class MatchBallGoalProgressDelta(ManagerTermBase):
+    """Dense, reset-safe reward for forward ball displacement.
+
+    Velocity-only shaping is almost zero when a kick is intermittent.  This
+    term measures the change in ball position over the manager step, so a
+    successful dribble or pass receives credit even after the ball slows down.
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.previous_ball_xy = env.scene["ball"].data.root_pos_w[:, :2].clone()
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        ids = slice(None) if env_ids is None else env_ids
+        self.previous_ball_xy[ids] = self._env.scene["ball"].data.root_pos_w[ids, :2]
+
+    def __call__(self, env: ManagerBasedRLEnv, scale: float = 0.05) -> torch.Tensor:
+        ball_xy = env.scene["ball"].data.root_pos_w[:, :2]
+        goal_direction = env.scene.env_origins[:, :2].clone()
+        goal_direction[:, 0] += 4.0
+        direction = goal_direction - ball_xy
+        direction /= torch.linalg.vector_norm(direction, dim=-1, keepdim=True).clamp_min(1.0e-6)
+        displacement = torch.sum((ball_xy - self.previous_ball_xy) * direction, dim=-1)
+        self.previous_ball_xy[:] = ball_xy
+        return (displacement / max(float(scale), 1.0e-6)).clamp(-1.0, 1.0)
+
+
+def match_time_pressure(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Small increasing penalty that makes timeout less attractive."""
+
+    fraction = env.episode_length_buf.float() / max(float(env.max_episode_length), 1.0)
+    return -fraction.clamp(0.0, 1.0)
+
+
+def match_timeout_event(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Terminal penalty signal for episodes that reach the time limit."""
+
+    return env.termination_manager.time_outs.float()
+
+
+def match_training_curriculum(
+    env: ManagerBasedRLEnv,
+    env_ids,
+    warmup_steps: int = 120_000,
+    expansion_steps: int = 480_000,
+) -> dict[str, float]:
+    """Progressively expose the full match after stable ball control emerges.
+
+    ``CurriculumManager`` calls this term before each reset.  The reset event
+    and reward manager keep their normal APIs; only their current parameters
+    are updated here.  The schedule is global (the simulator has one common
+    step counter), while ``env_ids`` remains part of the standard curriculum
+    signature.
+
+    Phase 0 presents mostly near-ball starts and mild terminal penalties.  In
+    phase 1 the start distribution and scoring objective expand.  Phase 2 is
+    the full randomized match objective.  This prevents the first updates
+    from learning a high-variance chase policy before the frozen dribble/shoot
+    skills have any chance to receive credit.
+    """
+
+    del env_ids
+    step = int(env.common_step_counter)
+    if step < int(warmup_steps):
+        phase = 0.0
+        near_ball_probability = 0.90
+        reset_params = {
+            "team_0_x_range": (-2.4, -0.2),
+            "team_1_x_range": (0.2, 2.4),
+            "robot_y_range": (-1.4, 1.4),
+            "ball_x_range": (-1.5, 1.5),
+            "ball_y_range": (-1.3, 1.3),
+            "near_ball_distance_range": (0.35, 0.75),
+            "near_ball_team": 0,
+            "min_clearance": 0.60,
+        }
+        weights = {
+            "goal": 1000.0,
+            "accidental_termination": -100.0,
+            "timeout": -50.0,
+            "time_pressure": 0.05,
+            "ball_goal_progress": 0.5,
+            "ball_position_progress": 10.0,
+            "robot_spacing": -0.25,
+            "robot_collision": -1.0,
+            "invalid_skill": -0.25,
+            "aggressive_command": -0.50,
+            "pass_ball": 1.0,
+            "approach_ball": 1.0,
+            "walk_command_alignment": 0.20,
+            "face_ball_while_approaching": 0.10,
+            "face_goal_while_moving": 0.25,
+            "dribble_ball_control": 5.0,
+            "shoot_setup": 8.0,
+            "shoot_launch": 15.0,
+        }
+    elif step < int(expansion_steps):
+        phase = 1.0
+        near_ball_probability = 0.70
+        reset_params = {
+            "team_0_x_range": (-3.0, 0.0),
+            "team_1_x_range": (0.0, 3.0),
+            "robot_y_range": (-1.7, 1.7),
+            "ball_x_range": (-2.6, 2.2),
+            "ball_y_range": (-1.6, 1.6),
+            "near_ball_distance_range": (0.40, 0.90),
+            "near_ball_team": 0,
+            "min_clearance": 0.70,
+        }
+        weights = {
+            "goal": 2200.0,
+            "accidental_termination": -150.0,
+            "timeout": -150.0,
+            "time_pressure": 0.20,
+            "ball_goal_progress": 0.75,
+            "ball_position_progress": 8.0,
+            "robot_spacing": -0.50,
+            "robot_collision": -1.50,
+            "invalid_skill": -0.40,
+            "aggressive_command": -0.75,
+            "pass_ball": 2.0,
+            "approach_ball": 0.75,
+            "walk_command_alignment": 0.20,
+            "face_ball_while_approaching": 0.10,
+            "face_goal_while_moving": 0.35,
+            "dribble_ball_control": 4.0,
+            "shoot_setup": 12.0,
+            "shoot_launch": 22.0,
+        }
+    else:
+        phase = 2.0
+        near_ball_probability = 0.50
+        reset_params = {
+            "team_0_x_range": (-3.4, 0.0),
+            "team_1_x_range": (0.0, 3.4),
+            "robot_y_range": (-1.9, 1.9),
+            "ball_x_range": (-3.2, 2.8),
+            "ball_y_range": (-1.7, 1.7),
+            "near_ball_distance_range": (0.40, 0.95),
+            "near_ball_team": None,
+            "min_clearance": 0.75,
+        }
+        weights = {
+            "goal": 3000.0,
+            "accidental_termination": -180.0,
+            "timeout": -180.0,
+            "time_pressure": 0.30,
+            "ball_goal_progress": 1.0,
+            "ball_position_progress": 6.0,
+            "robot_spacing": -0.50,
+            "robot_collision": -1.50,
+            "invalid_skill": -0.50,
+            "aggressive_command": -1.00,
+            "pass_ball": 2.0,
+            "approach_ball": 0.75,
+            "walk_command_alignment": 0.20,
+            "face_ball_while_approaching": 0.10,
+            "face_goal_while_moving": 0.40,
+            "dribble_ball_control": 3.5,
+            "shoot_setup": 14.0,
+            "shoot_launch": 30.0,
+        }
+
+    event_cfg = env.event_manager.get_term_cfg("reset_match")
+    event_cfg.params.update(reset_params)
+    event_cfg.params["near_ball_probability"] = near_ball_probability
+    env.event_manager.set_term_cfg("reset_match", event_cfg)
+    for term_name, weight in weights.items():
+        reward_cfg = env.reward_manager.get_term_cfg(term_name)
+        reward_cfg.weight = weight
+        env.reward_manager.set_term_cfg(term_name, reward_cfg)
+    return {
+        "phase": phase,
+        "near_ball_probability": near_ball_probability,
+        "difficulty": phase / 2.0,
+    }
+
+
 def match_robot_spacing(
     env: ManagerBasedRLEnv,
     robot_names: tuple[str, ...] = ("robot_0", "robot_1", "robot_2", "robot_3"),
@@ -121,14 +299,20 @@ def match_robot_spacing(
     target_spacing: float = 1.5,
     support_min_ball_distance: float = 1.15,
 ) -> torch.Tensor:
-    """Reward useful teammate spacing and penalize support-ball crowding."""
+    """Penalize teammate overlap and support-ball crowding.
+
+    A previous version continuously rewarded the target separation.  Since
+    that reward could be collected for the full 30-second episode without
+    touching the ball, it made safe timeouts more valuable than scoring.
+    Useful spacing is now the zero-penalty region instead of a reward source.
+    """
 
     team_names = robot_names[: len(robot_names) // 2]
     positions = torch.stack([env.scene[name].data.root_pos_w[:, :2] for name in team_names], dim=1)
     if positions.shape[1] < 2:
         return torch.zeros(env.num_envs, device=env.device)
     pair_distance = torch.linalg.vector_norm(positions[:, 0] - positions[:, 1], dim=-1)
-    useful = torch.exp(-torch.square((pair_distance - float(target_spacing)) / float(target_spacing)))
+    del target_spacing
     too_close = torch.clamp(float(min_spacing) - pair_distance, min=0.0) / float(min_spacing)
     ball_xy = env.scene["ball"].data.root_pos_w[:, None, :2]
     ball_distance = torch.linalg.vector_norm(positions - ball_xy, dim=-1)
@@ -143,7 +327,7 @@ def match_robot_spacing(
         min=0.0,
         max=1.0,
     )
-    return useful - 4.0 * too_close.square() - 2.0 * crowding
+    return 4.0 * too_close.square() + 2.0 * crowding
 
 
 def match_robot_collision(
@@ -182,6 +366,43 @@ def match_invalid_skill(
 ) -> torch.Tensor:
     masks = [env.action_manager.get_term(name).invalid_skill_mask for name in action_names]
     return torch.stack(masks, dim=1).float().sum(dim=1)
+
+
+def match_skill_switch(
+    env: ManagerBasedRLEnv,
+    action_names: tuple[str, ...] = ("skill_policy_0", "skill_policy_1"),
+) -> torch.Tensor:
+    """Count learning-team skill changes at the manager step."""
+
+    switches = [env.action_manager.get_term(name).skill_transition_mask for name in action_names]
+    return torch.stack(switches, dim=1).float().sum(dim=1)
+
+
+def match_aggressive_command(
+    env: ManagerBasedRLEnv,
+    action_names: tuple[str, ...] = ("skill_policy_0", "skill_policy_1"),
+    walk_speed_limit: float = 1.0,
+    dribble_speed_limit: float = 1.2,
+) -> torch.Tensor:
+    """Penalize excessive walk/dribble commands that destabilize the robot.
+
+    Shoot commands are excluded because their low-level policy intentionally
+    uses a larger planar command range for a brief strike.
+    """
+
+    penalties = []
+    for action_name in action_names:
+        term = env.action_manager.get_term(action_name)
+        speed = torch.linalg.vector_norm(term.skill_commands[:, :2], dim=-1)
+        limit = torch.where(
+            term.skill_ids == DRIBBLE_SKILL_ID,
+            torch.full_like(speed, float(dribble_speed_limit)),
+            torch.full_like(speed, float(walk_speed_limit)),
+        )
+        active = (term.skill_ids == WALK_SKILL_ID) | (term.skill_ids == DRIBBLE_SKILL_ID)
+        excess = ((speed - limit) / limit.clamp_min(1.0e-6)).clamp(0.0, 1.0)
+        penalties.append(excess.square() * active.float())
+    return torch.stack(penalties, dim=1).sum(dim=1)
 
 
 def match_approach_ball(
@@ -268,8 +489,8 @@ def match_face_ball_while_approaching(
             forward, dim=-1, keepdim=True
         ).clamp_min(1.0e-6)
         facing = torch.sum(forward * ball_direction, dim=-1).clamp(-1.0, 1.0)
-        command_speed = torch.linalg.vector_norm(term.skill_commands[:, :2], dim=-1)
-        activity = (command_speed / max(float(target_speed), 1.0e-6)).clamp(0.0, 1.0)
+        physical_approach = torch.sum(robot.data.root_lin_vel_w[:, :2] * ball_direction, dim=-1)
+        activity = (physical_approach / max(float(target_speed), 1.0e-6)).clamp(0.0, 1.0)
         distance = torch.linalg.vector_norm(ball_delta, dim=-1)
         active = (
             term.attacker_mask
@@ -335,6 +556,13 @@ def match_dribble_ball_control(
 ) -> torch.Tensor:
     ball = env.scene["ball"]
     ball_speed = torch.linalg.vector_norm(ball.data.root_lin_vel_w[:, :2], dim=-1)
+    goal = env.scene.env_origins[:, :2].clone()
+    goal[:, 0] += 4.0
+    goal_direction = goal - ball.data.root_pos_w[:, :2]
+    goal_direction /= torch.linalg.vector_norm(goal_direction, dim=-1, keepdim=True).clamp_min(1.0e-6)
+    goalward_alignment = torch.nn.functional.cosine_similarity(
+        ball.data.root_lin_vel_w[:, :2], goal_direction, dim=-1, eps=1.0e-6
+    ).clamp_min(0.0)
     scores = []
     active_masks = []
     for robot_name, action_name in zip(robot_names, action_names, strict=True):
@@ -342,9 +570,6 @@ def match_dribble_ball_control(
         distance = torch.linalg.vector_norm(
             ball.data.root_pos_w[:, :2] - env.scene[robot_name].data.root_pos_w[:, :2], dim=-1
         )
-        alignment = torch.nn.functional.cosine_similarity(
-            ball.data.root_lin_vel_w[:, :2], term.skill_commands[:, :2], dim=-1, eps=1.0e-6
-        ).clamp_min(0.0)
         speed_score = (ball_speed / float(target_ball_speed)).clamp(0.0, 1.0)
         active = (
             term.attacker_mask
@@ -353,7 +578,7 @@ def match_dribble_ball_control(
             & ~term.invalid_skill_mask
             & (distance <= float(control_distance))
         )
-        scores.append(alignment * speed_score)
+        scores.append(goalward_alignment * speed_score)
         active_masks.append(active)
     return _reduce_active_score(torch.stack(scores, dim=1), torch.stack(active_masks, dim=1))
 

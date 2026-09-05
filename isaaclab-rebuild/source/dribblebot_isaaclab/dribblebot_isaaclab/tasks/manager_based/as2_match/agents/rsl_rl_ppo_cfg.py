@@ -17,13 +17,21 @@ class AS2MatchSelfPlayPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     obs_groups = {"policy": ["policy"], "critic": ["critic"]}
     policy = RslRlPpoActorCriticCfg(
         class_name="HybridActorCritic",
-        init_noise_std=0.5,
+        init_noise_std=0.35,
+        noise_std_type="log",
         actor_obs_normalization=False,
         critic_obs_normalization=False,
         actor_hidden_dims=[512, 256, 128],
         critic_hidden_dims=[512, 256, 128],
         activation="elu",
     )
+    # Extra fields are consumed by the project HybridActorCritic constructor.
+    # Keep parameter exploration bounded and give categorical skill selection
+    # a stronger entropy signal than the three continuous command values.
+    policy.min_parameter_std = 0.15
+    policy.max_parameter_std = 0.6
+    policy.skill_entropy_scale = 1.0
+    policy.parameter_entropy_scale = 0.0
     algorithm = RslRlPpoAlgorithmCfg(
         value_loss_coef=1.0,
         use_clipped_value_loss=True,

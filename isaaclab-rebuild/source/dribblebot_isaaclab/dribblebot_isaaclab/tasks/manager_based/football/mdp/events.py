@@ -166,6 +166,7 @@ def reset_match_scene(
     near_ball_probability: float = 0.4,
     near_ball_distance_range: tuple[float, float] = (0.4, 0.95),
     near_ball_angle_range: tuple[float, float] = (-0.35, 0.35),
+    near_ball_team: int | None = None,
 ) -> None:
     """Reset a match using the current Isaac Gym randomized-start contract."""
 
@@ -179,6 +180,8 @@ def reset_match_scene(
     dtype = origins.dtype
     if not 0.0 <= float(near_ball_probability) <= 1.0:
         raise ValueError("near_ball_probability must be in [0, 1]")
+    if near_ball_team is not None and not 0 <= int(near_ball_team) < 2:
+        raise ValueError("near_ball_team must be 0, 1, or None")
     if float(min_clearance) < 0.0:
         raise ValueError("min_clearance must be non-negative")
 
@@ -242,10 +245,17 @@ def reset_match_scene(
                 origins[mask, :2], env.device, dtype
             ),
         )
+        near_robot_xy = robot_xy
+        near_robot_yaws = robot_yaws
+        if near_ball_team is not None:
+            start = int(near_ball_team) * int(team_size)
+            end = start + int(team_size)
+            near_robot_xy = robot_xy[start:end]
+            near_robot_yaws = robot_yaws[start:end]
         ball_xy = _apply_near_ball_reset(
             ball_xy,
-            robot_xy,
-            robot_yaws,
+            near_robot_xy,
+            near_robot_yaws,
             origins[:, :2],
             probability=float(near_ball_probability),
             distance_range=near_ball_distance_range,
