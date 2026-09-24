@@ -7,6 +7,12 @@ AC_Args:
     min_action_std: 0.05
     max_action_std: 0.3
     action_mean_bound: 2.0
+    hybrid_skill_policy: true
+    discrete_skill_direction_policy: false
+    skill_action_stride: 6
+    num_skill_logits: 3
+    num_direction_logits: 0
+    stop_skill_id: 3
     actor_hidden_dims:
     - 512
     - 256
@@ -30,7 +36,7 @@ PPO_Args:
     use_clipped_value_loss: true
     clip_param: 0.2
     entropy_coef: 0.001
-    num_learning_epochs: 2
+    num_learning_epochs: 5
     num_mini_batches: 4
     learning_rate: 0.0001
     adaptation_module_learning_rate: 0.0001
@@ -42,34 +48,41 @@ PPO_Args:
     max_grad_norm: 1.0
     min_learning_rate: 1.0e-05
     max_learning_rate: 0.0001
-    skill_entropy_coef: 0.02
+    skill_entropy_coef: 0.005
     skill_action_stride: 6
     num_skill_logits: 3
+    num_direction_logits: 0
+    stop_skill_id: 3
     stop_on_excessive_kl: true
     max_kl_factor: 4.0
+    max_log_ratio: 20.0
     selective_adaptation_module_loss: false
 RunnerArgs:
   desc: null
   value:
     algorithm_class_name: RMA
-    num_steps_per_env: 24
+    num_steps_per_env: 48
     max_iterations: 1500
     save_interval: 400
-    save_video_interval: 500
+    save_video_interval: 0
     log_freq: 10
-    checkpoint_dir: tmp/legged_data/high_level
+    checkpoint_dir: null
     resume: false
     load_run: -1
     checkpoint: -1
     resume_path: null
     resume_curriculum: true
     resume_checkpoint: tmp/legged_data/high_level/ac_weights_latest.pt
-    self_play_update_interval: 500
+    resume_policy_only: false
+    self_play_update_interval: 1200
+    skill_entropy_initial_coef: 0.005
+    skill_entropy_final_coef: 0.001
+    skill_entropy_anneal_iterations: 20000
 Cfg:
   desc: null
   value:
     env:
-      num_envs: 512
+      num_envs: 256
       num_observations: 3
       num_privileged_obs: 3
       num_actions: 48
@@ -77,7 +90,8 @@ Cfg:
       env_spacing: 10.0
       send_timeouts: true
       episode_length_s: 30.0
-      record_video: true
+      record_video: false
+      export_step_telemetry: false
       recording_width_px: 640
       recording_height_px: 640
       recording_mode: COLOR
@@ -93,10 +107,14 @@ Cfg:
       shooting_reset_yaw_error_range:
       - -0.6
       - 0.6
+      shooting_reset_world_yaw_range:
+      - -3.14159265
+      - 3.14159265
       shooting_reset_zero_velocities: true
       control_all_robots: true
       high_level_control: true
       high_level_control_interval: 10
+      high_level_joint_reset_noise: 0.0
       high_level_history_length: 4
       high_level_num_observations: 106
       high_level_num_actions: 24
@@ -116,9 +134,15 @@ Cfg:
       - 3.0
       - 3.0
       - 1.0
+      high_level_ball_xy_frame: team_canonical_field
       high_level_use_geometric_skill_fallback: true
+      high_level_role_aware_fallback: true
       num_robots: 4
       num_team_robots: 2
+      opponent_team_color:
+      - 0.85
+      - 0.1
+      - 0.1
       teammate_init_pos:
       - -1.0
       - 0.0
@@ -150,6 +174,13 @@ Cfg:
       field_length: 8.0
       field_width: 5.0
       field_margin: 0.35
+      add_boundary_walls: true
+      boundary_wall_thickness: 0.12
+      boundary_wall_height: 0.5
+      boundary_wall_offset: 0.05
+      boundary_wall_goal_opening_margin: 0.0
+      boundary_wall_friction: 0.35
+      boundary_wall_restitution: 0.85
       robot_init_x_range:
       - -3.4
       - 0.0
@@ -169,13 +200,13 @@ Cfg:
       - -3.14159265
       - 3.14159265
       ball_init_x_range:
-      - -3.2
-      - 2.8
+      - -3.0
+      - 0.0
       ball_init_y_range:
       - -1.7
       - 1.7
       match_init_min_clearance: 0.75
-      high_level_near_ball_init_probability: 0.6
+      high_level_near_ball_init_probability: 0.5
       high_level_near_ball_init_distance_range:
       - 0.4
       - 0.95
@@ -185,11 +216,23 @@ Cfg:
       team_goal_x: 4.0
       team_goal_half_width: 1.0
       high_level_camera_height: 9.6
-      add_field_markers: true
+      add_field_markers: false
       field_marker_width: 0.05
       field_marker_height: 0.035
+      add_goalposts: true
+      goalpost_asset_file: resources/objects/goalpost/goalpost.urdf
+      add_field_texture: true
+      field_texture_file: resources/textures/field.png
+      field_surface_asset_file: resources/objects/soccer_field/soccer_field.urdf
+      field_texture_length_scale: 1.0666667
+      field_texture_width_scale: 1.1067358
+      field_surface_thickness: 0.01
+      field_surface_offset: 0.002
       priv_observe_ball_drag: false
+      high_level_action_encoding: hybrid
+      high_level_discrete_command_fraction: 0.5
       high_level_action_input_clip: 10.0
+      high_level_collision_avoidance: false
       recording_horizontal_fov: 70.0
       opponent_init_x_range:
       - 0.0
@@ -200,6 +243,18 @@ Cfg:
       opponent_yaw_range:
       - -3.14159265
       - 3.14159265
+      high_level_near_ball_init_team: balanced
+      high_level_shooting_options: true
+      centralized_critic: true
+      attack_diagnostics: true
+      high_level_allow_near_ball_reposition: true
+      soccer_curriculum: true
+      curriculum_min_episodes: 512
+      curriculum_success_threshold: 0.35
+      curriculum_opponent_threshold: 0.1
+      curriculum_max_failure_rate: 0.25
+      curriculum_min_stage_updates: 300
+      curriculum_normal_threshold: 0.1
     robot:
       name: as2
     ball:
@@ -299,6 +354,7 @@ Cfg:
       max_yaw_curriculum: 1.0
       exclusive_command_sampling: false
       num_commands: 15
+      ball_xy_frame: body
       resampling_time: 1000000.0
       subsample_gait: false
       gait_interval_s: 10.0
@@ -490,7 +546,7 @@ Cfg:
       hip_scale_reduction: 0.5
       decimation: 4
     asset:
-      file: '{MINI_GYM_ROOT_DIR}/resources/robots/as2/urdf/as2.urdf'
+      file: /home/zhz/projects/dribblebot/resources/robots/as2/urdf/as2.urdf
       foot_name: foot
       penalize_contacts_on:
       - thigh
@@ -587,6 +643,12 @@ Cfg:
       only_positive_rewards_ji22_style: false
       sigma_rew_neg: 5
       reward_container_name: HighLevelRewards
+      unscaled_reward_names:
+      - high_level_goal
+      - high_level_opponent_goal
+      - high_level_accidental_termination
+      - high_level_shoot_setup
+      - high_level_shoot_launch
       tracking_sigma: 0.25
       tracking_sigma_lat: 0.25
       tracking_sigma_long: 0.25
@@ -643,26 +705,48 @@ Cfg:
       high_level_border_margin: 0.0
       high_level_min_robot_spacing: 0.65
       high_level_target_robot_spacing: 1.5
+      high_level_support_min_ball_distance: 1.15
+      high_level_support_depth: 0.5
+      high_level_support_lateral: 1.2
+      high_level_support_walk_speed: 0.75
+      high_level_support_command_deadband: 0.08
+      high_level_attacker_switch_margin: 0.0
+      high_level_robot_collision_distance: 0.7
+      high_level_robot_collision_lookahead: 0.25
+      high_level_robot_avoidance_distance: 0.55
+      high_level_robot_avoidance_lookahead: 0.25
+      high_level_robot_avoidance_speed: 0.5
       high_level_obstacle_safe_distance: 0.55
       high_level_dribble_skill_distance: 1.0
       high_level_dribble_control_distance: 0.8
       high_level_skill_command_min_speed: 0.2
+      high_level_skill_command_target_speed: 0.8
+      high_level_local_attacker_ball_skill_scale: 0.0
+      high_level_local_attacker_command_assist_scale: 0.0
+      high_level_local_role_conflict_scale: 0.0
+      high_level_local_support_ball_crowding_scale: 0.0
       high_level_dribble_min_ball_speed: 0.1
       high_level_dribble_target_ball_speed: 1.0
       high_level_shoot_skill_distance: 0.75
       high_level_shoot_min_forward: -0.1
       high_level_shoot_lateral_reach: 0.45
+      high_level_shoot_setup_min_behind_alignment: 0.3
       high_level_shoot_min_ball_speed: 0.8
       high_level_shoot_min_delta_speed: 0.25
       high_level_shoot_target_delta_speed: 1.5
       high_level_shoot_min_command_alignment: 0.6
       high_level_shoot_alignment: 0.35
       high_level_approach_walk_speed: 0.9
+      high_level_face_ball_min_closing_speed: 0.05
+      high_level_face_ball_target_closing_speed: 0.5
       constrict: false
       constrict_indices: []
       constrict_ranges:
       - []
       constrict_after: 0
+      high_level_shoot_setup_once_per_episode: true
+      high_level_goalward_launch: true
+      high_level_launch_event: true
       high_level_goal_facing_target_speed: 0.5
     reward_scales:
       termination: 0.0
@@ -729,20 +813,26 @@ Cfg:
       shooting_launch: 0.0
       shooting_success: 0.0
       shooting_failure: 0.0
-      high_level_goal: 500.0
-      high_level_accidental_termination: -200.0
+      high_level_goal: 75.0
+      high_level_opponent_goal: -75.0
+      high_level_accidental_termination: -5.0
       high_level_ball_goal_progress: 2.0
+      high_level_goalward_ball_velocity: 0.75
       high_level_possession: 0.0
       high_level_robot_spacing: 0.0
+      high_level_robot_collision: -2.0
       high_level_obstacle_clearance: 0.0
-      high_level_pass: 2.0
-      high_level_invalid_skill: -3.0
+      high_level_pass: 0.0
+      high_level_invalid_skill: -2.0
       high_level_approach_ball: 1.0
-      high_level_walk_command_alignment: 0.5
-      high_level_face_ball_while_approaching: 0.5
-      high_level_face_goal_while_moving: 0.75
-      high_level_dribble_ball_control: 2.0
-      high_level_shoot_launch: 10.0
+      high_level_walk_command_alignment: 0.0
+      high_level_face_ball_while_approaching: 0.0
+      high_level_face_goal_while_moving: 0.0
+      high_level_dribble_ball_control: 1.0
+      high_level_shoot_setup: 0.0
+      high_level_shoot_launch: 5.0
+      high_level_support_lane: -0.5
+      high_level_attack_position: 1.0
     normalization:
       clip_observations: 100.0
       clip_actions: 1.0
@@ -874,7 +964,7 @@ Cfg:
       up_axis: 1
       use_gpu_pipeline: true
       physx:
-        num_threads: 10
+        num_threads: 4
         solver_type: 1
         num_position_iterations: 4
         num_velocity_iterations: 0
@@ -943,107 +1033,137 @@ skill_runs:
     dribble: des_zhong/as2_dribbling/cp9m21ay
     shoot: des_zhong/as2_shooting/bve3isir
     checkpoint: latest
+high_level_action_encoding:
+  desc: null
+  value: hybrid
+high_level_discrete_command_fraction:
+  desc: null
+  value: null
+high_level_discrete_action_space:
+  desc: null
+  value: null
 skill_policy_source:
   desc: null
   value: local
 skill_source_locations:
   desc: null
   value:
-    walk: checkpoints/reproduction/walk
-    dribble: checkpoints/reproduction/dribble
-    shoot: checkpoints/reproduction/shoot
+    walk: /home/zhz/projects/dribblebot/checkpoints/reproduction/walk
+    dribble: /home/zhz/projects/dribblebot/checkpoints/reproduction/dribble
+    shoot: /home/zhz/projects/dribblebot/checkpoints/reproduction/shoot
 skill_policy_metadata:
   desc: null
   value:
     walk:
       run_path: null
-      checkpoint: '215200'
-      config_path: checkpoints/reproduction/walk/config.yaml
+      checkpoint: latest
+      config_path: /home/zhz/projects/dribblebot/checkpoints/reproduction/walk/config.yaml
       action_clip: 1.0
-      action_clip_source: config:checkpoints/reproduction/walk/config.yaml
+      action_clip_source: config:/home/zhz/projects/dribblebot/checkpoints/reproduction/walk/config.yaml
+      ball_xy_frame: null
+      ball_xy_frame_source: missing in config:/home/zhz/projects/dribblebot/checkpoints/reproduction/walk/config.yaml
       artifacts:
         body:
-          path: checkpoints/reproduction/walk/body_latest.jit
+          path: /home/zhz/projects/dribblebot/checkpoints/reproduction/walk/body_latest.jit
           size_bytes: 2894881
           sha256: 19110198eebd8937ccf2cc2417adbcd4ef46d0db376d0f2bba4cceb5a599f848
         adaptation_module:
-          path: checkpoints/reproduction/walk/adaptation_module_latest.jit
+          path: /home/zhz/projects/dribblebot/checkpoints/reproduction/walk/adaptation_module_latest.jit
           size_bytes: 1250384
           sha256: 9b4d96267a80a119026d3c9969de594cdd4989d007edf5a9cd658fa9222b7ae2
         ac_weights:
-          path: checkpoints/reproduction/walk/ac_weights_latest.pt
+          path: /home/zhz/projects/dribblebot/checkpoints/reproduction/walk/ac_weights_latest.pt
           size_bytes: 7008927
           sha256: 2f18fe28b3fb549d3ae89c976fd651bd5f481747f731771eaed3a49bfc631a5e
         config:
-          path: checkpoints/reproduction/walk/config.yaml
+          path: /home/zhz/projects/dribblebot/checkpoints/reproduction/walk/config.yaml
           size_bytes: 20370
           sha256: 341650353e33016331269d28031fe468745bc6e8b95876caddcb760ad6cf0011
       source_kind: local
-      source_location: checkpoints/reproduction/walk
+      source_location: /home/zhz/projects/dribblebot/checkpoints/reproduction/walk
       expected_history_dim: 1080
       policy_type: walking
     dribble:
       run_path: null
-      checkpoint: '92000'
-      config_path: checkpoints/reproduction/dribble/config.yaml
+      checkpoint: latest
+      config_path: /home/zhz/projects/dribblebot/checkpoints/reproduction/dribble/config.yaml
       action_clip: 1.0
-      action_clip_source: config:checkpoints/reproduction/dribble/config.yaml
+      action_clip_source: config:/home/zhz/projects/dribblebot/checkpoints/reproduction/dribble/config.yaml
+      ball_xy_frame: body
+      ball_xy_frame_source: config:/home/zhz/projects/dribblebot/checkpoints/reproduction/dribble/config.yaml
       artifacts:
         body:
-          path: checkpoints/reproduction/dribble/body_latest.jit
+          path: /home/zhz/projects/dribblebot/checkpoints/reproduction/dribble/body_latest.jit
           size_bytes: 2994416
-          sha256: f72084c7f71f4b6049c7892a91bac8a3490c2a731613909d096ac0fbc908de6c
+          sha256: 28bac7099b1300e88bd0a732430f3f30b398bc1f1222ce3e2c9b27d872fe30c2
         adaptation_module:
-          path: checkpoints/reproduction/dribble/adaptation_module_latest.jit
+          path: /home/zhz/projects/dribblebot/checkpoints/reproduction/dribble/adaptation_module_latest.jit
           size_bytes: 1297913
-          sha256: e534ba3fb4847ace824a68f5075ee318c436c65e206ebe9d003c1199f775a18e
+          sha256: 2dc23d2540ef97baa5ad4b9d5f89d8c90390f4d8f55b30aaaee81b7432b6881a
         ac_weights:
-          path: checkpoints/reproduction/dribble/ac_weights_latest.pt
+          path: /home/zhz/projects/dribblebot/checkpoints/reproduction/dribble/ac_weights_latest.pt
           size_bytes: 7253188
-          sha256: 0facc8d9eb45865f86aca03db9de4a7f1ae9397b22d9f8ba3167815c1ceed504
+          sha256: 4b2fed0598359bc15e37caed73874819cfefb9a4c27ef59f0c84ef0b5759c54d
         config:
-          path: checkpoints/reproduction/dribble/config.yaml
-          size_bytes: 22230
-          sha256: eb4b7822c6b90e8ad9fdfe6c639d090999b3a3f5876dfd87061c398d02d2d373
+          path: /home/zhz/projects/dribblebot/checkpoints/reproduction/dribble/config.yaml
+          size_bytes: 24368
+          sha256: 145f6b2ed4489ec82f8486dc956eb9c6d54ba81fe49aa007a4b43acbbb4b29f4
       source_kind: local
-      source_location: checkpoints/reproduction/dribble
+      source_location: /home/zhz/projects/dribblebot/checkpoints/reproduction/dribble
       expected_history_dim: 1125
       policy_type: ball
     shoot:
       run_path: null
-      checkpoint: '228000'
-      config_path: checkpoints/reproduction/shoot/config.yaml
+      checkpoint: latest
+      config_path: /home/zhz/projects/dribblebot/checkpoints/reproduction/shoot/config.yaml
       action_clip: 1.0
-      action_clip_source: config:checkpoints/reproduction/shoot/config.yaml
+      action_clip_source: config:/home/zhz/projects/dribblebot/checkpoints/reproduction/shoot/config.yaml
+      ball_xy_frame: body
+      ball_xy_frame_source: config:/home/zhz/projects/dribblebot/checkpoints/reproduction/shoot/config.yaml
       artifacts:
         body:
-          path: checkpoints/reproduction/shoot/body_latest.jit
-          size_bytes: 2994573
-          sha256: 6bb1238640aeaec06626b633b42f508364ff96b47ec97ccf66240c9a1fcea902
+          path: /home/zhz/projects/dribblebot/checkpoints/reproduction/shoot/body_latest.jit
+          size_bytes: 2994571
+          sha256: e08d2b5602ae5c6492deb9de7d0a9854dd57668ad9b6f529cf204c75184c7d37
         adaptation_module:
-          path: checkpoints/reproduction/shoot/adaptation_module_latest.jit
+          path: /home/zhz/projects/dribblebot/checkpoints/reproduction/shoot/adaptation_module_latest.jit
           size_bytes: 1298000
-          sha256: d5d93ecb3a9982249bb60bdffb3481ef186ecae2c2c4b56f86d1a93ae0e522ff
+          sha256: 38f124f9fd4fc240d1c6412818d29b53d4f9b727035554d40d8ed15b39be92ce
         ac_weights:
-          path: checkpoints/reproduction/shoot/ac_weights_latest.pt
+          path: /home/zhz/projects/dribblebot/checkpoints/reproduction/shoot/ac_weights_latest.pt
           size_bytes: 7253215
-          sha256: edd2a69f05a7ae5f50b6442276a708d17844bffbc467f22a4ab20421a8bf3dc8
+          sha256: d7ef3a49bbc1a3daa417738dfafddd19fa030c74d17be027ccd2418f5a7e9080
         config:
-          path: checkpoints/reproduction/shoot/config.yaml
-          size_bytes: 21774
-          sha256: 6847597b24cbf9237ff283ee60a99fe18bc5e1437fa365caf71c11f4e6c60a55
+          path: /home/zhz/projects/dribblebot/checkpoints/reproduction/shoot/config.yaml
+          size_bytes: 25188
+          sha256: 0aaf2f0f356c6eb1ae2c0002a8e72c429c5246df6c91524e462af8c5e351348f
       source_kind: local
-      source_location: checkpoints/reproduction/shoot
+      source_location: /home/zhz/projects/dribblebot/checkpoints/reproduction/shoot
       expected_history_dim: 1125
       policy_type: ball
+training_seed:
+  desc: null
+  value: 42
 self_play:
   desc: null
   value:
     enabled: true
     team_size: 2
     shared_actor_parameters: true
-    opponent_snapshot_interval: 500
-    local_observation_dim: 34
+    opponent_snapshot_interval: 1200
+    opponent_pool_size: 8
+    opponent_latest_probability: 0.2
+    opponent_action_selection: sample
+    local_observation_dim: 35
+    local_role_reward_scales:
+      attacker_ball_skill: 0.0
+      attacker_command_assist: 0.0
+      role_conflict: 0.0
+      support_ball_crowding: 0.0
+mpc_teacher:
+  desc: null
+  value:
+    enabled: false
 _wandb:
   desc: null
   value:
@@ -1052,7 +1172,7 @@ _wandb:
     framework: torch
     is_jupyter_run: false
     is_kaggle_kernel: false
-    start_time: 1786549016.839419
+    start_time: 1789887203.991106
     t:
       1:
       - 1
@@ -1062,6 +1182,7 @@ _wandb:
       - 55
       3:
       - 1
+      - 2
       - 3
       - 16
       - 23
@@ -1069,3 +1190,6 @@ _wandb:
       5: 0.15.0
       8:
       - 5
+resolved_checkpoint_dir:
+  desc: null
+  value: /home/zhz/projects/dribblebot/wandb/run-20260920_145323-1s2mw9rb/files/tmp/legged_data/high_level

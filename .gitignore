@@ -8,7 +8,7 @@ __pycache__/
 .coverage
 htmlcov/
 discard/
-
+bash/
 # Validation suites are not required to reproduce the training pipeline
 /tests/
 /isaaclab-rebuild/tests/
