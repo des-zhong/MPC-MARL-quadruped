@@ -19,6 +19,7 @@ from isaaclab.utils import configclass
 
 from ....assets import (
     AS2_CFG,
+    GOAL_VISUAL_CFG,
     GOAL_EAST_CROSSBAR_CFG,
     GOAL_EAST_NORTH_CFG,
     GOAL_EAST_SOUTH_CFG,
@@ -54,6 +55,7 @@ class AS2MatchSceneCfg(AS2DribbleSceneCfg):
     robot_2: ArticulationCfg = AS2_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot_2")
     robot_3: ArticulationCfg = AS2_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot_3")
     field_visual: AssetBaseCfg = SOCCER_FIELD_VISUAL_CFG
+    goal_visual: AssetBaseCfg = GOAL_VISUAL_CFG
     goal_east_north: AssetBaseCfg = GOAL_EAST_NORTH_CFG
     goal_east_south: AssetBaseCfg = GOAL_EAST_SOUTH_CFG
     goal_east_crossbar: AssetBaseCfg = GOAL_EAST_CROSSBAR_CFG
@@ -66,11 +68,14 @@ class AS2MatchSceneCfg(AS2DribbleSceneCfg):
         prim_path="{ENV_REGEX_NS}/WallNorth",
         spawn=sim_utils.CuboidCfg(
             size=(8.34, 0.12, 0.50),
-            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
-            physics_material=sim_utils.RigidBodyMaterialCfg(
-                static_friction=0.35, dynamic_friction=0.35, restitution=0.85
+            collision_props=sim_utils.CollisionPropertiesCfg(
+                collision_enabled=True, contact_offset=0.01, rest_offset=0.0,
             ),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.15, 0.15, 0.15)),
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                static_friction=0.35, dynamic_friction=0.35, restitution=0.85,
+                friction_combine_mode="average", restitution_combine_mode="average",
+            ),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.92, 0.92, 0.88)),
         ),
         init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 2.61, 0.25)),
     )
@@ -82,11 +87,14 @@ class AS2MatchSceneCfg(AS2DribbleSceneCfg):
         prim_path="{ENV_REGEX_NS}/WallEastNorth",
         spawn=sim_utils.CuboidCfg(
             size=(0.12, 1.55, 0.50),
-            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
-            physics_material=sim_utils.RigidBodyMaterialCfg(
-                static_friction=0.35, dynamic_friction=0.35, restitution=0.85
+            collision_props=sim_utils.CollisionPropertiesCfg(
+                collision_enabled=True, contact_offset=0.01, rest_offset=0.0,
             ),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.15, 0.15, 0.15)),
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                static_friction=0.35, dynamic_friction=0.35, restitution=0.85,
+                friction_combine_mode="average", restitution_combine_mode="average",
+            ),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.92, 0.92, 0.88)),
         ),
         init_state=AssetBaseCfg.InitialStateCfg(pos=(4.11, 1.775, 0.25)),
     )
@@ -214,6 +222,8 @@ class AS2MatchActionsCfg:
         team_slot=1,
     )
 
+    ball_drag = mdp.MatchBallDragCfg()
+
 
 @configclass
 class AS2MatchObservationsCfg:
@@ -245,6 +255,17 @@ class AS2MatchObservationsCfg:
 
 @configclass
 class AS2MatchEventsCfg:
+    # Gym samples this once per physical match, including in play mode.
+    ball_mass = EventTerm(
+        func=env_mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("ball"),
+            "mass_distribution_params": (0.5, 0.8),
+            "operation": "scale",
+            "recompute_inertia": True,
+        },
+    )
     reset_match = EventTerm(
         func=mdp.reset_match_scene,
         mode="reset",
@@ -432,7 +453,7 @@ class AS2MatchTerminationsCfg:
     )
     ball_out_of_bounds = DoneTerm(
         func=mdp.match_ball_out_of_bounds,
-        params={"half_extent_xy": (4.0, 2.5)},
+        params={"half_extent_xy": (4.0, 2.5), "boundary_walls": True},
     )
     robot_fallen = DoneTerm(
         func=mdp.match_robot_fallen,
@@ -474,6 +495,9 @@ class AS2MatchFlatEnvCfg(ManagerBasedRLEnvCfg):
     terminations: AS2MatchTerminationsCfg = AS2MatchTerminationsCfg()
     recorders: AS2MatchRecordersCfg = AS2MatchRecordersCfg()
     curriculum: AS2MatchCurriculumCfg = AS2MatchCurriculumCfg()
+    # Raw manager steps completed before this simulator instance was created.
+    # The segmented train/eval launcher fills this from the checkpoint index.
+    curriculum_step_offset: int = 0
     episode_length_s: float = 30.0
     decimation: int = 4
     macro_control_interval: int = 10
@@ -487,8 +511,31 @@ class AS2MatchFlatEnvCfg(ManagerBasedRLEnvCfg):
     opponent_mode: str = "zero"
 
     def __post_init__(self) -> None:
+        # Scene/material parity with the default Gym 2v2 match. Keep these
+        # overrides local to match; low-level parity fixtures use fixed balls.
+        self.sim.physics_material = sim_utils.RigidBodyMaterialCfg(
+            static_friction=1.0, dynamic_friction=1.0, restitution=0.0,
+            friction_combine_mode="average", restitution_combine_mode="average",
+        )
+        self.scene.terrain.physics_material = self.sim.physics_material.copy()
+        self.scene.ball.spawn.physics_material = sim_utils.RigidBodyMaterialCfg(
+            static_friction=1.0, dynamic_friction=1.0, restitution=0.85,
+            friction_combine_mode="average", restitution_combine_mode="average",
+        )
+        self.scene.ball.spawn.visual_material = sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 1.0, 0.0))
+        for index in range(TEAM_SIZE, 4):
+            # Preserve both original AS2 body/foot materials on the learner.
+            # Gym paints every opponent link red at actor creation.
+            color = (0.85, 0.10, 0.10)
+            getattr(self.scene, f"robot_{index}").spawn.visual_material = sim_utils.PreviewSurfaceCfg(
+                diffuse_color=color,
+            )
+        self.sim.gravity = (0.0, 0.0, -9.8)  # Gym _randomize_gravity baseline
         self.sim.dt = 0.005
         self.sim.render_interval = self.decimation
+        # A single flat terrain tile otherwise assigns (0, 0, 0) to EVERY
+        # match, while static goals/walls follow GridCloner's spaced origins.
+        self.scene.terrain.use_terrain_origins = False
         self.scene.terrain.terrain_type = "generator"
         self.scene.terrain.terrain_generator = FLAT_TERRAIN_CFG
         self.scene.terrain.terrain_generator.curriculum = False

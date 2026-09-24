@@ -1,27 +1,36 @@
-"""IsaacLab-native soccer-field and goalpost visual assets."""
+"""USD field and goal assets sourced from the same URDFs as Isaac Gym."""
 
 from dataclasses import MISSING
+import xml.etree.ElementTree as ET
+
+import numpy as np
+import trimesh
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import AssetBaseCfg
 from isaaclab.sim import SpawnerCfg
 from isaaclab.sim.utils import clone, create_prim, get_current_stage
 from isaaclab.utils import configclass
-from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade, Vt
 
 from ..paths import asset_path
 
 
 FIELD_TEXTURE_PATH = asset_path("textures/field.png")
+FIELD_URDF_PATH = asset_path("objects/soccer_field/soccer_field.urdf")
+GOAL_URDF_PATH = asset_path("objects/goalpost/goalpost.urdf")
+_FIELD_BOX = tuple(float(v) for v in ET.parse(FIELD_URDF_PATH).find(".//collision/geometry/box").get("size").split())
+_GOAL_LINK = ET.parse(GOAL_URDF_PATH).find("link")
 
 
 @configclass
 class TexturedFieldCfg(SpawnerCfg):
-    """Configuration for one UV-mapped, non-colliding field plane."""
+    """Textured field with the legacy thin box contact surface."""
 
     func = None
     texture_file: str = MISSING
-    size: tuple[float, float] = (8.5333336, 5.533679)
+    size: tuple[float, float] = _FIELD_BOX[:2]
+    thickness: float = _FIELD_BOX[2]
     roughness: float = 0.8
 
 
@@ -33,7 +42,7 @@ def spawn_textured_field(
     orientation: tuple[float, float, float, float] | None = None,
     **kwargs,
 ) -> Usd.Prim:
-    """Create a textured USD mesh without adding a second contact surface."""
+    """Match Gym's field box: visual/contact top at z=0.002, ground at z=0."""
 
     del kwargs
     stage = get_current_stage()
@@ -84,6 +93,16 @@ def spawn_textured_field(
     material.CreateSurfaceOutput().ConnectToSource(surface.ConnectableAPI(), "surface")
     UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim())
     UsdShade.MaterialBindingAPI(mesh.GetPrim()).Bind(material)
+    collider = sim_utils.CuboidCfg(
+        size=(*cfg.size, cfg.thickness),
+        visible=False,
+        collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.01, rest_offset=0.0),
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            static_friction=1.0, dynamic_friction=1.0, restitution=0.0,
+            friction_combine_mode="average", restitution_combine_mode="average",
+        ),
+    )
+    collider.func(f"{prim_path}/Collider", collider, translation=(0.0, 0.0, -0.5 * cfg.thickness))
     return stage.GetPrimAtPath(prim_path)
 
 
@@ -94,30 +113,77 @@ SOCCER_FIELD_VISUAL_CFG = AssetBaseCfg(
 )
 
 
-def _goal_bar_cfg(prim_name: str, size: tuple[float, float, float], pos: tuple[float, float, float]):
+@configclass
+class GoalVisualCfg(SpawnerCfg):
+    """Original goal net/frame mesh, separate from the open-mouth collisions."""
+
+    func = None
+
+
+@clone
+def spawn_goal_visual(prim_path, cfg, translation=None, orientation=None, **kwargs) -> Usd.Prim:
+    del cfg, kwargs
+    visual = _GOAL_LINK.find("visual")
+    geometry = visual.find("geometry/mesh")
+    origin = visual.find("origin")
+    source = trimesh.load(GOAL_URDF_PATH.parent / geometry.get("filename"), force="mesh", process=False)
+    source.apply_scale([float(v) for v in geometry.get("scale").split()])
+    transform = trimesh.transformations.euler_matrix(*[float(v) for v in origin.get("rpy").split()])
+    transform[:3, 3] = [float(v) for v in origin.get("xyz").split()]
+    source.apply_transform(transform)
+    stage = get_current_stage()
+    create_prim(prim_path, "Xform", translation=translation, orientation=orientation)
+    mesh = UsdGeom.Mesh.Define(stage, f"{prim_path}/Mesh")
+    mesh.CreatePointsAttr(Vt.Vec3fArray.FromNumpy(np.asarray(source.vertices, dtype=np.float32)))
+    mesh.CreateFaceVertexCountsAttr([3] * len(source.faces))
+    mesh.CreateFaceVertexIndicesAttr(source.faces.reshape(-1).tolist())
+    mesh.CreateSubdivisionSchemeAttr("none")
+    mesh.CreateDoubleSidedAttr(True)
+    color = tuple(float(v) for v in visual.find("material/color").get("rgba").split()[:3])
+    material = sim_utils.PreviewSurfaceCfg(diffuse_color=color)
+    material.func(f"{prim_path}/Material", material)
+    sim_utils.bind_visual_material(prim_path, f"{prim_path}/Material")
+    # No CollisionAPI: convexifying the net would close the goal mouth.
+    return stage.GetPrimAtPath(prim_path)
+
+
+GOAL_VISUAL_CFG = AssetBaseCfg(
+    prim_path="{ENV_REGEX_NS}/GoalVisual",
+    spawn=GoalVisualCfg(func=spawn_goal_visual),
+)
+
+
+def _goal_bar_cfg(prim_name: str, collision_name: str):
+    collision = _GOAL_LINK.find(f"collision[@name='{collision_name}']")
+    size = tuple(float(v) for v in collision.find("geometry/box").get("size").split())
+    pos = tuple(float(v) for v in collision.find("origin").get("xyz").split())
     return AssetBaseCfg(
         prim_path=f"{{ENV_REGEX_NS}}/{prim_name}",
         spawn=sim_utils.CuboidCfg(
             size=size,
-            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
-            physics_material=sim_utils.RigidBodyMaterialCfg(
-                static_friction=0.35, dynamic_friction=0.35, restitution=0.85
+            visible=False,
+            collision_props=sim_utils.CollisionPropertiesCfg(
+                collision_enabled=True, contact_offset=0.01, rest_offset=0.0,
             ),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.92, 0.92, 0.88)),
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                static_friction=1.0, dynamic_friction=1.0, restitution=0.0,
+                friction_combine_mode="average", restitution_combine_mode="average",
+            ),
         ),
         init_state=AssetBaseCfg.InitialStateCfg(pos=pos),
     )
 
 
-GOAL_EAST_NORTH_CFG = _goal_bar_cfg("GoalEastNorth", (0.04, 0.08, 1.0), (4.01, 1.04, 0.5))
-GOAL_EAST_SOUTH_CFG = _goal_bar_cfg("GoalEastSouth", (0.04, 0.08, 1.0), (4.01, -1.04, 0.5))
-GOAL_EAST_CROSSBAR_CFG = _goal_bar_cfg("GoalEastCrossbar", (0.04, 2.16, 0.04), (4.01, 0.0, 1.02))
-GOAL_WEST_NORTH_CFG = _goal_bar_cfg("GoalWestNorth", (0.04, 0.08, 1.0), (-4.01, 1.04, 0.5))
-GOAL_WEST_SOUTH_CFG = _goal_bar_cfg("GoalWestSouth", (0.04, 0.08, 1.0), (-4.01, -1.04, 0.5))
-GOAL_WEST_CROSSBAR_CFG = _goal_bar_cfg("GoalWestCrossbar", (0.04, 2.16, 0.04), (-4.01, 0.0, 1.02))
+GOAL_EAST_NORTH_CFG = _goal_bar_cfg("GoalEastNorth", "positive_left_post")
+GOAL_EAST_SOUTH_CFG = _goal_bar_cfg("GoalEastSouth", "positive_right_post")
+GOAL_EAST_CROSSBAR_CFG = _goal_bar_cfg("GoalEastCrossbar", "positive_crossbar")
+GOAL_WEST_NORTH_CFG = _goal_bar_cfg("GoalWestNorth", "negative_left_post")
+GOAL_WEST_SOUTH_CFG = _goal_bar_cfg("GoalWestSouth", "negative_right_post")
+GOAL_WEST_CROSSBAR_CFG = _goal_bar_cfg("GoalWestCrossbar", "negative_crossbar")
 
 
 __all__ = [
+    "GOAL_VISUAL_CFG",
     "SOCCER_FIELD_VISUAL_CFG",
     "GOAL_EAST_NORTH_CFG",
     "GOAL_EAST_SOUTH_CFG",

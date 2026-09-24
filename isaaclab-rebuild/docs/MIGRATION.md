@@ -106,6 +106,8 @@ segments training and starts a fresh evaluator after each chunk, writing
 `eval/iter_<k>.json` and (when enabled) `eval/iter_<k>.mp4`, plus `Eval/*`
 TensorBoard scalars. This is the supported path for in-training evaluation;
 launching a second Isaac Sim concurrently with PPO is not supported.
+The segmented launcher also restores the curriculum's manager-step offset from
+the checkpoint index, so reset/reward phases advance continuously across chunks.
 
 The existing standing-pose/self-collision and randomized rolling/contact comparisons remain
 valuable regression diagnostics, but they do not block the first MARL training run unless they

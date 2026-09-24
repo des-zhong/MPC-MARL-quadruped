@@ -71,6 +71,8 @@
 已同步当前 Isaac Gym 的球技能命令坐标系、随机比赛开局、角色滞回、support deadband、
 物理边界墙和主要 dense reward；这是新的训练基线，旧训练曲线不应直接横向比较。
 
+场景资产、接触参数和截图同步的对齐说明及验证命令见 [SCENE_ALIGNMENT.md](docs/SCENE_ALIGNMENT.md)。
+
 ## 2. 已注册环境
 
 | 环境 ID | 说明 |
@@ -374,6 +376,8 @@ Curriculum 分三个阶段：前约 500 个 PPO iteration 只在较小场地、�
 终止惩罚下学习稳定控球；约 500–2000 iteration 扩大起始分布并增加 shoot/goal 权重；
 之后使用完整随机场地和成熟 reward。每次 reset 会写入
 `Curriculum/training_difficulty/{phase,near_ball_probability,difficulty}`。
+分段训练恢复时，`train_self_play.py` 会把 checkpoint iteration 换算为
+`curriculum_step_offset`，因此每次 eval 后重建 Isaac Sim 不会将 curriculum 重置到 phase 0。
 Hybrid PPO 的连续参数 std 被限制在 `[0.15,0.6]`；entropy bonus 只用于 categorical
 skill，避免上一轮出现参数噪声变大、随后 skill entropy 塌缩的现象。
 

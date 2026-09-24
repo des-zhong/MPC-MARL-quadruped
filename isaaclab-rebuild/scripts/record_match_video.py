@@ -163,6 +163,13 @@ def main() -> Path:
     cfg.wait_for_textures = False
     cfg.scene.match_camera = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/MatchCamera",
+        # Author the pose before Fabric loads the scene; later USD-only
+        # camera writes are not sufficient in headless GPU rendering.
+        offset=TiledCameraCfg.OffsetCfg(
+            pos=(7.5, -8.5, 7.0),
+            rot=(0.8168875807790317, 0.4556463629302085, 0.17228195838274002, 0.3088689028265254),
+            convention="opengl",
+        ),
         update_period=0.0,
         height=args_cli.video_height,
         width=args_cli.video_width,

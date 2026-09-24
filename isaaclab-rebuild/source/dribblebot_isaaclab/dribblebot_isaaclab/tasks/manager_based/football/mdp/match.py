@@ -30,9 +30,12 @@ def match_alive(env: ManagerBasedRLEnv) -> torch.Tensor:
 def match_ball_out_of_bounds(
     env: ManagerBasedRLEnv,
     half_extent_xy: tuple[float, float] = (4.0, 2.5),
+    boundary_walls: bool = False,
 ) -> torch.Tensor:
-    """Terminate a match smoke episode when the ball leaves the field."""
+    """Gym wall mode relies on physical rebounds; goals remain separate terms."""
 
+    if boundary_walls:
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     ball = env.scene["ball"]
     local_xy = ball.data.root_pos_w[:, :2] - env.scene.env_origins[:, :2]
     return (torch.abs(local_xy[:, 0]) > float(half_extent_xy[0])) | (
@@ -289,6 +292,7 @@ def match_training_curriculum(
         "phase": phase,
         "near_ball_probability": near_ball_probability,
         "difficulty": phase / 2.0,
+        "global_manager_step": float(step),
     }
 
 

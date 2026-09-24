@@ -156,6 +156,11 @@ manager-based 结构如下：
 - 该 run 的指标表明固定难度仍会把策略推向高风险追球（摔倒/出界上升），因此新增
   `AS2MatchCurriculumCfg`：按约 500/2000 PPO iteration 分三阶段调整 near-ball 起点、
   场地范围、终止惩罚和 shoot/goal shaping；PLAY 配置关闭 curriculum，保持固定布局。
+- `curriculum_marl_v3_20260904` 暴露了分段训练的时间基准问题：每次 eval 后重建环境会
+  清零 `common_step_counter`，导致 5000 iterations 全部停在 phase 0。训练入口现根据
+  `model_<iteration>.pt` 和 rollout/macro 长度恢复 `curriculum_step_offset`；从
+  `model_499.pt` 恢复的 GPU gate 已记录 phase 1/global step 120000。修复后的正式 run 为
+  `curriculum_marl_v4_20260905`。
 
 主要证据：
 

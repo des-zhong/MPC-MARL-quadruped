@@ -2,6 +2,7 @@
 
 from .ball import SOCCER_BALL_CFG
 from .field import (
+    GOAL_VISUAL_CFG,
     GOAL_EAST_CROSSBAR_CFG,
     GOAL_EAST_NORTH_CFG,
     GOAL_EAST_SOUTH_CFG,

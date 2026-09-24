@@ -158,9 +158,8 @@ def main() -> None:
         args_cli.task,
         device=args_cli.device,
         num_envs=args_cli.num_envs,
-        # Camera pose writes use the USD xform view. Disable Fabric only for
-        # video eval so those writes remain synchronized with the renderer.
-        use_fabric=args_cli.video_output is None,
+        # Fabric synchronizes GPU physics poses with RTX rendering.
+        use_fabric=True,
     )
     agent_cfg = load_cfg_from_registry(args_cli.task, "rsl_rl_cfg_entry_point")
     env_cfg.seed = args_cli.seed
@@ -176,6 +175,13 @@ def main() -> None:
         # sensor RGB is deterministic and works both with and without X.
         env_cfg.scene.match_camera = TiledCameraCfg(
             prim_path="{ENV_REGEX_NS}/MatchCamera",
+            # Author the pose before Fabric loads the scene; later USD-only
+            # camera writes are not sufficient in headless GPU rendering.
+            offset=TiledCameraCfg.OffsetCfg(
+                pos=(7.5, -8.5, 7.0),
+                rot=(0.8168875807790317, 0.4556463629302085, 0.17228195838274002, 0.3088689028265254),
+                convention="opengl",
+            ),
             update_period=0.0,
             height=args_cli.video_height,
             width=args_cli.video_width,

@@ -6,6 +6,7 @@ import argparse
 from datetime import datetime
 import os
 from pathlib import Path
+import re
 from time import perf_counter
 
 from isaaclab.app import AppLauncher
@@ -93,6 +94,18 @@ def main() -> None:
         agent_cfg.num_steps_per_env = args_cli.num_steps_per_env
     if args_cli.run_name:
         agent_cfg.run_name = args_cli.run_name
+    resume_iteration = 0
+    if args_cli.resume_checkpoint is not None:
+        match = re.fullmatch(r"model_(\d+)\.pt", args_cli.resume_checkpoint.name)
+        if match is None:
+            raise ValueError("--resume_checkpoint must be named model_<iteration>.pt")
+        resume_iteration = int(match.group(1)) + int(args_cli.resume_next_iteration)
+    # A segmented train/eval run reconstructs the simulator every chunk. Keep
+    # curriculum time continuous by converting the restored PPO iteration to
+    # the raw manager-step offset used by CurriculumManager.
+    env_cfg.curriculum_step_offset = (
+        resume_iteration * int(agent_cfg.num_steps_per_env) * int(env_cfg.macro_control_interval)
+    )
     if args_cli.opponent_checkpoint_root:
         env_cfg.opponent_checkpoint_root = args_cli.opponent_checkpoint_root
         env_cfg.opponent_policy_device = args_cli.opponent_policy_device
@@ -120,8 +133,12 @@ def main() -> None:
         log_dir.mkdir(parents=True, exist_ok=True)
     env_cfg.log_dir = str(log_dir)
 
-    _stage(f"创建四机环境（physical matches={env_cfg.scene.num_envs}）")
+    _stage(
+        f"创建四机环境（physical matches={env_cfg.scene.num_envs}, "
+        f"curriculum_step_offset={env_cfg.curriculum_step_offset}）"
+    )
     env = gym.make(args_cli.task, cfg=env_cfg)
+    env.unwrapped.common_step_counter = int(env_cfg.curriculum_step_offset)
     _stage("环境创建完成；执行一次初始 reset")
     env.reset()
     _stage("初始 reset 完成；初始化 self-play RSL-RL wrapper")
