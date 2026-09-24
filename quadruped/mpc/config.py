@@ -49,6 +49,9 @@ class MPCConfig:
     analytical_reward_coefficient: float = 1.0
     analytical_macro_dt: float = 0.2
     analytical_event_dt: float = 0.02
+    shooting_options: bool = False
+    analytical_robot_collision_distance_m: float = 0.70
+    analytical_robot_collision_lookahead_s: float = 0.25
     max_state_uncertainty: Optional[float] = None
     max_return_uncertainty: Optional[float] = None
     relax_ood_when_all_candidates_rejected: bool = True
@@ -137,6 +140,8 @@ class MPCConfig:
             "analytical_reward_coefficient",
             "analytical_macro_dt",
             "analytical_event_dt",
+            "analytical_robot_collision_distance_m",
+            "analytical_robot_collision_lookahead_s",
             "terminal_value_coefficient",
             "terminal_value_uncertainty_beta",
         ):
@@ -152,6 +157,7 @@ class MPCConfig:
         for name in (
             "collision_avoidance_distance_m",
             "collision_avoidance_speed_mps",
+            "analytical_robot_collision_distance_m",
         ):
             if float(getattr(self, name)) <= 0.0:
                 raise ValueError(f"mpc.{name} must be positive")

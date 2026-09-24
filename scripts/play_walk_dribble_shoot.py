@@ -718,9 +718,17 @@ def configure_rollout_cfg(args, config_path=None):
 
 def make_env(args, config_path=None, raw_action_clip=None):
     configure_rollout_cfg(args, config_path)
+    if getattr(args, "fixed_skill_init", False):
+        # Diagnostic placement: respect ball-x/y and the zero-yaw terrain
+        # settings instead of inheriting randomized shooting-training resets.
+        Cfg.env.shooting_reset_relative_to_command = False
+        Cfg.env.shooting_fixed_world_target = False
+        Cfg.rewards.use_shooting_phase_termination = False
     if raw_action_clip is not None:
         Cfg.normalization.clip_actions = float(raw_action_clip)
     env = VelocityTrackingEasyEnv(sim_device=args.device, headless=args.headless, cfg=Cfg)
+    if getattr(args, "fixed_skill_init", False):
+        env.shooting_initial_ball_xy = env.object_pos_world_frame[:, :2].clone()
     env = HistoryWrapper(env)
     return env
 

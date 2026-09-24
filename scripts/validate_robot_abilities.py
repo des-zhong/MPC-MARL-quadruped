@@ -128,7 +128,9 @@ def summarize_dribble(rows, args):
 
 def summarize_shoot(rows, args):
     target = np.array([args.shoot_x, args.shoot_y], dtype=np.float64)
-    velocities = np.array([[row["ball_vx"], row["ball_vy"]] for row in rows])
+    world_frame = getattr(args, "command_frame", "body") == "world"
+    velocities = np.array([[row["ball_vx_world"], row["ball_vy_world"]] if world_frame
+                           else [row["ball_vx"], row["ball_vy"]] for row in rows])
     speeds = np.linalg.norm(velocities, axis=1)
     peak_idx = int(np.argmax(speeds))
     peak_speed = float(speeds[peak_idx])
@@ -266,6 +268,13 @@ def run_single(args):
     import imageio
     import torch
 
+    if getattr(args, "seed", None) is not None:
+        import random
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+
     phase = PHASE_BY_ABILITY[args.ability]
     if args.ball_x is None:
         args.ball_x = 3.0 if args.ability == "walk" else args.ball_distance
@@ -290,6 +299,8 @@ def run_single(args):
     command_slice = get_sensor_slice(raw_env, "RCSensor")
     object_slice = get_sensor_slice(raw_env, "ObjectSensor")
     obs = env.reset()
+    if getattr(args, "fixed_skill_init", False):
+        raw_env.shooting_initial_ball_xy = raw_env.object_pos_world_frame[:, :2].clone()
 
     if args.ability == "walk":
         command = np.array([args.walk_x, args.walk_y, args.walk_yaw], dtype=np.float32)
@@ -297,6 +308,7 @@ def run_single(args):
         command = np.array([args.dribble_x, args.dribble_y, args.dribble_yaw], dtype=np.float32)
     else:
         command = np.array([args.shoot_x, args.shoot_y, 0.0], dtype=np.float32)
+    fixed_command = command.copy()
 
     ability_dir = Path(args.output_dir) / args.ability
     ability_dir.mkdir(parents=True, exist_ok=True)
@@ -309,6 +321,11 @@ def run_single(args):
     steps = args.steps or getattr(args, f"{args.ability}_steps")
     try:
         for step in range(steps):
+            if args.ability != "walk" and getattr(args, "command_frame", "body") == "world":
+                command[:2] = world_xy_to_body_xy(
+                    torch.as_tensor(fixed_command[:2], device=raw_env.device).view(1, 2),
+                    raw_env.base_quat[0:1],
+                )[0].detach().cpu().numpy()
             if args.ability == "walk":
                 set_walking_command(raw_env, command, args)
             else:
@@ -318,7 +335,7 @@ def run_single(args):
             with torch.no_grad():
                 action = policy_record["policy"](policy_obs).to(raw_env.device)
                 action = playback.clip_policy_action(action, policy_record)
-            obs, reward, done, _ = env.step(action)
+            obs, reward, done, info = env.step(action)
 
             robot_xy = raw_env.base_pos[0, :2].detach().cpu().numpy()
             ball_xy = raw_env.object_pos_world_frame[0, :2].detach().cpu().numpy()
@@ -332,6 +349,8 @@ def run_single(args):
                 torch.as_tensor(command[:2], dtype=raw_env.base_quat.dtype, device=raw_env.device).view(1, 2),
                 raw_env.base_quat[0:1],
             )[0].detach().cpu().numpy()
+            if getattr(args, "command_frame", "body") == "world":
+                command_world = fixed_command[:2]
             base_vel = raw_env.base_lin_vel[0, :2].detach().cpu().numpy()
             yaw_rate = float(raw_env.base_ang_vel[0, 2].item())
             rows.append(
@@ -359,6 +378,7 @@ def run_single(args):
                     "reward": float(reward[0].item()),
                     "action_norm": float(torch.norm(action[0]).item()),
                     "done": int(done[0].item()),
+                    "timeout": int(raw_env.time_out_buf[0].item()),
                 }
             )
             if writer is not None:
@@ -482,6 +502,10 @@ def build_parser():
     parser.add_argument("--shoot-angle-deg", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--shoot-x", type=float, default=3.0, help="Body-frame shoot x command.")
     parser.add_argument("--shoot-y", type=float, default=0.0, help="Body-frame shoot y command.")
+    parser.add_argument("--command-frame", choices=("body", "world"), default="body",
+                        help="Frame of dribble/shoot x,y target; world holds a fixed field direction as in high-level execution.")
+    parser.add_argument("--fixed-skill-init", action="store_true", help="Use explicit ball position and zero initial yaw instead of shooting-training reset randomization.")
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--ball-distance", type=float, default=0.55)
     parser.add_argument("--ball-x", type=float, default=0.5)
     parser.add_argument("--ball-y", type=float, default=0.5)
@@ -547,9 +571,12 @@ def build_parser():
     return parser
 
 
-def main(argv=None):
+def main(argv=None, defaults=None):
     argv = sys.argv[1:] if argv is None else argv
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    if defaults:
+        parser.set_defaults(**defaults)
+    args = parser.parse_args(argv)
     args.output_dir = str(Path(args.output_dir).expanduser().resolve())
     if args.steps is not None and args.steps <= 0:
         raise SystemExit("--steps must be positive.")

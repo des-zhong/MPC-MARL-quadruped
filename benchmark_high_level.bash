@@ -9,11 +9,13 @@ export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-${TMPDIR:-/tmp}/dribblebot_
 # Uses every complete numbered learner checkpoint as a candidate. The fixed
 # opponent set is selected from the early, middle, and final learner snapshots.
 POLICY_DIR="wandb/run-20260817_191642-yz0y52ly/files/tmp/legged_data/high_level"
+OUTPUT_DIR="outputs/high_level_benchmark"
+DEVICE="${DEVICE:-cuda:0}"
+POLICY_DEVICE="${POLICY_DEVICE:-cpu}"
 
 exec "${PYTHON_BIN}" scripts/benchmark_high_level_checkpoints.py \
   --policy-dir "${POLICY_DIR}" \
-  --candidate-checkpoints auto \
-  --opponent-checkpoints auto \
-  --seeds 0,1,2 \
-  --steps 300 \
-  "$@"
+  --output-dir "${OUTPUT_DIR}" \
+  --num-robots 2 \
+  --device "${DEVICE}" \
+  --policy-device "${POLICY_DEVICE}"

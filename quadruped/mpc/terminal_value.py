@@ -233,6 +233,24 @@ class TerminalValueModel(nn.Module):
             [network(normalized).squeeze(-1) for network in networks], dim=0
         )
 
+    @torch.no_grad()
+    def rescale_returns(self, mean, std):
+        """Change target units while preserving every unnormalized prediction.
+
+        If V = old_std * (W h + b) + old_mean, transform the output
+        layer so new_std * (W' h + b') + new_mean equals the same V.
+        """
+        if not math.isfinite(float(mean)) or not math.isfinite(float(std)) or std <= 0:
+            raise ValueError('Return normalization requires finite mean and positive std')
+        old_mean = float(self.return_normalizer.mean)
+        old_std = float(self.return_normalizer.std)
+        for network in (self.network, *self.additional_networks):
+            head = network[-1]
+            head.weight.mul_(old_std / std)
+            head.bias.mul_(old_std).add_(old_mean - mean).div_(std)
+        self.return_normalizer.mean.fill_(mean)
+        self.return_normalizer.std.fill_(std)
+
     def forward(self, states: torch.Tensor) -> torch.Tensor:
         return self.forward_members(states).mean(dim=0)
 

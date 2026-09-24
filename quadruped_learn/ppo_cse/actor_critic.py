@@ -18,8 +18,14 @@ class AC_Args(PrefixProto, cli=False):
     # continuous command means. The actor output width is unchanged so legacy
     # checkpoints remain loadable.
     hybrid_skill_policy = False
+    # Fully discrete coordinator used by train_discrete_high_level.bash.  Each
+    # action block contains four skill logits followed by eight direction
+    # logits.  Direction is conditionally ignored when Stop is selected.
+    discrete_skill_direction_policy = False
     skill_action_stride = 6
     num_skill_logits = 3
+    num_direction_logits = 0
+    stop_skill_id = 3
     actor_hidden_dims = [512, 256, 128]
     critic_hidden_dims = [512, 256, 128]
     activation = 'elu'  # can be elu, relu, selu, crelu, lrelu, tanh, sigmoid
@@ -136,6 +142,127 @@ class HybridSkillDistribution:
         return skill_log_prob + command_log_prob
 
 
+class DiscreteSkillDirectionDistribution:
+    """A categorical skill and conditional categorical direction per robot.
+
+    The packed action layout is ``[skill one-hot, direction one-hot]``.  Stop
+    is represented by its skill one-hot and an all-zero direction block,
+    because direction has no effect for that skill.  Entropy, log probability,
+    and KL therefore omit the direction term on Stop transitions.
+    """
+
+    def __init__(
+        self,
+        parameters,
+        action_stride=12,
+        num_skill_logits=4,
+        num_direction_logits=8,
+        stop_skill_id=3,
+    ):
+        if action_stride <= 0:
+            raise ValueError("action_stride must be positive")
+        if num_skill_logits <= 1 or num_direction_logits <= 1:
+            raise ValueError("Discrete skill and direction heads need at least two logits")
+        if num_skill_logits + num_direction_logits != action_stride:
+            raise ValueError(
+                "Discrete action stride must equal skill logits plus direction logits"
+            )
+        if not 0 <= stop_skill_id < num_skill_logits:
+            raise ValueError("stop_skill_id is outside the skill-logit block")
+        if parameters.shape[-1] % action_stride != 0:
+            raise ValueError(
+                f"Action width {parameters.shape[-1]} is not divisible by "
+                f"stride {action_stride}"
+            )
+
+        self.parameters = parameters
+        self.action_stride = int(action_stride)
+        self.num_skill_logits = int(num_skill_logits)
+        self.num_direction_logits = int(num_direction_logits)
+        self.stop_skill_id = int(stop_skill_id)
+        self.group_count = parameters.shape[-1] // self.action_stride
+        grouped = parameters.reshape(
+            *parameters.shape[:-1], self.group_count, self.action_stride
+        )
+        self.skill_logits = grouped[..., : self.num_skill_logits]
+        self.direction_logits = grouped[..., self.num_skill_logits :]
+        self.skill_distribution = Categorical(logits=self.skill_logits)
+        self.direction_distribution = Categorical(logits=self.direction_logits)
+
+    @property
+    def mean(self):
+        """Packed categorical logits retained by rollout storage."""
+
+        return self.parameters
+
+    @property
+    def stddev(self):
+        """Categorical actions have no Gaussian standard deviation."""
+
+        return torch.zeros_like(self.parameters)
+
+    @property
+    def skill_entropy(self):
+        """Entropy of the effective Stop-or-(skill, direction) decision."""
+
+        skill_entropy = self.skill_distribution.entropy()
+        active_probability = (
+            1.0
+            - torch.softmax(self.skill_logits, dim=-1)[..., self.stop_skill_id]
+        )
+        direction_entropy = self.direction_distribution.entropy()
+        return (skill_entropy + active_probability * direction_entropy).sum(dim=-1)
+
+    @property
+    def continuous_entropy(self):
+        return self.parameters.new_zeros(self.parameters.shape[:-1])
+
+    def entropy(self):
+        return self.skill_entropy
+
+    def _pack(self, skill_ids, direction_ids):
+        skill_one_hot = F.one_hot(
+            skill_ids, num_classes=self.num_skill_logits
+        ).to(self.parameters.dtype)
+        direction_one_hot = F.one_hot(
+            direction_ids, num_classes=self.num_direction_logits
+        ).to(self.parameters.dtype)
+        active = (skill_ids != self.stop_skill_id).unsqueeze(-1)
+        direction_one_hot = direction_one_hot * active.to(self.parameters.dtype)
+        return torch.cat((skill_one_hot, direction_one_hot), dim=-1).reshape_as(
+            self.parameters
+        )
+
+    def sample(self):
+        return self._pack(
+            self.skill_distribution.sample(),
+            self.direction_distribution.sample(),
+        )
+
+    def mode(self):
+        return self._pack(
+            torch.argmax(self.skill_logits, dim=-1),
+            torch.argmax(self.direction_logits, dim=-1),
+        )
+
+    def log_prob(self, actions):
+        grouped_actions = actions.reshape(
+            *actions.shape[:-1], self.group_count, self.action_stride
+        )
+        skill_ids = torch.argmax(
+            grouped_actions[..., : self.num_skill_logits], dim=-1
+        )
+        direction_ids = torch.argmax(
+            grouped_actions[..., self.num_skill_logits :], dim=-1
+        )
+        skill_log_prob = self.skill_distribution.log_prob(skill_ids)
+        direction_log_prob = self.direction_distribution.log_prob(direction_ids)
+        active = skill_ids != self.stop_skill_id
+        return (
+            skill_log_prob + active.to(direction_log_prob.dtype) * direction_log_prob
+        ).sum(dim=-1)
+
+
 class ActorCritic(nn.Module):
     is_recurrent = False
 
@@ -212,10 +339,29 @@ class ActorCritic(nn.Module):
 
         # Action noise
         self.std = nn.Parameter(AC_Args.init_noise_std * torch.ones(num_actions))
+        # Preserve the effective sampling bounds on each actor instance so a
+        # frozen self-play snapshot can reproduce its rollout distribution
+        # without depending on later mutations of the global AC_Args profile.
+        self.min_action_std = float(AC_Args.min_action_std)
+        self.max_action_std = float(AC_Args.max_action_std)
         self.distribution = None
-        self.hybrid_skill_policy = bool(AC_Args.hybrid_skill_policy)
+        self.discrete_skill_direction_policy = bool(
+            AC_Args.discrete_skill_direction_policy
+        )
+        if self.discrete_skill_direction_policy and AC_Args.hybrid_skill_policy:
+            raise ValueError(
+                "hybrid_skill_policy and discrete_skill_direction_policy are mutually exclusive"
+            )
+        # PPO uses this as the common flag for non-Gaussian coordinator
+        # actions.  ``discrete_skill_direction_policy`` distinguishes the
+        # all-categorical layout from the legacy categorical/Gaussian layout.
+        self.hybrid_skill_policy = bool(
+            AC_Args.hybrid_skill_policy or self.discrete_skill_direction_policy
+        )
         self.skill_action_stride = int(AC_Args.skill_action_stride)
         self.num_skill_logits = int(AC_Args.num_skill_logits)
+        self.num_direction_logits = int(AC_Args.num_direction_logits)
+        self.stop_skill_id = int(AC_Args.stop_skill_id)
         # disable args validation for speedup
         Normal.set_default_validate_args = False
 
@@ -261,7 +407,15 @@ class ActorCritic(nn.Module):
         latent = self.adaptation_module(observation_history)
         mean = self.actor_body(torch.cat((observation_history, latent), dim=-1))
         std = self.std.clamp(min=AC_Args.min_action_std, max=AC_Args.max_action_std)
-        if self.hybrid_skill_policy:
+        if self.discrete_skill_direction_policy:
+            self.distribution = DiscreteSkillDirectionDistribution(
+                mean,
+                action_stride=self.skill_action_stride,
+                num_skill_logits=self.num_skill_logits,
+                num_direction_logits=self.num_direction_logits,
+                stop_skill_id=self.stop_skill_id,
+            )
+        elif self.hybrid_skill_policy:
             self.distribution = HybridSkillDistribution(
                 mean,
                 std,
@@ -281,7 +435,7 @@ class ActorCritic(nn.Module):
         # distribution has already reduced its categorical and command terms
         # to one joint value per sample, so summing it again would incorrectly
         # reduce the entire minibatch to a scalar.
-        if self.hybrid_skill_policy:
+        if self.discrete_skill_direction_policy or self.hybrid_skill_policy:
             return log_prob
         return log_prob.sum(dim=-1)
 
@@ -295,6 +449,14 @@ class ActorCritic(nn.Module):
         latent = self.adaptation_module(observation_history)
         actions_mean = self.actor_body(torch.cat((observation_history, latent), dim=-1))
         policy_info["latents"] = latent.detach().cpu().numpy()
+        if self.discrete_skill_direction_policy:
+            return DiscreteSkillDirectionDistribution(
+                actions_mean,
+                action_stride=self.skill_action_stride,
+                num_skill_logits=self.num_skill_logits,
+                num_direction_logits=self.num_direction_logits,
+                stop_skill_id=self.stop_skill_id,
+            ).mode()
         if self.hybrid_skill_policy:
             std = self.std.clamp(min=AC_Args.min_action_std, max=AC_Args.max_action_std)
             return HybridSkillDistribution(
@@ -308,6 +470,14 @@ class ActorCritic(nn.Module):
     def act_teacher(self, observation_history, privileged_info, policy_info={}):
         actions_mean = self.actor_body(torch.cat((observation_history, privileged_info), dim=-1))
         policy_info["latents"] = privileged_info
+        if self.discrete_skill_direction_policy:
+            return DiscreteSkillDirectionDistribution(
+                actions_mean,
+                action_stride=self.skill_action_stride,
+                num_skill_logits=self.num_skill_logits,
+                num_direction_logits=self.num_direction_logits,
+                stop_skill_id=self.stop_skill_id,
+            ).mode()
         if self.hybrid_skill_policy:
             std = self.std.clamp(min=AC_Args.min_action_std, max=AC_Args.max_action_std)
             return HybridSkillDistribution(

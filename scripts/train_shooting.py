@@ -5,7 +5,7 @@ import argparse
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="Train AS2 shooting with normalized command-scale rewards.")
-    parser.add_argument("--device", default="cuda:5")
+    parser.add_argument("--device", default="cuda:4")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--num-envs", type=int, default=1000)
     parser.add_argument("--iterations", type=int, default=1_000_000)
@@ -33,6 +33,11 @@ def build_arg_parser():
     parser.add_argument("--reset-longitudinal-max", type=float, default=0.60)
     parser.add_argument("--reset-lateral-range", type=float, default=0.20)
     parser.add_argument("--reset-yaw-error-range", type=float, default=0.25)
+    parser.add_argument("--deployment-reset-fraction", type=float, default=0.5,
+                        help="Fraction of resets with ball in front independent of kick direction.")
+    parser.add_argument("--option-training", action="store_true",
+                        help="Train the prepared forward-strike initiation region and 2.4-second deadline used by high-level shooting options.")
+    parser.add_argument("--save-video-interval", type=int, default=500)
     parser.add_argument(
         "--randomize-ball-physics",
         action="store_true",
@@ -49,10 +54,12 @@ def build_arg_parser():
         action="store_true",
         help="Resume only a checkpoint already trained with ball_xy_frame=body.",
     )
-    parser.add_argument("--resume-run", default=None)
+    parser.add_argument("--resume-run", default=None,
+                        help="Optional W&B entity/project/run ID; omit to load a local checkpoint.")
     parser.add_argument(
         "--resume-checkpoint",
         default="tmp/legged_data/shoot/ac_weights_latest.pt",
+        help="Local .pt path, or artifact path inside --resume-run when provided.",
     )
     return parser
 
@@ -64,6 +71,41 @@ def parse_args():
 def symmetric_range(scale):
     scale = abs(float(scale))
     return [-scale, scale]
+
+
+def configure_shooting_reliability(cfg, args):
+    if not 0 <= args.deployment_reset_fraction <= 1:
+        raise ValueError("--deployment-reset-fraction must be in [0, 1]")
+    if min(abs(args.shoot_x_speed_scale), abs(args.shoot_y_speed_scale)) < 1.5:
+        raise ValueError("Shooting command scales must be at least 1.5 m/s")
+    cfg.env.shooting_fixed_world_target = True
+    cfg.env.shooting_option_training = bool(getattr(args, "option_training", False))
+    if cfg.env.shooting_option_training:
+        cfg.env.shooting_reset_longitudinal_range = [.25, .65]
+        cfg.env.shooting_reset_lateral_range = [-.2, .2]
+        cfg.rewards.shooting_max_attempt_time_s = 2.4
+    cfg.env.shooting_deployment_reset_fraction = 1.0 if cfg.env.shooting_option_training else args.deployment_reset_fraction
+    cfg.env.shooting_min_target_speed = 1.5
+    cfg.env.shooting_max_target_speed = min(abs(args.shoot_x_speed_scale), abs(args.shoot_y_speed_scale))
+    cfg.rewards.shooting_require_ball_travel = True
+    cfg.rewards.shooting_min_launch_speed = 0.8
+    cfg.rewards.shooting_min_success_speed = 1.2
+    cfg.rewards.shooting_min_ball_travel = 0.5
+    cfg.rewards.shooting_launch_speed_fraction = 0.35
+    cfg.rewards.shooting_launch_alignment = 0.6
+    cfg.rewards.shooting_success_speed_fraction = 0.5
+    cfg.rewards.shooting_success_alignment = 0.75
+    # Events occur once, so their weight must not depend on simulation dt.
+    cfg.rewards.unscaled_reward_names = list(set(
+        getattr(cfg.rewards, 'unscaled_reward_names', ()) or ()) |
+        {'shooting_launch', 'shooting_success', 'shooting_failure'})
+    cfg.reward_scales.shooting_launch = 5.0
+    cfg.reward_scales.shooting_success = 25.0
+    cfg.reward_scales.shooting_failure = -2.0
+    cfg.reward_scales.shooting_robot_ball_behind = 0.0
+    # A strike needs freedom to depart from the nominal trotting contact clock.
+    cfg.reward_scales.tracking_contacts_shaped_force = 0.5
+    cfg.reward_scales.tracking_contacts_shaped_vel = 0.5
 
 
 def train_robot(args=None, headless=True):
@@ -110,7 +152,9 @@ def train_robot(args=None, headless=True):
         raise ValueError("--reset-yaw-error-range must be non-negative")
 
     if args.resume and not args.resume_run:
-        raise ValueError("--resume requires --resume-run for a compatible shooting checkpoint.")
+        from pathlib import Path
+        if not Path(args.resume_checkpoint).expanduser().is_file():
+            raise FileNotFoundError(f"Local shooting resume checkpoint not found: {args.resume_checkpoint}")
     RunnerArgs.resume = bool(args.resume)
     RunnerArgs.resume_path = args.resume_run
     RunnerArgs.resume_checkpoint = args.resume_checkpoint
@@ -449,7 +493,8 @@ def train_robot(args=None, headless=True):
     AC_Args.adaptation_labels = []
     AC_Args.adaptation_dims = []
 
-    RunnerArgs.save_video_interval = 500
+    configure_shooting_reliability(Cfg, args)
+    RunnerArgs.save_video_interval = args.save_video_interval
 
     import wandb
     wandb.init(
@@ -474,8 +519,19 @@ def train_robot(args=None, headless=True):
         with torch.no_grad():
             runner.alg.actor_critic.std.fill_(args.init_noise_std)
         print(f"Reset resumed shooting policy action std to {args.init_noise_std}")
-    runner.learn(num_learning_iterations=args.iterations, init_at_random_ep_len=False, eval_freq=100)
+    try:
+        runner.learn(num_learning_iterations=args.iterations, init_at_random_ep_len=False, eval_freq=100)
+    finally:
+        wandb.finish()
 
 
 if __name__ == "__main__":
     train_robot(parse_args())
+    # Match validate_robot_abilities.py: legacy Isaac Gym can segfault during
+    # interpreter teardown, even after destroy_sim. Only take this exit after
+    # successful training and explicit W&B completion; exceptions still fail.
+    import os
+    import sys
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

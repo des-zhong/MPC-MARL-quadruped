@@ -1,0 +1,6 @@
+{
+  "scenario": "Controlled ball moves backward at 1 m/s, following a backward dribble command",
+  "real_reward_rate": -1.0,
+  "real_reward_for_0.2s_constant_state": -0.2,
+  "mpc_reward_for_0.2s": 0.10000000149011612
+}

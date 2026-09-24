@@ -8,10 +8,48 @@ from quadruped.command_frames import world_xy_to_body_xy
 
 SKILL_NAMES = ("walk", "dribble", "shoot")
 SKILL_TO_ID = {name: idx for idx, name in enumerate(SKILL_NAMES)}
+DISCRETE_SKILL_NAMES = ("walk", "dribble", "shoot", "stop")
+DISCRETE_SKILL_TO_ID = {
+    name: idx for idx, name in enumerate(DISCRETE_SKILL_NAMES)
+}
+STOP_SKILL_ID = 3
+DIRECTION_LABELS = (
+    "Up",
+    "Up-Right",
+    "Right",
+    "Down-Right",
+    "Down",
+    "Down-Left",
+    "Left",
+    "Up-Left",
+)
+DIRECTION_NAMES = (
+    "up",
+    "up_right",
+    "right",
+    "down_right",
+    "down",
+    "down_left",
+    "left",
+    "up_left",
+)
+# +x is Up/forward and +y is Left in the robot/field coordinate convention.
+# Diagonals are normalized so all eight choices have the same magnitude.
+_DIAGONAL = 1.0 / math.sqrt(2.0)
+DIRECTION_VECTORS = (
+    (1.0, 0.0),
+    (_DIAGONAL, -_DIAGONAL),
+    (0.0, -1.0),
+    (-_DIAGONAL, -_DIAGONAL),
+    (-1.0, 0.0),
+    (-_DIAGONAL, _DIAGONAL),
+    (0.0, 1.0),
+    (_DIAGONAL, _DIAGONAL),
+)
 
 
 class HighLevelSkillWrapper(gym.Wrapper):
-    """High-level N-robot skill wrapper with six coordinator actions per robot."""
+    """High-level N-robot skill wrapper for hybrid or discrete actions."""
 
     def __init__(self, env, skill_policies, control_interval=None, history_length=None):
         super().__init__(env)
@@ -39,11 +77,28 @@ class HighLevelSkillWrapper(gym.Wrapper):
                 "cfg.env.high_level_ball_xy_frame='team_canonical_field', "
                 f"got {high_level_ball_frame!r}"
             )
-        self.num_actions = int(getattr(env.cfg.env, "high_level_num_actions", 6 * self.num_robots))
-        self.num_obs = int(getattr(env.cfg.env, "high_level_num_observations", 25 * self.num_robots + 6))
-        if self.num_actions != 6 * self.num_robots:
+        self.action_encoding = str(
+            getattr(env.cfg.env, "high_level_action_encoding", "hybrid")
+        )
+        if self.action_encoding not in ("hybrid", "discrete_skill_direction"):
             raise ValueError(
-                f"high_level_num_actions must be 6*num_robots={6 * self.num_robots}, got {self.num_actions}"
+                "high_level_action_encoding must be 'hybrid' or "
+                f"'discrete_skill_direction', got {self.action_encoding!r}"
+            )
+        self.action_stride = 12 if self.action_encoding == "discrete_skill_direction" else 6
+        self.num_actions = int(
+            getattr(
+                env.cfg.env,
+                "high_level_num_actions",
+                self.action_stride * self.num_robots,
+            )
+        )
+        self.num_obs = int(getattr(env.cfg.env, "high_level_num_observations", 25 * self.num_robots + 6))
+        if self.num_actions != self.action_stride * self.num_robots:
+            raise ValueError(
+                "high_level_num_actions must be "
+                f"{self.action_stride}*num_robots="
+                f"{self.action_stride * self.num_robots}, got {self.num_actions}"
             )
         if self.num_obs != 25 * self.num_robots + 6:
             raise ValueError(
@@ -101,9 +156,17 @@ class HighLevelSkillWrapper(gym.Wrapper):
             device=self.device,
         )
         self.low_level_actions = torch.zeros(self.num_envs, self.num_robots, 12, dtype=torch.float, device=self.device)
+        self.shoot_option_remaining = torch.zeros(self.num_envs, self.num_robots, device=self.device)
         self.last_low_level_actions = torch.zeros_like(self.low_level_actions)
+        # Per-robot actuator saturation diagnostics. The raw environment's
+        # aggregate clip fraction cannot identify which frozen skill saturates.
+        self.low_level_action_clip_fraction = torch.zeros(
+            self.num_envs, self.num_robots, dtype=torch.float, device=self.device
+        )
         self.skill_ids = torch.zeros(self.num_envs, self.num_robots, dtype=torch.long, device=self.device)
         self.requested_skill_ids = torch.zeros_like(self.skill_ids)
+        self.direction_ids = torch.full_like(self.skill_ids, -1)
+        self.requested_direction_ids = torch.full_like(self.skill_ids, -1)
         self.skill_transition_mask = torch.zeros_like(
             self.skill_ids, dtype=torch.bool
         )
@@ -165,6 +228,11 @@ class HighLevelSkillWrapper(gym.Wrapper):
         env_ids = bad_envs.nonzero(as_tuple=False).flatten()
         if hasattr(self.env, "high_level_accidental_termination_buf"):
             self.env.high_level_accidental_termination_buf[env_ids] = True
+        if hasattr(self.env, "high_level_learning_team_failure_buf"):
+            # A non-finite match state cannot be attributed reliably after the
+            # fact. Keep the legacy conservative treatment for this rare
+            # simulator failure instead of silently dropping its penalty.
+            self.env.high_level_learning_team_failure_buf[env_ids] = True
         self.env.reset_buf[env_ids] = True
         self.env.reset_idx(env_ids)
         self._clear_attacker_assignments(env_ids)
@@ -454,6 +522,11 @@ class HighLevelSkillWrapper(gym.Wrapper):
                     [0.5 * field_length - support_margin, 0.5 * field_width - support_margin]
                 )
                 target = torch.minimum(torch.maximum(target, lower), upper)
+                from quadruped.envs.support_position import avoid_teammate_path
+                for teammate in group:
+                    if teammate != slot:
+                        target = avoid_teammate_path(position[:, slot], target, position[:, teammate])
+                target = torch.minimum(torch.maximum(target, lower), upper)
                 world_delta = target - position[:, slot]
                 delta_3d = torch.cat((world_delta, torch.zeros_like(world_delta[:, :1])), dim=-1)
                 body_delta = quat_rotate_inverse(
@@ -655,13 +728,71 @@ class HighLevelSkillWrapper(gym.Wrapper):
         commands[avoidance_mask] = escape_commands[avoidance_mask]
         return skill_ids, commands, avoidance_mask
 
-    def _decode_action(self, action):
-        action = self._sanitize_tensor(action.to(self.device), self._high_level_action_clip()).view(
-            self.num_envs,
-            self.num_robots,
-            6,
+    def _decode_action_values(self, action, action_encoding):
+        """Decode a team in its native format before shared execution rules."""
+        action = self._sanitize_tensor(action.to(self.device), self._high_level_action_clip())
+        requested_direction_ids = torch.full(
+            action.shape[:2],
+            -1,
+            dtype=torch.long,
+            device=self.device,
         )
-        requested_skill_ids = torch.argmax(action[:, :, :3], dim=-1)
+        if action_encoding == "discrete_skill_direction":
+            requested_skill_ids = torch.argmax(action[:, :, :4], dim=-1)
+            sampled_direction_ids = torch.argmax(action[:, :, 4:12], dim=-1)
+            active_skill = requested_skill_ids != STOP_SKILL_ID
+            requested_direction_ids[active_skill] = sampled_direction_ids[active_skill]
+            direction_table = action.new_tensor(DIRECTION_VECTORS)
+            direction_xy = direction_table[sampled_direction_ids]
+            scales = self._command_scales(requested_skill_ids)
+            # The low-level skill training bounds are symmetric planar speed
+            # limits.  Use half of that per-skill maximum as the fixed speed;
+            # the normalized direction table keeps cardinals and diagonals at
+            # the same magnitude for the normal isotropic training ranges.
+            command_fraction = float(
+                getattr(
+                    self.env.cfg.env,
+                    "high_level_discrete_command_fraction",
+                    0.5,
+                )
+            )
+            planar_magnitude = scales[:, :, :2].amax(dim=-1) * command_fraction
+            commands = torch.zeros(
+                action.shape[0],
+                action.shape[1],
+                3,
+                dtype=action.dtype,
+                device=self.device,
+            )
+            commands[:, :, :2] = direction_xy * planar_magnitude.unsqueeze(-1)
+            commands[:, :, :2] = torch.maximum(
+                torch.minimum(commands[:, :, :2], scales[:, :, :2]),
+                -scales[:, :, :2],
+            )
+            commands[~active_skill] = 0.0
+        else:
+            requested_skill_ids = torch.argmax(action[:, :, :3], dim=-1)
+            commands = torch.tanh(action[:, :, 3:6]) * self._command_scales(
+                requested_skill_ids
+            )
+        return requested_skill_ids, commands, requested_direction_ids
+
+    def _decode_action(self, action):
+        if not hasattr(self, "direction_ids"):
+            self.direction_ids = torch.full_like(self.requested_skill_ids, -1)
+        if not hasattr(self, "requested_direction_ids"):
+            self.requested_direction_ids = torch.full_like(self.requested_skill_ids, -1)
+        if isinstance(action, tuple):
+            decoded = [self._decode_action_values(team, "discrete_skill_direction" if team.shape[-1] == 12 else "hybrid")
+                       for team in action]
+            requested_skill_ids, commands, requested_direction_ids = (
+                torch.cat(parts, dim=1) for parts in zip(*decoded)
+            )
+        else:
+            encoding = getattr(self, "action_encoding", "hybrid")
+            stride = 12 if encoding == "discrete_skill_direction" else 6
+            action = action.view(self.num_envs, self.num_robots, stride)
+            requested_skill_ids, commands, requested_direction_ids = self._decode_action_values(action, encoding)
         # Keep lightweight/offline fixtures that construct the wrapper with
         # ``__new__`` compatible with the full initialized wrapper.
         if not hasattr(self, "skill_transition_mask"):
@@ -722,7 +853,10 @@ class HighLevelSkillWrapper(gym.Wrapper):
                 )
             )
             support_role_conflict = (
-                (requested_skill_ids != SKILL_TO_ID["walk"])
+                (
+                    (requested_skill_ids == SKILL_TO_ID["dribble"])
+                    | (requested_skill_ids == SKILL_TO_ID["shoot"])
+                )
                 & ~attacker_mask
                 & ~preserve_external
                 if role_aware
@@ -733,6 +867,7 @@ class HighLevelSkillWrapper(gym.Wrapper):
                 & attacker_mask
                 & affordances["can_dribble"]
                 & ~preserve_external
+                & (not getattr(self.env.cfg.env, "high_level_allow_near_ball_reposition", False))
                 if role_aware
                 else torch.zeros_like(requested_skill_ids, dtype=torch.bool)
             )
@@ -767,11 +902,14 @@ class HighLevelSkillWrapper(gym.Wrapper):
         else:
             # Do not silently replace the coordinator's decision. This keeps
             # exploration and credit assignment faithful when no affordance
-            # masking is part of the experiment.
+            # masking is part of the experiment, while retaining a diagnostic
+            # penalty for requests that are physically out of reach.
             force_walk = torch.zeros_like(requested_skill_ids, dtype=torch.bool)
-            invalid_skill_mask = torch.zeros_like(requested_skill_ids, dtype=torch.bool)
+            invalid_skill_mask = (
+                ((requested_skill_ids == SKILL_TO_ID["dribble"]) & ~affordances["can_dribble"])
+                | ((requested_skill_ids == SKILL_TO_ID["shoot"]) & ~affordances["can_shoot"])
+            ) & ~preserve_external
 
-        commands = torch.tanh(action[:, :, 3:6]) * self._command_scales(requested_skill_ids)
         final_scales = self._command_scales(skill_ids)
         commands = torch.maximum(torch.minimum(commands, final_scales), -final_scales)
         if use_geometric_fallback:
@@ -809,7 +947,10 @@ class HighLevelSkillWrapper(gym.Wrapper):
             )
             command_assist_mask = (
                 attacker_mask
-                & (skill_ids != SKILL_TO_ID["walk"])
+                & (
+                    (skill_ids == SKILL_TO_ID["dribble"])
+                    | (skill_ids == SKILL_TO_ID["shoot"])
+                )
                 & (torch.norm(commands[:, :, :2], dim=-1) < min_command_speed)
             )
             if bool(torch.any(command_assist_mask).detach().cpu().item()):
@@ -817,6 +958,32 @@ class HighLevelSkillWrapper(gym.Wrapper):
                     skill_ids, attacker_mask
                 )
                 commands[command_assist_mask] = assisted_commands[command_assist_mask]
+        if getattr(self.env.cfg.env, "high_level_shooting_options", False):
+            from quadruped.envs.shooting_option import resolve_shooting_option
+            roots = self.env.root_states[self.env.robot_actor_idxs_all.reshape(-1)].view(self.num_envs, self.num_robots, 13)
+            q = roots[..., 3:7]
+            yaw = torch.atan2(2*(q[..., 3]*q[..., 2]+q[..., 0]*q[..., 1]),
+                              1-2*(q[..., 1].square()+q[..., 2].square()))
+            goal = self.env.env_origins[:, None, :2].expand(-1, self.num_robots, -1).clone()
+            team = int(self.env.cfg.env.num_team_robots)
+            goal[:, :team, 0] += float(self.env.cfg.env.team_goal_x)
+            goal[:, team:, 0] -= float(self.env.cfg.env.team_goal_x)
+            # Role arbitration takes precedence over a raw Shoot request.
+            # Otherwise the support robot's rejected request chases the ball.
+            option_allowed = ~support_override
+            intent = torch.where((requested_skill_ids == 2) & option_allowed, requested_skill_ids, skill_ids)
+            option_timer = torch.where(option_allowed, self.shoot_option_remaining,
+                                       torch.zeros_like(self.shoot_option_remaining))
+            previous_skills = self.skill_ids.clone()
+            skill_ids, commands, remaining, begun = resolve_shooting_option(
+                intent, commands, option_timer, self.skill_commands,
+                roots[..., :2], torch.stack((yaw.sin(), yaw.cos()), -1),
+                self.env.object_pos_world_frame[:, :2], self.env.object_lin_vel[:, :2], goal, roots[..., 2])
+            option_control = ((requested_skill_ids == 2) | (self.shoot_option_remaining > 0)) & option_allowed
+            self.shoot_option_remaining[:] = remaining
+            requested_skill_ids = torch.where(option_control, skill_ids, requested_skill_ids)
+            invalid_skill_mask[option_control] = False
+            self.skill_transition_mask[:] = skill_ids != previous_skills
         commands[:, :, 2] = torch.where(skill_ids == 2, torch.zeros_like(commands[:, :, 2]), commands[:, :, 2])
         skill_ids, commands, collision_avoidance_mask = self._apply_collision_avoidance(
             skill_ids,
@@ -826,6 +993,9 @@ class HighLevelSkillWrapper(gym.Wrapper):
         commands = self._sanitize_tensor(commands, max(command_clip, 1.0))
         self.requested_skill_ids[:] = requested_skill_ids
         self.skill_ids[:] = skill_ids
+        self.requested_direction_ids[:] = requested_direction_ids
+        self.direction_ids[:] = requested_direction_ids
+        self.direction_ids[skill_ids == STOP_SKILL_ID] = -1
         self.invalid_skill_mask[:] = invalid_skill_mask
         self.collision_avoidance_mask[:] = collision_avoidance_mask
         self.attacker_command_assist_mask[:] = command_assist_mask
@@ -870,7 +1040,10 @@ class HighLevelSkillWrapper(gym.Wrapper):
         """
 
         command = self.skill_commands[:, robot_slot, :].clone()
-        ball_skill = self.skill_ids[:, robot_slot] != SKILL_TO_ID["walk"]
+        ball_skill = (
+            (self.skill_ids[:, robot_slot] == SKILL_TO_ID["dribble"])
+            | (self.skill_ids[:, robot_slot] == SKILL_TO_ID["shoot"])
+        )
         root_state = self._robot_root_states(robot_slot)
         body_xy = world_xy_to_body_xy(command[:, :2], root_state[:, 3:7])
         command[:, :2] = torch.where(
@@ -951,8 +1124,25 @@ class HighLevelSkillWrapper(gym.Wrapper):
             "not the high-level coordinator run."
         )
 
+    def _advance_low_level_actions(self):
+        # Inference observes a[t-1] and a[t-2]. Shifting before inference
+        # duplicates a[t-1] in both ActionSensor and LastActionSensor slots.
+        next_actions = self._low_level_actions_from_skills()
+        self.last_low_level_actions.copy_(self.low_level_actions)
+        self.low_level_actions.copy_(next_actions)
+
     def _low_level_actions_from_skills(self):
         actions = torch.zeros(self.num_envs, self.num_robots, 12, dtype=torch.float, device=self.device)
+        if not hasattr(self, "low_level_action_clip_fraction"):
+            self.low_level_action_clip_fraction = torch.zeros(
+                self.num_envs,
+                self.num_robots,
+                dtype=torch.float,
+                device=self.device,
+            )
+        # Stop has no low-level policy to overwrite this diagnostic, so clear
+        # the previous control tick before filling active-skill rows.
+        self.low_level_action_clip_fraction.zero_()
         full_commands = []
         for robot_slot in range(self.num_robots):
             execution_command = self._execution_command(robot_slot)
@@ -970,7 +1160,13 @@ class HighLevelSkillWrapper(gym.Wrapper):
                 policy_record = self.skill_policies[skill_name]
                 with torch.no_grad():
                     skill_action = policy_record["policy"](self._policy_obs(robot_slot, policy_record)).to(self.device)
-                skill_action = self._sanitize_tensor(skill_action, self.policy_action_clips[skill_name])
+                action_clip = self.policy_action_clips[skill_name]
+                self.low_level_action_clip_fraction[mask, robot_slot] = (
+                    (skill_action.abs() >= action_clip - 1e-6)
+                    .float()
+                    .mean(dim=-1)[mask]
+                )
+                skill_action = self._sanitize_tensor(skill_action, action_clip)
                 actions[mask, robot_slot, :] = skill_action[mask]
 
         self.env.commands[:, :] = full_commands[0][:, : self.env.cfg.commands.num_commands]
@@ -1059,7 +1255,12 @@ class HighLevelSkillWrapper(gym.Wrapper):
             )
         )
 
-        skill_one_hot = torch.nn.functional.one_hot(self.skill_ids, num_classes=3).float().reshape(self.num_envs, -1)
+        # Preserve the established observation width. Stop is encoded as all
+        # zeros in the three active-skill indicators.
+        skill_one_hot = torch.nn.functional.one_hot(
+            self.skill_ids.clamp(min=0, max=STOP_SKILL_ID),
+            num_classes=STOP_SKILL_ID + 1,
+        )[:, :, :3].float().reshape(self.num_envs, -1)
         pieces.append(skill_one_hot)
         pieces.append(
             self.skill_commands.reshape(self.num_envs, -1)
@@ -1092,11 +1293,15 @@ class HighLevelSkillWrapper(gym.Wrapper):
 
     def _clear_high_level_state(self, env_ids):
         """Clear coordinator state after the raw env has auto-reset rows."""
+        if hasattr(self, "shoot_option_remaining"):
+            self.shoot_option_remaining[env_ids] = 0
 
         self.high_level_obs[env_ids] = 0.0
         self.high_level_obs_history[env_ids] = 0.0
         self.skill_ids[env_ids] = 0
         self.requested_skill_ids[env_ids] = 0
+        self.direction_ids[env_ids] = -1
+        self.requested_direction_ids[env_ids] = -1
         if hasattr(self, "skill_transition_mask"):
             self.skill_transition_mask[env_ids] = False
         self.invalid_skill_mask[env_ids] = False
@@ -1104,6 +1309,8 @@ class HighLevelSkillWrapper(gym.Wrapper):
         self.attacker_command_assist_mask[env_ids] = False
         self.role_conflict_mask[env_ids] = False
         self.skill_commands[env_ids] = 0.0
+        if hasattr(self, "low_level_action_clip_fraction"):
+            self.low_level_action_clip_fraction[env_ids] = 0.0
         self.decision_robot_ball_distances[env_ids] = 0.0
         self._clear_attacker_assignments(env_ids)
         self.env.high_level_skill_ids[env_ids] = 0
@@ -1117,14 +1324,21 @@ class HighLevelSkillWrapper(gym.Wrapper):
 
     def reset(self):
         self.env.reset()
+        if hasattr(self, "attack_episode_diagnostics"):
+            del self.attack_episode_diagnostics
         self._clear_attacker_assignments()
         self.high_level_obs.zero_()
         self.high_level_obs_history.zero_()
         self.low_level_obs_history_full.zero_()
         self.low_level_actions.zero_()
         self.last_low_level_actions.zero_()
+        if hasattr(self, "low_level_action_clip_fraction"):
+            self.low_level_action_clip_fraction.zero_()
         self.skill_ids.zero_()
+        self.shoot_option_remaining.zero_()
         self.requested_skill_ids.zero_()
+        self.direction_ids.fill_(-1)
+        self.requested_direction_ids.fill_(-1)
         self.skill_transition_mask.zero_()
         self.invalid_skill_mask.zero_()
         self.collision_avoidance_mask.zero_()
@@ -1145,12 +1359,40 @@ class HighLevelSkillWrapper(gym.Wrapper):
         self._update_high_level_obs()
         return self.cached_obs
 
+    def _observe_attack_diagnostics(self, active=None):
+        if getattr(self.env.cfg.env, "attack_diagnostics", False):
+            from quadruped.envs.attack_diagnostics import AttackDiagnostics
+            if not hasattr(self, "attack_episode_diagnostics"):
+                self.attack_episode_diagnostics = AttackDiagnostics(self.num_envs, self.device)
+            ball = self.env.object_pos_world_frame[:, :2]
+            goal = self.env.env_origins[:, :2].clone()
+            goal[:, 0] += float(self.env.cfg.env.team_goal_x)
+            direction = goal-ball
+            distance = direction.norm(dim=-1)
+            direction /= distance[:, None].clamp_min(1e-6)
+            team = int(self.env.cfg.env.num_team_robots)
+            near = self.env._high_level_robot_ball_distances()[:, :team]
+            # Observe every low-level tick before auto-reset can replace the state.
+            shooting = ((self.skill_ids[:, :team] == 2) & (near <= .8)).any(-1)
+            self.attack_episode_diagnostics.observe(
+                distance, near.min(-1).values, shooting,
+                (self.env.object_lin_vel[:, :2]*direction).sum(-1), active=active)
+
     def step(self, action):
         self._reset_bad_envs()
         self._decode_action(action)
+        # Capture labels before the simulator auto-resets terminal matches.
+        start_labels = {
+            name: getattr(self.env, name).clone()
+            for name in ("soccer_start_kind", "soccer_start_stage")
+            if hasattr(self.env, name)
+        }
         reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         done_total = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         elapsed_low_level_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        low_level_clip_fraction_sum = torch.zeros(
+            self.num_envs, self.num_robots, dtype=torch.float, device=self.device
+        )
         info = {}
         terminal_info = {
             "high_level_goal": torch.zeros(self.num_envs, dtype=torch.bool, device=self.device),
@@ -1158,6 +1400,15 @@ class HighLevelSkillWrapper(gym.Wrapper):
             "high_level_ball_off_border": torch.zeros(self.num_envs, dtype=torch.bool, device=self.device),
             "high_level_obstacle_contact": torch.zeros(self.num_envs, dtype=torch.bool, device=self.device),
             "high_level_accidental_termination": torch.zeros(self.num_envs, dtype=torch.bool, device=self.device),
+            "high_level_opponent_accidental_termination": torch.zeros(
+                self.num_envs, dtype=torch.bool, device=self.device
+            ),
+            "high_level_learning_team_failure": torch.zeros(
+                self.num_envs, dtype=torch.bool, device=self.device
+            ),
+            "high_level_opponent_team_failure": torch.zeros(
+                self.num_envs, dtype=torch.bool, device=self.device
+            ),
             "time_outs": torch.zeros(self.num_envs, dtype=torch.bool, device=self.device),
         }
         terminal_attrs = {
@@ -1166,14 +1417,25 @@ class HighLevelSkillWrapper(gym.Wrapper):
             "high_level_ball_off_border": "last_high_level_ball_off_border_buf",
             "high_level_obstacle_contact": "last_high_level_obstacle_contact_buf",
             "high_level_accidental_termination": "last_high_level_accidental_termination_buf",
+            "high_level_opponent_accidental_termination": "last_high_level_opponent_accidental_termination_buf",
+            "high_level_learning_team_failure": "last_high_level_learning_team_failure_buf",
+            "high_level_opponent_team_failure": "last_high_level_opponent_team_failure_buf",
             "time_outs": "time_out_buf",
         }
 
+        for skill in ("walk", "dribble", "shoot", "stop"):
+            key = f"high_level_{skill}_height_failure"
+            terminal_info[key] = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            terminal_attrs[key] = f"last_{key}_buf"
+
         for low_level_step in range(self.control_interval):
             active = ~done_total
+            self._observe_attack_diagnostics(active)
             elapsed_low_level_steps += active.long()
-            self.last_low_level_actions[:] = self.low_level_actions
-            self.low_level_actions[:] = self._low_level_actions_from_skills()
+            self._advance_low_level_actions()
+            low_level_clip_fraction_sum += (
+                self.low_level_action_clip_fraction * active.unsqueeze(1).float()
+            )
             joint_actions = self.low_level_actions.reshape(self.num_envs, -1)
             joint_actions[~active] = 0.0
             _, low_reward, done, info = self.env.step(joint_actions)
@@ -1195,11 +1457,16 @@ class HighLevelSkillWrapper(gym.Wrapper):
                 self.low_level_obs_history_full[done_bool] = 0.0
                 self.low_level_actions[done_bool] = 0.0
                 self.last_low_level_actions[done_bool] = 0.0
+                self.low_level_action_clip_fraction[done_bool] = 0.0
             if bool(torch.all(done_total).detach().cpu().item()):
                 break
 
         executed_skill_ids = self.skill_ids.detach().cpu().numpy().copy()
         requested_skill_ids = self.requested_skill_ids.detach().cpu().numpy().copy()
+        executed_direction_ids = self.direction_ids.detach().cpu().numpy().copy()
+        requested_direction_ids = (
+            self.requested_direction_ids.detach().cpu().numpy().copy()
+        )
         invalid_skill_mask = self.invalid_skill_mask.detach().cpu().numpy().copy()
         collision_avoidance_mask = self.collision_avoidance_mask.detach().cpu().numpy().copy()
         attacker_mask = self.env.high_level_attacker_mask.detach().cpu().numpy().copy()
@@ -1211,14 +1478,23 @@ class HighLevelSkillWrapper(gym.Wrapper):
         decision_robot_ball_distances = (
             self.decision_robot_ball_distances.detach().cpu().numpy().copy()
         )
+        low_level_action_clip_fraction = (
+            low_level_clip_fraction_sum
+            / elapsed_low_level_steps.clamp(min=1).unsqueeze(1)
+        ).detach().cpu().numpy()
         if bool(torch.any(done_total).detach().cpu().item()):
             self._clear_high_level_state(done_total)
         self._update_high_level_obs()
         reward = self._sanitize_tensor(reward, 1.0e4)
         info = dict(info)
+        info.update(start_labels)
+        if hasattr(self, "attack_episode_diagnostics"):
+            info["attack_diagnostics"] = self.attack_episode_diagnostics.finish(done_total, terminal_info["time_outs"])
         info["privileged_obs"] = self.high_level_obs
         info["high_level_skill_ids"] = executed_skill_ids
         info["high_level_requested_skill_ids"] = requested_skill_ids
+        info["high_level_direction_ids"] = executed_direction_ids
+        info["high_level_requested_direction_ids"] = requested_direction_ids
         info["high_level_invalid_skill_mask"] = invalid_skill_mask
         info["high_level_collision_avoidance_mask"] = collision_avoidance_mask
         info["high_level_attacker_mask"] = attacker_mask
@@ -1230,6 +1506,7 @@ class HighLevelSkillWrapper(gym.Wrapper):
             self.env._high_level_robot_ball_distances().detach().cpu().numpy()
         )
         info["elapsed_low_level_steps"] = elapsed_low_level_steps.detach().cpu().numpy()
+        info["low_level_action_clip_fraction"] = low_level_action_clip_fraction
         info["low_level_action_clips"] = dict(self.policy_action_clips)
         for key, value in terminal_info.items():
             # PPO bootstraps truncated episodes from this field and expects an

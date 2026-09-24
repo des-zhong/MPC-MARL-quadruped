@@ -62,7 +62,8 @@ class FootballWorldModelStateAdapter:
         if configured_robots < 1:
             raise ValueError("num_robots must be at least 1")
         self.num_robots = configured_robots
-        self.schema = schema or default_state_schema(max_obstacles, configured_robots)
+        option_enabled = bool(getattr(getattr(getattr(raw, "cfg", None), "env", None), "high_level_shooting_options", False))
+        self.schema = schema or default_state_schema(max_obstacles, configured_robots, option_enabled)
         schema_robots = len(
             [feature for feature in self.schema.features if feature.name.endswith(".position") and feature.name.startswith("robot_")]
         )
@@ -157,6 +158,8 @@ class FootballWorldModelStateAdapter:
             structured[f"{prefix}.ball_contact"] = ball_contact[:, robot : robot + 1].float()
             structured[f"{prefix}.skill_one_hot"] = torch.nn.functional.one_hot(skill_ids[:, robot], 3).float()
             structured[f"{prefix}.previous_command"] = normalized_commands[:, robot]
+            if any(f.name == f"{prefix}.shoot_option_remaining" for f in self.schema.features):
+                structured[f"{prefix}.shoot_option_remaining"] = wrapper.shoot_option_remaining[:, robot:robot+1]
             structured[f"{prefix}.parameter_mask"] = masks[:, robot]
             phase_angle = 2.0 * torch.pi * gait_phase
             structured[f"{prefix}.gait_phase_sin_cos"] = torch.stack((phase_angle.sin(), phase_angle.cos()), -1)
@@ -246,6 +249,11 @@ class FootballWorldModelStateAdapter:
             normalized = self.action_adapter.normalize_parameters(skills, params)
             masks = self.action_adapter._selected(skills, "mask", result.dtype)
             for robot in range(self.num_robots):
+                timer_name = f"robot_{robot}.shoot_option_remaining"
+                if any(f.name == timer_name for f in self.schema.features):
+                    from quadruped.envs.shooting_option import next_timer
+                    previous_timer = current_state[..., self.schema.slice(timer_name)]
+                    result[..., self.schema.slice(timer_name)] = next_timer(previous_timer, (skills[..., robot] == 2).unsqueeze(-1))
                 result[..., self.schema.slice(f"robot_{robot}.skill_one_hot")] = torch.nn.functional.one_hot(skills[..., robot], 3).to(result.dtype)
                 result[..., self.schema.slice(f"robot_{robot}.previous_command")] = normalized[..., robot, :]
                 result[..., self.schema.slice(f"robot_{robot}.parameter_mask")] = masks[..., robot, :]
@@ -269,7 +277,13 @@ class FootballWorldModelStateAdapter:
             info.get("high_level_goal", next_state[:, self.schema.slice("ball.in_opponent_goal")]),
             device=state.device,
         ).reshape(-1).bool()
-        own_goal = next_state[:, self.schema.slice("ball.in_own_goal")].reshape(-1).bool()
+        own_goal = torch.as_tensor(
+            info.get(
+                "high_level_opponent_goal",
+                next_state[:, self.schema.slice("ball.in_own_goal")],
+            ),
+            device=state.device,
+        ).reshape(-1).bool()
         out_of_bounds = torch.as_tensor(
             info.get("high_level_ball_off_border", next_state[:, self.schema.slice("ball.out_of_bounds")]),
             device=state.device,

@@ -232,7 +232,7 @@ def build_runtime(
         config["world_model"]["max_obstacles"] = checkpoint_num_obstacles
     # Local import preserves Isaac Gym's required import-before-torch order in
     # each simulator-facing entry point.
-    from scripts.collect_world_model_data import build_environment
+    from .simulator_environment import build_environment
 
     env = build_environment(args, config)
     validate_environment_compatibility(

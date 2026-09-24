@@ -5,7 +5,7 @@ system for quadruped robot soccer in NVIDIA Isaac Gym. AS2 quadrupeds learn
 walking, dribbling, and shooting as separate low-level skills. A shared
 high-level policy selects those skills for every robot, trains against an older
 frozen copy of itself through self-play, and can receive privileged guidance
-from world-model MPC during training. 
+from world-model MPC during training.
 
 The main pipeline supports:
 
@@ -16,7 +16,7 @@ The main pipeline supports:
 - hybrid CEM MPC over discrete skills and continuous skill commands;
 - privileged MPC teacher rewards for high-level policy training.
 
-This project is derived from
+This project is heavily modified from
 [DribbleBot](https://github.com/Improbable-AI/dribblebot) and
 [Walk These Ways](https://github.com/Improbable-AI/walk-these-ways). See
 [Acknowledgements and license](#acknowledgements-and-license).
@@ -187,7 +187,15 @@ iteration counter.
 [train_high_level.bash](train_high_level.bash) provides the same workflow with
 the local paths used during development.
 
-The coordinator samples walk/dribble/shoot from a true categorical
+For a fully categorical coordinator, use
+[train_discrete_high_level.bash](train_discrete_high_level.bash). It selects
+`Walk`, `Dribble`, `Shoot`, or `Stop`, and (for the first three) one of
+`Up`, `Up-Right`, `Right`, `Down-Right`, `Down`, `Down-Left`, `Left`, or
+`Up-Left`. Direction commands use half of each frozen low-level skill's
+configured planar speed limit (0.75 m/s for Walk/Dribble and 1.5 m/s for
+Shoot with the bundled checkpoints).
+
+The legacy coordinator samples walk/dribble/shoot from a true categorical
 distribution and samples only the three command values from a Gaussian. Its
 categorical entropy coefficient anneals from `0.002` to `0.0002` over the first
 4,000 PPO iterations. Opponent-pool state is saved as
@@ -356,10 +364,4 @@ quadruped/world_model/      Joint dynamics model and dataset components
 quadruped/mpc/              Hybrid CEM MPC and teacher tooling
 quadruped_learn/            PPO implementation
 scripts/                    Training, validation, collection, and analysis tools
-tests/                      Unit and contract tests
 ```
-
-## Acknowledgements and license
-
-This repo is heavily modified from [DribbleBot ]()[github.com/Improbable-AI/dribblebot](https://github.com/Improbable-AI/dribblebot). Redistributed upstream components retain their original licenses.
-See [LICENSE](LICENSE) and [LICENSES/](LICENSES/) for details.

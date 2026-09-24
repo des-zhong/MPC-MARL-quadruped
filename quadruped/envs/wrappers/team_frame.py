@@ -37,15 +37,32 @@ def mirror_high_level_commands(
 def mirror_high_level_policy_actions(actions: torch.Tensor) -> torch.Tensor:
     """Convert canonical opponent policy outputs to executable world actions.
 
-    Policy actions contain three skill logits followed by three raw command
-    values that are passed through ``tanh`` by ``HighLevelSkillWrapper``.
-    Negating the raw planar values negates the decoded command because tanh is
-    odd, while leaving skill selection and yaw-rate commands unchanged.
+    Legacy policy actions contain three skill logits followed by three raw
+    command values. Discrete policies contain four skill one-hot values and
+    eight direction one-hot values; ball-skill directions are rotated by pi
+    for the opponent while Walk directions remain body-relative.
     """
 
+    if actions.shape[-1] == 12:
+        mirrored = actions.clone()
+        skill_ids = actions[..., :4].argmax(dim=-1)
+        field_frame = ((skill_ids == 1) | (skill_ids == 2))
+        # Rotating by pi maps direction d to d+4. Reordering logits also
+        # handles deterministic raw actor outputs; one-hot samples remain
+        # one-hot, and Stop's direction block remains irrelevant/unchanged.
+        opposite_order = torch.tensor(
+            [4, 5, 6, 7, 0, 1, 2, 3],
+            dtype=torch.long,
+            device=actions.device,
+        )
+        rotated_directions = actions[..., 4:12].index_select(-1, opposite_order)
+        mirrored[..., 4:12] = torch.where(
+            field_frame.unsqueeze(-1), rotated_directions, actions[..., 4:12]
+        )
+        return mirrored
     if actions.shape[-1] != 6:
         raise ValueError(
-            f"Expected high-level policy actions [..., 6], got {tuple(actions.shape)}"
+            f"Expected high-level policy actions [..., 6] or [..., 12], got {tuple(actions.shape)}"
         )
     mirrored = actions.clone()
     skill_ids = actions[..., :3].argmax(dim=-1)

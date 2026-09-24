@@ -81,6 +81,60 @@ def hybrid_policy_kl_mean(
     return (categorical_kl.mean() + command_kl).clamp_min(0.0)
 
 
+def discrete_skill_direction_kl_mean(
+    old_parameters,
+    new_parameters,
+    action_stride=12,
+    num_skill_logits=4,
+    num_direction_logits=8,
+    stop_skill_id=3,
+):
+    """Exact KL for Stop-or-(skill, direction) categorical decisions."""
+
+    if num_skill_logits + num_direction_logits != action_stride:
+        raise ValueError(
+            "Discrete action stride must equal skill logits plus direction logits"
+        )
+    if not 0 <= stop_skill_id < num_skill_logits:
+        raise ValueError("stop_skill_id is outside the skill-logit block")
+    if old_parameters.shape != new_parameters.shape:
+        raise ValueError("Old and new discrete policy parameters must have the same shape")
+    if old_parameters.shape[-1] % action_stride != 0:
+        raise ValueError(
+            f"Action width {old_parameters.shape[-1]} is not divisible by stride "
+            f"{action_stride}"
+        )
+
+    old_grouped = old_parameters.reshape(
+        *old_parameters.shape[:-1], -1, action_stride
+    )
+    new_grouped = new_parameters.reshape_as(old_grouped)
+    old_skill_log_probs = torch.log_softmax(
+        old_grouped[..., :num_skill_logits], dim=-1
+    )
+    new_skill_log_probs = torch.log_softmax(
+        new_grouped[..., :num_skill_logits], dim=-1
+    )
+    old_skill_probs = torch.exp(old_skill_log_probs)
+    skill_kl = (
+        old_skill_probs * (old_skill_log_probs - new_skill_log_probs)
+    ).sum(dim=-1)
+
+    old_direction_log_probs = torch.log_softmax(
+        old_grouped[..., num_skill_logits:], dim=-1
+    )
+    new_direction_log_probs = torch.log_softmax(
+        new_grouped[..., num_skill_logits:], dim=-1
+    )
+    old_direction_probs = torch.exp(old_direction_log_probs)
+    direction_kl = (
+        old_direction_probs
+        * (old_direction_log_probs - new_direction_log_probs)
+    ).sum(dim=-1)
+    active_probability = 1.0 - old_skill_probs[..., stop_skill_id]
+    return (skill_kl + active_probability * direction_kl).sum(dim=-1).mean().clamp_min(0.0)
+
+
 class PPO_Args(PrefixProto):
     # algorithm
     value_loss_coef = 1.0
@@ -105,6 +159,8 @@ class PPO_Args(PrefixProto):
     skill_entropy_coef = 0.0
     skill_action_stride = 6
     num_skill_logits = 3
+    num_direction_logits = 0
+    stop_skill_id = 3
     stop_on_excessive_kl = False
     max_kl_factor = 4.0
     # Prevent an extreme likelihood-ratio exponent from overflowing before
@@ -224,7 +280,16 @@ class PPO:
             # KL
             if PPO_Args.desired_kl is not None:
                 with torch.inference_mode():
-                    if self.actor_critic.hybrid_skill_policy:
+                    if self.actor_critic.discrete_skill_direction_policy:
+                        kl_mean = discrete_skill_direction_kl_mean(
+                            old_mu_batch,
+                            mu_batch,
+                            PPO_Args.skill_action_stride,
+                            PPO_Args.num_skill_logits,
+                            PPO_Args.num_direction_logits,
+                            PPO_Args.stop_skill_id,
+                        )
+                    elif self.actor_critic.hybrid_skill_policy:
                         kl_mean = hybrid_policy_kl_mean(
                             old_mu_batch,
                             old_sigma_batch,

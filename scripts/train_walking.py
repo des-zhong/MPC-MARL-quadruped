@@ -314,7 +314,15 @@ def train_robot(args=None, headless=True):
     Cfg.domain_rand.randomize_gravity = False
     Cfg.domain_rand.randomize_ball_drag = False
     Cfg.normalization.clip_actions = 1.0
-    AC_Args.init_noise_std = 0.5
+    # PPO evaluates the log probability of the sampled action, while the
+    # simulator executes a clipped action.  Leaving the walking mean
+    # unbounded makes those two actions diverge (the old checkpoint reached
+    # ~98% actuator clipping and could not recover).  Keep both the mean and
+    # exploration noise inside the same normalized actuator contract.
+    AC_Args.action_mean_bound = Cfg.normalization.clip_actions
+    AC_Args.init_noise_std = 0.25
+    AC_Args.max_action_std = 0.40
+    PPO_Args.max_learning_rate = args.learning_rate
 
     AC_Args.adaptation_labels = []
     AC_Args.adaptation_dims = []

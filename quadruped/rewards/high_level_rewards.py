@@ -146,6 +146,15 @@ class HighLevelRewards:
             torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.env.device),
         ).float()
 
+    def _reward_high_level_opponent_goal(self):
+        """Penalize a goal scored by the opponent as a distinct match event."""
+
+        return getattr(
+            self.env,
+            "high_level_opponent_goal_buf",
+            torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.env.device),
+        ).float()
+
     def _reward_high_level_accidental_termination(self):
         return getattr(
             self.env,
@@ -156,20 +165,32 @@ class HighLevelRewards:
     def _reward_high_level_ball_goal_progress(self):
         return torch.clamp(self._ball_goal_progress_speed(), min=-1.0, max=1.0)
 
+    def _reward_high_level_goalward_ball_velocity(self):
+        """Dense bounded signal for carrying the ball toward the goal.
+
+        Distance progress can be nearly zero while the ball is being prepared
+        for a dribble or shot.  This velocity alignment term supplies credit
+        for the correct direction and negative credit for driving the ball
+        back toward our own side.
+        """
+        velocity = self.env.object_lin_vel[:, :2]
+        speed = torch.linalg.vector_norm(velocity, dim=-1)
+        alignment = (velocity * self._ball_goal_direction()).sum(-1)
+        return torch.tanh(alignment) * torch.clamp(speed, max=1.5) / 1.5
+
     def _reward_high_level_possession(self):
         min_distance = torch.min(self._robot_ball_distances(), dim=1).values
         return torch.exp(-2.0 * torch.square(min_distance))
 
     def _reward_high_level_robot_spacing(self):
-        """Reward a useful support distance and penalize ball crowding.
+        """Penalize teammate overlap and support crowding without a living bonus.
 
         ``high_level_approach_ball`` intentionally gives progress credit only
-        to the assigned attacker. Without a complementary support term, however,
-        every teammate can still converge on the ball and receive no immediate
-        cost for doing so. The wrapper's hysteretic role selection determines
-        the attacker; the other teammates are rewarded for
-        maintaining space and are penalized when they enter the attacker's
-        control bubble.
+        to the assigned attacker.  The old implementation also emitted a
+        positive reward every step when the robot pair was near a target
+        separation, which could outscore a sparse goal without any ball play.
+        This term is now non-positive: overlap is always discouraged and
+        support crowding is charged only once the attacker controls the ball.
         """
 
         robot_xy = self._robot_xy()
@@ -189,21 +210,11 @@ class HighLevelRewards:
         rows = torch.arange(self.env.num_envs, device=self.env.device)
         attacker_distance = previous_distances[rows, attacker]
 
-        # The pairwise term remains useful before possession is established;
-        # the role-specific term becomes active as soon as the attacker is
-        # within a short approach radius.
         pair_distance = torch.norm(robot_xy[:, 0] - robot_xy[:, 1], dim=-1)
         min_spacing = float(
             getattr(self.env.cfg.rewards, "high_level_min_robot_spacing", 0.65)
         )
-        target_spacing = max(
-            float(getattr(self.env.cfg.rewards, "high_level_target_robot_spacing", 1.5)),
-            min_spacing,
-        )
         too_close = torch.clamp(min_spacing - pair_distance, min=0.0)
-        useful_spacing = torch.exp(
-            -torch.square((pair_distance - target_spacing) / target_spacing)
-        )
 
         # For the common two-robot team, gather the non-attacker directly. For
         # larger teams use the closest support slot so one crowded teammate
@@ -225,10 +236,10 @@ class HighLevelRewards:
             ),
             min_spacing,
         )
-        attack_radius = float(
-            getattr(self.env.cfg.rewards, "high_level_dribble_skill_distance", 1.0)
-        ) + 0.35
-        attack_active = (attacker_distance <= attack_radius).float()
+        control_distance = float(
+            getattr(self.env.cfg.rewards, "high_level_dribble_control_distance", 0.8)
+        )
+        attacker_controlled = (attacker_distance <= control_distance).float()
         support_crowding = torch.clamp(
             (support_min_distance - support_distance) / support_min_distance,
             min=0.0,
@@ -248,10 +259,9 @@ class HighLevelRewards:
             max=1.0,
         )
         return (
-            useful_spacing
-            - 4.0 * torch.square(too_close / min_spacing)
-            - 2.0 * attack_active * support_crowding
-            - 0.5 * attack_active * support_closing * support_crowding
+            -4.0 * torch.square(too_close / min_spacing)
+            - 2.0 * attacker_controlled * support_crowding
+            - 0.5 * attacker_controlled * support_closing * support_crowding
         )
 
     def _reward_high_level_robot_collision(self):
@@ -378,6 +388,14 @@ class HighLevelRewards:
             return torch.zeros(self.env.num_envs, dtype=torch.float, device=self.env.device)
         return torch.stack(rewards, dim=1).amax(dim=1)
 
+    def _reward_high_level_support_lane(self):
+        from quadruped.envs.support_position import shot_lane_obstruction
+        ball = self.env.object_pos_world_frame[:, :2]
+        goal = self.env.env_origins[:, :2].clone()
+        goal[:, 0] += float(self.env.cfg.env.team_goal_x)
+        return shot_lane_obstruction(self._robot_xy(), ball, goal,
+                                     self._attacker_indices(self._robot_ball_distances()))
+
     def _reward_high_level_invalid_skill(self):
         invalid_skill_mask = getattr(self.env, "high_level_invalid_skill_mask", None)
         if invalid_skill_mask is None:
@@ -446,10 +464,8 @@ class HighLevelRewards:
         active = valid_dribble & controlled & moving
         # Command following earns reward only when it is also goal aligned.
         # The signed term remains negative when the controlled ball moves away.
-        per_robot = (
-            command_tracking * aligned_progress[:, None]
-            + away_from_goal[:, None]
-        )
+        from quadruped.rewards.football_shaping import dribble_score
+        per_robot = dribble_score(self.env.object_lin_vel[:, :2], self._ball_goal_direction(), commands, target_speed)
         return self._reduce_active_score(per_robot, active)
 
     def _reward_high_level_shoot_setup(self):
@@ -472,6 +488,7 @@ class HighLevelRewards:
         robot_to_ball = (
             self.env.object_pos_world_frame[:, None, :2] - self._robot_xy()
         )
+        robot_ball_distance = torch.norm(robot_to_ball, dim=-1)
         robot_to_ball_direction = robot_to_ball / torch.norm(
             robot_to_ball, dim=-1, keepdim=True
         ).clamp(min=1e-6)
@@ -493,17 +510,39 @@ class HighLevelRewards:
         min_command_speed = float(
             getattr(self.env.cfg.rewards, "high_level_skill_command_min_speed", 0.2)
         )
+        shoot_distance = float(
+            getattr(self.env.cfg.rewards, "high_level_shoot_skill_distance", 0.75)
+        )
         active = (
             valid_shoot
             & transition
+            & (robot_ball_distance <= shoot_distance)
             & (command_speed >= min_command_speed)
             & (behind_readiness > 0.0)
         )
         per_robot = command_goal_alignment * behind_readiness
-        return self._reduce_active_score(per_robot, active)
+        score = self._reduce_active_score(per_robot, active)
+        if getattr(self.env.cfg.rewards, "high_level_shoot_setup_once_per_episode", False):
+            if not hasattr(self.env, "high_level_shoot_setup_paid"):
+                self.env.high_level_shoot_setup_paid = torch.zeros_like(score, dtype=torch.bool)
+            # No repeated setup bonus from toggling walk/shoot near the ball.
+            positive = (score > 0) & ~self.env.high_level_shoot_setup_paid
+            score = torch.where(score > 0, score * positive.float(), score)
+            self.env.high_level_shoot_setup_paid |= positive
+        return score
 
     def _reward_high_level_shoot_launch(self):
         """Emit a launch reward only for valid shots that accelerate the ball."""
+
+        if getattr(self.env.cfg.rewards, "high_level_launch_event", False):
+            from quadruped.rewards.football_shaping import launch_score
+            previous = getattr(self.env, "prev_object_lin_vel", self.env.object_lin_vel)[:, :2]
+            previous_ball = getattr(self.env, "prev_object_pos_world_frame", self.env.object_pos_world_frame)[:, :2]
+            direction = self._goal_xy() - previous_ball
+            direction /= direction.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            near = getattr(self.env, "prev_high_level_robot_ball_distances", self._robot_ball_distances())[:, :self._team_size()] <= .95
+            shot = (self._valid_executed_skill(2) & near).any(-1)
+            return launch_score(previous, self.env.object_lin_vel[:, :2], direction) * shot
 
         valid_shoot = self._valid_executed_skill(2)
         previous_distances = getattr(
@@ -566,9 +605,34 @@ class HighLevelRewards:
             & (delta_projected_speed >= min_delta_speed)
             & (alignment >= min_alignment)
         )
-        return torch.max(launch_score * alignment_score * launched.float(), dim=1).values
+        score = torch.max(launch_score * alignment_score * launched.float(), dim=1).values
+        if getattr(self.env.cfg.rewards, "high_level_goalward_launch", False):
+            # Previously a command-aligned kick toward our own goal could earn
+            # the launch reward. Require velocity toward the attacking goal.
+            velocity = self.env.object_lin_vel[:, :2]
+            goal_alignment = (velocity * self._ball_goal_direction()).sum(-1) / velocity.norm(dim=-1).clamp_min(1e-6)
+            score *= goal_alignment.clamp(0., 1.)
+        return score
+
+    def _reward_high_level_attack_position(self):
+        from quadruped.rewards.attack_progress import attack_position_progress
+        previous = getattr(self.env, "prev_high_level_robot_xy", self._robot_xy())[:, :self._team_size()]
+        distances = getattr(self.env, "prev_high_level_robot_ball_distances", self._robot_ball_distances())[:, :self._team_size()]
+        return attack_position_progress(
+            previous, self._robot_xy(), self.env.prev_object_pos_world_frame[:, :2],
+            self.env.object_pos_world_frame[:, :2], self._goal_xy(), self.env.dt,
+            self._attacker_indices(distances))
 
     def _reward_high_level_approach_ball(self):
+        """Signed attacker-to-ball progress outside low-level skill range.
+
+        This is deliberately state based: progress receives the same credit no
+        matter which low-level skill produced it.  Skill-specific gates would
+        reintroduce the action bias that the minimal reward is intended to
+        remove.  Selecting only the assigned attacker avoids rewarding every
+        teammate for converging on the ball.
+        """
+
         prev_distances = getattr(self.env, "prev_high_level_robot_ball_distances", None)
         if prev_distances is None:
             return torch.zeros(self.env.num_envs, dtype=torch.float, device=self.env.device)
@@ -576,16 +640,14 @@ class HighLevelRewards:
         prev_distances = prev_distances[:, : self._team_size()]
         current_distances = self._robot_ball_distances()
         progress = (prev_distances - current_distances) / max(self.env.dt, 1e-6)
-        dribble_distance = float(getattr(self.env.cfg.rewards, "high_level_dribble_skill_distance", 1.0))
-        executed_skill_ids = self._skill_ids("high_level_skill_ids")
-        requested_skill_ids = self._skill_ids("high_level_requested_skill_ids")
-        invalid_skill_mask = self._skill_ids("high_level_invalid_skill_mask")
-        far_from_ball = prev_distances > dribble_distance
-        valid_requested_walk = (
-            (executed_skill_ids == 0)
-            & (requested_skill_ids == 0)
-            & (invalid_skill_mask == 0)
+        approach_distance = float(
+            getattr(
+                self.env.cfg.rewards,
+                "high_level_dribble_skill_distance",
+                1.0,
+            )
         )
+        far_from_ball = prev_distances > approach_distance
 
         # Use the same decision-time role as observation construction and
         # geometric fallback. This avoids rewarding a different teammate when
@@ -593,12 +655,11 @@ class HighLevelRewards:
         attacker = self._attacker_indices(prev_distances).unsqueeze(1)
         attacker_progress = torch.gather(progress, 1, attacker).squeeze(1)
         attacker_far = torch.gather(far_from_ball, 1, attacker).squeeze(1)
-        attacker_walking = torch.gather(valid_requested_walk, 1, attacker).squeeze(1)
 
         # Keep the sign: moving away must cancel previously earned approach
         # reward instead of being hidden by a zero clamp or by the teammate.
         signed_progress = torch.clamp(attacker_progress, min=-1.0, max=1.0)
-        return signed_progress * attacker_far.float() * attacker_walking.float()
+        return signed_progress * attacker_far.float()
 
     def _reward_high_level_walk_command_alignment(self):
         """Reward walking commands toward the ball and penalize commands away from it."""
@@ -659,11 +720,10 @@ class HighLevelRewards:
     def _reward_high_level_face_ball_while_approaching(self):
         """Keep the active approaching robot's body pointed at the ball.
 
-        The command-speed gate prevents a stationary robot from accumulating
-        this dense orientation reward merely by looking at the ball.  As with
-        the approach reward, only the assigned attacker receives credit, which
-        is also the sole robot in the
-        single-robot task.
+        Credit is gated by measured closing speed, not merely by a non-zero
+        command.  A robot that asks to move but remains stationary therefore
+        cannot accumulate orientation reward just by looking at the ball.
+        As with the approach reward, only the assigned attacker receives credit.
         """
 
         prev_distances = getattr(self.env, "prev_high_level_robot_ball_distances", None)
@@ -700,12 +760,54 @@ class HighLevelRewards:
             min=-1.0, max=1.0
         )
 
-        command_speed = torch.norm(self._commands()[:, :, :2], dim=-1)
-        target_speed = max(
-            float(getattr(self.env.cfg.rewards, "high_level_approach_walk_speed", 0.9)),
-            1e-6,
+        current_distances = self._robot_ball_distances()
+        closing_speed = (prev_distances - current_distances) / max(self.env.dt, 1e-6)
+        min_closing_speed = max(
+            float(
+                getattr(
+                    self.env.cfg.rewards,
+                    "high_level_face_ball_min_closing_speed",
+                    0.05,
+                )
+            ),
+            0.0,
         )
-        approach_activity = torch.clamp(command_speed / target_speed, min=0.0, max=1.0)
+        target_closing_speed = max(
+            float(
+                getattr(
+                    self.env.cfg.rewards,
+                    "high_level_face_ball_target_closing_speed",
+                    0.5,
+                )
+            ),
+            min_closing_speed + 1e-6,
+        )
+        approach_activity = torch.clamp(
+            (closing_speed - min_closing_speed)
+            / (target_closing_speed - min_closing_speed),
+            min=0.0,
+            max=1.0,
+        )
+        # Keep orientation credit proportional to actual closure.  The
+        # command-speed term used previously rewarded a command even when the
+        # robot was not moving toward the ball.
+        command_speed = torch.norm(self._commands()[:, :, :2], dim=-1)
+        command_activity = torch.clamp(
+            command_speed
+            / max(
+                float(
+                    getattr(
+                        self.env.cfg.rewards,
+                        "high_level_approach_walk_speed",
+                        0.9,
+                    )
+                ),
+                1e-6,
+            ),
+            min=0.0,
+            max=1.0,
+        )
+        approach_activity = approach_activity * command_activity
         dribble_distance = float(
             getattr(self.env.cfg.rewards, "high_level_dribble_skill_distance", 1.0)
         )

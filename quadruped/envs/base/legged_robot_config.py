@@ -35,6 +35,8 @@ class Cfg(PrefixProto, cli=False):
         control_all_robots = False
         high_level_control = False
         high_level_control_interval = 10
+        # Relative joint-pose noise for frozen skills; match geometry stays random.
+        high_level_joint_reset_noise = 0.0
         high_level_history_length = 4
         high_level_num_observations = 56
         high_level_num_actions = 12
@@ -390,6 +392,10 @@ class Cfg(PrefixProto, cli=False):
         only_positive_rewards_ji22_style = False
         sigma_rew_neg = 5
         reward_container_name = "SoccerRewards"
+        # Event rewards are impulses (for example a scored goal), rather than
+        # rates evaluated every simulator step.  The high-level trainer opts
+        # into leaving its match events unscaled by ``env.dt``.
+        unscaled_reward_names = []
         tracking_sigma = 0.25  # tracking reward = exp(-error^2/sigma)
         tracking_sigma_lat = 0.25  # tracking reward = exp(-error^2/sigma)
         tracking_sigma_long = 0.25  # tracking reward = exp(-error^2/sigma)
@@ -440,7 +446,10 @@ class Cfg(PrefixProto, cli=False):
         high_level_support_lateral = 1.2
         high_level_support_walk_speed = 0.75
         high_level_support_command_deadband = 0.08
-        high_level_attacker_switch_margin = 0.15
+        # Always transfer the attacker role to the nearest teammate. A
+        # hysteresis gap can leave the farther robot approaching while the
+        # closer robot is treated as support in evaluation.
+        high_level_attacker_switch_margin = 0.0
         high_level_robot_collision_distance = 0.65
         high_level_robot_collision_lookahead = 0.25
         high_level_robot_avoidance_distance = 0.55
@@ -451,10 +460,13 @@ class Cfg(PrefixProto, cli=False):
         high_level_dribble_control_distance = 0.8
         high_level_skill_command_min_speed = 0.2
         high_level_skill_command_target_speed = 0.8
-        high_level_local_attacker_ball_skill_scale = 2.0
-        high_level_local_attacker_command_assist_scale = -4.0
-        high_level_local_role_conflict_scale = -3.0
-        high_level_local_support_ball_crowding_scale = -3.0
+        # Optional decentralized role shaping is disabled by default.  The
+        # high-level trainer uses a minimal cooperative objective; individual
+        # role diagnostics remain available without changing PPO's reward.
+        high_level_local_attacker_ball_skill_scale = 0.0
+        high_level_local_attacker_command_assist_scale = 0.0
+        high_level_local_role_conflict_scale = 0.0
+        high_level_local_support_ball_crowding_scale = 0.0
         high_level_dribble_min_ball_speed = 0.1
         high_level_dribble_target_ball_speed = 1.0
         high_level_shoot_skill_distance = 0.75
@@ -467,6 +479,10 @@ class Cfg(PrefixProto, cli=False):
         high_level_shoot_min_command_alignment = 0.6
         high_level_shoot_alignment = 0.35
         high_level_approach_walk_speed = 0.9
+        # Face-ball shaping requires measured distance closure.  The minimum
+        # avoids rewarding noise; the target normalizes useful approach speed.
+        high_level_face_ball_min_closing_speed = 0.05
+        high_level_face_ball_target_closing_speed = 0.5
         
         constrict = False
         constrict_indices = []
@@ -539,8 +555,10 @@ class Cfg(PrefixProto, cli=False):
         shooting_success = 0.0
         shooting_failure = 0.0
         high_level_goal = 0.0
+        high_level_opponent_goal = 0.0
         high_level_accidental_termination = 0.0
         high_level_ball_goal_progress = 0.0
+        high_level_goalward_ball_velocity = 0.0
         high_level_possession = 0.0
         high_level_robot_spacing = 0.0
         high_level_robot_collision = 0.0

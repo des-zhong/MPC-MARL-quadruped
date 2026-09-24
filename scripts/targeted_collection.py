@@ -313,13 +313,21 @@ class TargetedScenarioManager:
             self.wrapper._clear_high_level_state(ids)
         for name in (
             "high_level_goal_buf",
+            "high_level_opponent_goal_buf",
             "high_level_ball_off_border_buf",
             "high_level_obstacle_contact_buf",
             "high_level_accidental_termination_buf",
+            "high_level_opponent_accidental_termination_buf",
+            "high_level_learning_team_failure_buf",
+            "high_level_opponent_team_failure_buf",
             "last_high_level_goal_buf",
+            "last_high_level_opponent_goal_buf",
             "last_high_level_ball_off_border_buf",
             "last_high_level_obstacle_contact_buf",
             "last_high_level_accidental_termination_buf",
+            "last_high_level_opponent_accidental_termination_buf",
+            "last_high_level_learning_team_failure_buf",
+            "last_high_level_opponent_team_failure_buf",
         ):
             if hasattr(self.raw, name):
                 getattr(self.raw, name)[ids] = False

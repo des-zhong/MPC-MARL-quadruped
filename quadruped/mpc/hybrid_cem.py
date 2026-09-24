@@ -9,7 +9,7 @@ from typing import Dict, Optional, Tuple
 import torch
 
 from .config import MPCConfig
-from .objective import MPCObjective
+from .objective import MPCObjective, MPCObjectiveResult
 from .planner_state import MPCPlannerState
 
 
@@ -199,17 +199,45 @@ class HybridCEMMPC:
         mask = fixed_robot_mask.to(device=actions.device, dtype=torch.bool)
         if actions.ndim == 4:
             fixed = fixed[:, None]
-        shaped[..., mask, :] = fixed[..., mask, :]
+        if mask.ndim == 1:
+            shaped[..., mask, :] = fixed[..., mask, :]
+        else:
+            expanded = mask[:, None, None, :, None] if actions.ndim == 4 else mask[:, None, :, None]
+            shaped = torch.where(expanded, fixed, shaped)
         return shaped.flatten(-2)
 
     def _evaluate_candidates(
-        self, states: torch.Tensor, actions: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self,
+        states: torch.Tensor,
+        actions: torch.Tensor,
+        return_best: bool = False,
+    ) -> Tuple[torch.Tensor, ...]:
+        """Evaluate candidates, optionally retaining the best candidate data.
+
+        The planner used to evaluate all candidates in chunks and then run the
+        selected sequence again with a single candidate.  Apart from doing
+        unnecessary model work, that made deterministic world-model outputs
+        depend on the candidate batch shape (especially near an OOD threshold).
+        When ``return_best`` is true, this method keeps the selected rollout and
+        objective from the original chunk evaluation so final validation and
+        the returned plan are based on exactly the values used for selection.
+        """
         count = actions.shape[1]
         chunk = self.config.candidate_batch_size or count
         returns = []
         validity = []
         finite_returns = []
+        batch = states.shape[0]
+        batch_rows = torch.arange(batch, device=states.device)
+        iteration_best = torch.full(
+            (batch,), float("-inf"), dtype=states.dtype, device=states.device
+        )
+        has_strict_candidate = torch.zeros(
+            batch, dtype=torch.bool, device=states.device
+        )
+        best_rollout = None
+        best_score = None
+        best_action = None
         for start in range(0, count, chunk):
             selected = actions[:, start : start + chunk]
             rollout = self.world_model.rollout(
@@ -222,18 +250,117 @@ class HybridCEMMPC:
             score = self.objective.evaluate(states, selected, rollout)
             returns.append(score.total)
             validity.append(score.valid)
-            finite_returns.append(
-                torch.where(
-                    score.diagnostics["numerically_valid"],
-                    score.diagnostics["raw_total"],
-                    torch.full_like(score.total, float("-inf")),
-                )
+            finite = torch.where(
+                score.diagnostics["numerically_valid"],
+                score.diagnostics["raw_total"],
+                torch.full_like(score.total, float("-inf")),
             )
-        return (
+            finite_returns.append(finite)
+
+            if return_best:
+                chunk_strict_available = torch.isfinite(score.total).any(dim=1)
+                chunk_strict_best, chunk_strict_indices = score.total.max(dim=1)
+                chunk_finite_best, chunk_finite_indices = finite.max(dim=1)
+                chunk_best = torch.where(
+                    chunk_strict_available,
+                    chunk_strict_best,
+                    chunk_finite_best,
+                )
+                chunk_indices = torch.where(
+                    chunk_strict_available,
+                    chunk_strict_indices,
+                    chunk_finite_indices,
+                )
+                improved = (
+                    chunk_strict_available
+                    & (~has_strict_candidate | (chunk_best > iteration_best))
+                ) | (
+                    ~chunk_strict_available
+                    & ~has_strict_candidate
+                    & (chunk_best > iteration_best)
+                )
+
+                # Keep only one candidate's data per batch row.  This avoids
+                # retaining all rollout tensors while still eliminating the
+                # shape-changing final rerun in ``plan``.
+                def select_candidate(value):
+                    if (
+                        not isinstance(value, torch.Tensor)
+                        or value.ndim < 2
+                        or value.shape[:2] != selected.shape[:2]
+                    ):
+                        raise ValueError(
+                            "MPC candidate result does not have leading [B,C] "
+                            f"dimensions: {getattr(value, 'shape', None)}"
+                        )
+                    return value[batch_rows, chunk_indices].unsqueeze(1)
+
+                selected_rollout = {
+                    key: select_candidate(value)
+                    for key, value in rollout.items()
+                    # Per-ensemble-member tensors use [M,B,C,...] and are
+                    # already summarized by ``score``.  The returned plan only
+                    # needs standard batch-first rollout fields.
+                    if isinstance(value, torch.Tensor)
+                    and value.ndim >= 2
+                    and value.shape[:2] == selected.shape[:2]
+                }
+                selected_score = MPCObjectiveResult(
+                    total=select_candidate(score.total),
+                    components={
+                        key: select_candidate(value)
+                        for key, value in score.components.items()
+                    },
+                    valid=select_candidate(score.valid),
+                    return_uncertainty=select_candidate(score.return_uncertainty),
+                    diagnostics={
+                        key: select_candidate(value)
+                        for key, value in score.diagnostics.items()
+                    },
+                )
+                selected_action = selected[batch_rows, chunk_indices]
+                if best_rollout is None:
+                    best_rollout = selected_rollout
+                    best_score = selected_score
+                    best_action = selected_action
+                else:
+                    row_mask = improved
+
+                    def choose_rows(old, new):
+                        shape = (batch,) + (1,) * (old.ndim - 1)
+                        return torch.where(row_mask.reshape(shape), new, old)
+
+                    best_rollout = {
+                        key: choose_rows(best_rollout[key], value)
+                        for key, value in selected_rollout.items()
+                    }
+                    best_score = MPCObjectiveResult(
+                        total=choose_rows(best_score.total, selected_score.total),
+                        components={
+                            key: choose_rows(best_score.components[key], value)
+                            for key, value in selected_score.components.items()
+                        },
+                        valid=choose_rows(best_score.valid, selected_score.valid),
+                        return_uncertainty=choose_rows(
+                            best_score.return_uncertainty,
+                            selected_score.return_uncertainty,
+                        ),
+                        diagnostics={
+                            key: choose_rows(best_score.diagnostics[key], value)
+                            for key, value in selected_score.diagnostics.items()
+                        },
+                    )
+                    best_action = choose_rows(best_action, selected_action)
+                iteration_best = torch.where(improved, chunk_best, iteration_best)
+                has_strict_candidate |= chunk_strict_available
+        result = (
             torch.cat(returns, dim=1),
             torch.cat(validity, dim=1),
             torch.cat(finite_returns, dim=1),
         )
+        if not return_best:
+            return result
+        return result + (best_action, best_rollout, best_score)
 
     @staticmethod
     def _gather_candidates(value: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
@@ -330,8 +457,8 @@ class HybridCEMMPC:
                 f"fixed_action_sequence must have shape {expected}, got "
                 f"{tuple(fixed_action_sequence.shape)}"
             )
-        if tuple(fixed_robot_mask.shape) != (self.num_robots,):
-            raise ValueError(f"fixed_robot_mask must have shape ({self.num_robots},)")
+        if tuple(fixed_robot_mask.shape) not in ((self.num_robots,), (states.shape[0], self.num_robots)):
+            raise ValueError("fixed_robot_mask must have shape [robots] or [batch, robots]")
         self.action_adapter.assert_within_bounds(fixed_action_sequence)
 
     @torch.no_grad()
@@ -341,6 +468,7 @@ class HybridCEMMPC:
         planner_state: Optional[MPCPlannerState] = None,
         fixed_action_sequence: Optional[torch.Tensor] = None,
         fixed_robot_mask: Optional[torch.Tensor] = None,
+        reference_action_sequence: Optional[torch.Tensor] = None,
     ) -> MPCPlanResult:
         """Return the first action of the highest predicted-return sequence."""
 
@@ -356,7 +484,17 @@ class HybridCEMMPC:
         started = time.perf_counter()
         probabilities, means, stds = self._initialize(states, planner_state)
         batch = states.shape[0]
-        batch_rows = torch.arange(batch, device=states.device)
+        if reference_action_sequence is not None:
+            if reference_action_sequence.shape != (batch, self.config.horizon, self.action_adapter.action_dim):
+                raise ValueError("Invalid reference action sequence shape")
+            reference_action_sequence = self._apply_fixed_robot_actions(reference_action_sequence, fixed_action_sequence, fixed_robot_mask)
+            self.action_adapter.assert_within_bounds(reference_action_sequence)
+            reference_skills, reference_commands = self.action_adapter.unpack(reference_action_sequence)
+            reference_normalized = self.action_adapter.normalize_parameters(reference_skills, reference_commands)
+            prior = torch.nn.functional.one_hot(reference_skills.long(), self.num_skills).to(probabilities.dtype)
+            # Preserve exploration while centering CEM on an executable student proposal.
+            probabilities = .5*probabilities + .5*prior
+            means = torch.where(prior[..., None].bool(), reference_normalized[..., None, :], means)
         best_return = torch.full(
             (batch,), float("-inf"), dtype=states.dtype, device=states.device
         )
@@ -364,6 +502,8 @@ class HybridCEMMPC:
             batch, dtype=torch.bool, device=states.device
         )
         best_sequence = None
+        best_rollout = None
+        best_score = None
         last_elites = None
         last_actions = last_returns = last_valid = None
         convergence_lists = {
@@ -380,13 +520,24 @@ class HybridCEMMPC:
             self._synchronize(states.device)
             iteration_started = time.perf_counter()
             actions, skills, normalized = self._sample(probabilities, means, stds)
+            if reference_action_sequence is not None:
+                actions[:, 0] = reference_action_sequence
+                skills[:, 0] = reference_skills
+                normalized[:, 0] = reference_normalized
             actions = self._apply_fixed_robot_actions(
                 actions, fixed_action_sequence, fixed_robot_mask
             )
             skills, parameters = self.action_adapter.unpack(actions)
             normalized = self.action_adapter.normalize_parameters(skills, parameters)
-            strict_returns, valid, finite_returns = self._evaluate_candidates(
-                states, actions
+            (
+                strict_returns,
+                valid,
+                finite_returns,
+                selected,
+                selected_rollout,
+                selected_score,
+            ) = self._evaluate_candidates(
+                states, actions, return_best=True
             )
             strict_available = torch.isfinite(strict_returns).any(dim=1)
             recoverable = (~strict_available) & torch.isfinite(finite_returns).any(dim=1)
@@ -402,13 +553,9 @@ class HybridCEMMPC:
                 probabilities, means, stds, skills, normalized, elite_indices
             )
 
-            strict_best, strict_indices = strict_returns.max(dim=1)
-            relaxed_best, relaxed_indices = finite_returns.max(dim=1)
+            strict_best = strict_returns.max(dim=1).values
+            relaxed_best = finite_returns.max(dim=1).values
             iteration_best = torch.where(strict_available, strict_best, relaxed_best)
-            best_indices = torch.where(
-                strict_available, strict_indices, relaxed_indices
-            )
-            selected = actions[batch_rows, best_indices]
             improved = (
                 strict_available
                 & (~has_strict_candidate | (iteration_best > best_return))
@@ -419,9 +566,36 @@ class HybridCEMMPC:
             )
             if best_sequence is None:
                 best_sequence = selected
+                best_rollout = selected_rollout
+                best_score = selected_score
             else:
                 best_sequence = torch.where(
                     improved[:, None, None], selected, best_sequence
+                )
+
+                def choose_rows(old, new):
+                    shape = (batch,) + (1,) * (old.ndim - 1)
+                    return torch.where(improved.reshape(shape), new, old)
+
+                best_rollout = {
+                    key: choose_rows(best_rollout[key], value)
+                    for key, value in selected_rollout.items()
+                }
+                best_score = MPCObjectiveResult(
+                    total=choose_rows(best_score.total, selected_score.total),
+                    components={
+                        key: choose_rows(best_score.components[key], value)
+                        for key, value in selected_score.components.items()
+                    },
+                    valid=choose_rows(best_score.valid, selected_score.valid),
+                    return_uncertainty=choose_rows(
+                        best_score.return_uncertainty,
+                        selected_score.return_uncertainty,
+                    ),
+                    diagnostics={
+                        key: choose_rows(best_score.diagnostics[key], value)
+                        for key, value in selected_score.diagnostics.items()
+                    },
                 )
             best_return = torch.where(improved, iteration_best, best_return)
             has_strict_candidate |= strict_available
@@ -465,27 +639,33 @@ class HybridCEMMPC:
 
         ood_fallback_used = ~has_strict_candidate
 
-        selected_sequence = self._apply_fixed_robot_actions(
-            best_sequence, fixed_action_sequence, fixed_robot_mask
-        )
-        selected_rollout = self.world_model.rollout(
-            states,
-            selected_sequence[:, None],
-            deterministic=self.config.deterministic_world_model,
-            stop_on_done=False,
-            action_transform=self.objective.resolve_imagined_action,
-        )
-        selected_score = self.objective.evaluate(
-            states, selected_sequence[:, None], selected_rollout
-        )
+        selected_sequence = best_sequence
+        selected_rollout = best_rollout
+        selected_score = best_score
         selected_valid = selected_score.valid[:, 0] | (
             ood_fallback_used
             & selected_score.diagnostics["numerically_valid"][:, 0]
         )
         if not bool(selected_valid.all().item()):
             rows = (~selected_valid).nonzero(as_tuple=False).flatten().tolist()
+            numerically_invalid = (
+                ~selected_score.diagnostics["numerically_valid"][:, 0]
+            ).nonzero(as_tuple=False).flatten().tolist()
+            state_ood = selected_score.diagnostics[
+                "state_ood_rejected"
+            ][:, 0].nonzero(as_tuple=False).flatten().tolist()
+            return_ood = selected_score.diagnostics[
+                "return_ood_rejected"
+            ][:, 0].nonzero(as_tuple=False).flatten().tolist()
+            value_ood = selected_score.diagnostics[
+                "terminal_value_ood_rejected"
+            ][:, 0].nonzero(as_tuple=False).flatten().tolist()
             raise RuntimeError(
-                f"Selected MPC rollout is not finite for batch rows {rows}"
+                "Selected MPC candidate failed its original evaluation for batch "
+                f"rows {rows}; numerically_invalid={numerically_invalid}, "
+                f"state_ood_rejected={state_ood}, "
+                f"return_ood_rejected={return_ood}, "
+                f"terminal_value_ood_rejected={value_ood}"
             )
 
         diagnostic_count = min(
@@ -558,15 +738,10 @@ class HybridCEMMPC:
             torch.ones(batch, dtype=torch.bool, device=states.device),
         )
         physical_means, physical_stds = self._physical_distribution(means, stds)
-        selected_return = torch.where(
-            ood_fallback_used,
-            selected_score.diagnostics["raw_total"][:, 0],
-            selected_score.total[:, 0],
-        )
         return MPCPlanResult(
             first_joint_action=selected_sequence[:, 0],
             best_action_sequence=selected_sequence,
-            best_objective=selected_return,
+            best_objective=best_return,
             predicted_states=rollout_states,
             predicted_rewards=rollout_rewards,
             predicted_done_probabilities=rollout_dones,

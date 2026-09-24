@@ -21,10 +21,10 @@ environment:
 mpc:
   algorithm: cem
   horizon: 8
-  num_candidates: 2048
-  num_elites: 128
-  num_iterations: 5
-  candidate_batch_size: 256
+  num_candidates: 128
+  num_elites: 16
+  num_iterations: 3
+  candidate_batch_size: 64
   skill_temperature: 1.0
   min_skill_probability: 0.02
   initial_parameter_std_fraction: 0.50
@@ -37,11 +37,11 @@ mpc:
   gamma: 0.99
   uncertainty_penalty: 0.10
   return_uncertainty_penalty: 0.50
-  skill_switch_penalty: 0.01
-  command_change_penalty: 0.01
-  invalid_skill_penalty: 2.0
-  apply_skill_fallback_in_rollout: true
-  apply_collision_avoidance_in_rollout: true
+  skill_switch_penalty: 0.0
+  command_change_penalty: 0.0
+  invalid_skill_penalty: 0.0
+  apply_skill_fallback_in_rollout: false
+  apply_collision_avoidance_in_rollout: false
   dribble_affordance_distance_m: 1.0
   shoot_affordance_distance_m: 0.75
   shoot_min_forward_m: -0.10
@@ -57,20 +57,20 @@ mpc:
   analytical_reward_coefficient: 1.0
   analytical_macro_dt: 0.2
   analytical_event_dt: 0.02
+  analytical_robot_collision_distance_m: 0.70
+  analytical_robot_collision_lookahead_s: 0.25
   # 1.0 is the measured maximum selected-plan state uncertainty in
   # outputs/mpc_visualizations; candidates beyond it are treated as OOD.
   max_state_uncertainty: 1.0
   max_return_uncertainty: null
   relax_ood_when_all_candidates_rejected: true
-  objective_mode: reward_plus_terminal_value
+  objective_mode: reward_only
   terminal_handling: probability_weighted
   terminal_value:
-    enabled: true
+    enabled: false
     checkpoint: checkpoints/terminal_value_mpc/best.pt
-    required: true
-    # Monte-Carlo V is trained on the behavior mixture rather than the
-    # optimal-policy value; keep it as a continuation prior, not the dominant
-    # candidate-ranking signal.
+    required: false
+    # Available for explicit value-model experiments; disabled by default.
     coefficient: 0.05
     uncertainty_gating: true
     uncertainty_beta: 1.0
@@ -87,16 +87,16 @@ mpc_profiles:
     candidate_batch_size: 256
   fast_validation:
     horizon: 10
-    num_candidates: 256
-    num_elites: 32
+    num_candidates: 128
+    num_elites: 16
     num_iterations: 3
-    candidate_batch_size: 128
+    candidate_batch_size: 64
   realtime:
     horizon: 5
     num_candidates: 128
     num_elites: 16
     num_iterations: 3
-    candidate_batch_size: 128
+    candidate_batch_size: 64
   visualization:
     # Shorter rollouts reduce exploitation of accumulated yaw and command-lag
     # error in the current world model.

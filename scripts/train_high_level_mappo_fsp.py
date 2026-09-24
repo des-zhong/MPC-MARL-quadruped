@@ -26,3 +26,7 @@ def parse_args():
 
 if __name__ == "__main__":
     train_robot(parse_args())
+    import wandb
+    wandb.finish()
+    from scripts.train_high_level import successful_training_exit
+    successful_training_exit()

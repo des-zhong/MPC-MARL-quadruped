@@ -7,6 +7,12 @@ AC_Args:
     min_action_std: 0.05
     max_action_std: 0.25
     action_mean_bound: 0.75
+    hybrid_skill_policy: false
+    discrete_skill_direction_policy: false
+    skill_action_stride: 6
+    num_skill_logits: 3
+    num_direction_logits: 0
+    stop_skill_id: 3
     actor_hidden_dims:
     - 512
     - 256
@@ -42,6 +48,14 @@ PPO_Args:
     max_grad_norm: 1.0
     min_learning_rate: 1.0e-05
     max_learning_rate: 0.001
+    skill_entropy_coef: 0.0
+    skill_action_stride: 6
+    num_skill_logits: 3
+    num_direction_logits: 0
+    stop_skill_id: 3
+    stop_on_excessive_kl: false
+    max_kl_factor: 4.0
+    max_log_ratio: 20.0
     selective_adaptation_module_loss: false
 RunnerArgs:
   desc: null
@@ -52,13 +66,18 @@ RunnerArgs:
     save_interval: 400
     save_video_interval: 500
     log_freq: 10
-    checkpoint_dir: tmp/legged_data/shoot
-    resume: false
+    checkpoint_dir: tmp/legged_data/shoot_option
+    resume: true
     load_run: -1
     checkpoint: -1
     resume_path: null
     resume_curriculum: true
-    resume_checkpoint: tmp/legged_data/shoot/ac_weights_latest.pt
+    resume_checkpoint: wandb/run-20260911_090625-pcze51n3/files/tmp/legged_data/shoot/ac_weights_latest.pt
+    resume_policy_only: false
+    self_play_update_interval: 0
+    skill_entropy_initial_coef: 0.0
+    skill_entropy_final_coef: 0.0
+    skill_entropy_anneal_iterations: 0
 Cfg:
   desc: null
   value:
@@ -72,6 +91,7 @@ Cfg:
       send_timeouts: true
       episode_length_s: 10.0
       record_video: true
+      export_step_telemetry: true
       recording_width_px: 360
       recording_height_px: 240
       recording_mode: COLOR
@@ -79,14 +99,17 @@ Cfg:
       add_balls: true
       shooting_reset_relative_to_command: true
       shooting_reset_longitudinal_range:
-      - 0.35
-      - 0.6
+      - 0.25
+      - 0.65
       shooting_reset_lateral_range:
       - -0.2
       - 0.2
       shooting_reset_yaw_error_range:
       - -0.25
       - 0.25
+      shooting_reset_world_yaw_range:
+      - -3.14159265
+      - 3.14159265
       shooting_reset_zero_velocities: true
       control_all_robots: false
       high_level_control: false
@@ -110,7 +133,15 @@ Cfg:
       - 1.5
       - 1.5
       - 1.0
+      high_level_ball_xy_frame: team_canonical_field
+      high_level_use_geometric_skill_fallback: false
+      high_level_role_aware_fallback: true
       num_robots: 1
+      num_team_robots: 1
+      opponent_team_color:
+      - 0.85
+      - 0.1
+      - 0.1
       teammate_init_pos:
       - -1.0
       - 0.0
@@ -142,6 +173,13 @@ Cfg:
       field_length: 8.0
       field_width: 5.0
       field_margin: 0.4
+      add_boundary_walls: false
+      boundary_wall_thickness: 0.12
+      boundary_wall_height: 0.5
+      boundary_wall_offset: 0.05
+      boundary_wall_goal_opening_margin: 0.0
+      boundary_wall_friction: 0.35
+      boundary_wall_restitution: 0.85
       robot_init_x_range:
       - -3.2
       - -0.8
@@ -180,7 +218,21 @@ Cfg:
       add_field_markers: false
       field_marker_width: 0.04
       field_marker_height: 0.03
+      add_goalposts: false
+      goalpost_asset_file: resources/objects/goalpost/goalpost.urdf
+      add_field_texture: false
+      field_texture_file: resources/textures/field.png
+      field_surface_asset_file: resources/objects/soccer_field/soccer_field.urdf
+      field_texture_length_scale: 1.0666667
+      field_texture_width_scale: 1.1067358
+      field_surface_thickness: 0.01
+      field_surface_offset: 0.002
       priv_observe_ball_drag: true
+      shooting_fixed_world_target: true
+      shooting_option_training: true
+      shooting_deployment_reset_fraction: 1.0
+      shooting_min_target_speed: 1.5
+      shooting_max_target_speed: 3.0
     robot:
       name: as2
     ball:
@@ -301,6 +353,7 @@ Cfg:
       max_yaw_curriculum: 1.0
       exclusive_command_sampling: false
       num_commands: 15
+      ball_xy_frame: body
       resampling_time: 10
       subsample_gait: false
       gait_interval_s: 10.0
@@ -492,7 +545,7 @@ Cfg:
       hip_scale_reduction: 0.5
       decimation: 4
     asset:
-      file: '{MINI_GYM_ROOT_DIR}/resources/robots/as2/urdf/as2.urdf'
+      file: /home/zhz/projects/dribblebot/resources/robots/as2/urdf/as2.urdf
       foot_name: foot
       penalize_contacts_on:
       - thigh
@@ -590,6 +643,10 @@ Cfg:
       only_positive_rewards_ji22_style: false
       sigma_rew_neg: 0.02
       reward_container_name: SoccerRewards
+      unscaled_reward_names:
+      - shooting_failure
+      - shooting_launch
+      - shooting_success
       tracking_sigma: 0.25
       tracking_sigma_lat: 0.25
       tracking_sigma_long: 0.25
@@ -602,6 +659,10 @@ Cfg:
       - 1.5
       - 1.5
       - 1.0
+      dribbling_target_forward: 0.35
+      dribbling_target_lateral: 0.0
+      dribbling_position_gain: 10.0
+      dribbling_forward_speed_scale: 1.0
       shooting_command_scale:
       - 3.0
       - 3.0
@@ -632,36 +693,59 @@ Cfg:
       shooting_free_yaw_rate: 0.75
       shooting_yaw_rate_scale: 2.0
       shooting_reward_min_separation: 0.55
-      shooting_launch_speed_fraction: 0.2
-      shooting_launch_alignment: 0.5
+      shooting_launch_speed_fraction: 0.35
+      shooting_launch_alignment: 0.6
       shooting_success_distance: 0.7
-      shooting_success_speed_fraction: 0.25
-      shooting_success_alignment: 0.65
-      shooting_max_attempt_time_s: 5.0
+      shooting_success_speed_fraction: 0.5
+      shooting_success_alignment: 0.75
+      shooting_max_attempt_time_s: 2.4
       use_high_level_match_termination: false
       high_level_border_margin: 0.0
       high_level_min_robot_spacing: 0.65
       high_level_target_robot_spacing: 1.5
+      high_level_support_min_ball_distance: 1.15
+      high_level_support_depth: 0.5
+      high_level_support_lateral: 1.2
+      high_level_support_walk_speed: 0.75
+      high_level_support_command_deadband: 0.08
+      high_level_attacker_switch_margin: 0.15
+      high_level_robot_collision_distance: 0.65
+      high_level_robot_collision_lookahead: 0.25
+      high_level_robot_avoidance_distance: 0.55
+      high_level_robot_avoidance_lookahead: 0.25
+      high_level_robot_avoidance_speed: 0.5
       high_level_obstacle_safe_distance: 0.55
       high_level_dribble_skill_distance: 1.0
       high_level_dribble_control_distance: 0.8
       high_level_skill_command_min_speed: 0.2
+      high_level_skill_command_target_speed: 0.8
+      high_level_local_attacker_ball_skill_scale: 0.0
+      high_level_local_attacker_command_assist_scale: 0.0
+      high_level_local_role_conflict_scale: 0.0
+      high_level_local_support_ball_crowding_scale: 0.0
       high_level_dribble_min_ball_speed: 0.1
       high_level_dribble_target_ball_speed: 1.0
       high_level_shoot_skill_distance: 0.75
       high_level_shoot_min_forward: -0.1
       high_level_shoot_lateral_reach: 0.45
+      high_level_shoot_setup_min_behind_alignment: 0.3
       high_level_shoot_min_ball_speed: 0.8
       high_level_shoot_min_delta_speed: 0.25
       high_level_shoot_target_delta_speed: 1.5
       high_level_shoot_min_command_alignment: 0.6
       high_level_shoot_alignment: 0.35
       high_level_approach_walk_speed: 0.9
+      high_level_face_ball_min_closing_speed: 0.05
+      high_level_face_ball_target_closing_speed: 0.5
       constrict: false
       constrict_indices: []
       constrict_ranges:
       - []
       constrict_after: 0
+      shooting_require_ball_travel: true
+      shooting_min_launch_speed: 0.8
+      shooting_min_success_speed: 1.2
+      shooting_min_ball_travel: 0.5
     reward_scales:
       termination: -0.0
       tracking_lin_vel: 0.0
@@ -682,8 +766,8 @@ Cfg:
       tracking_lin_vel_long: 0.0
       tracking_contacts: 0.0
       tracking_contacts_shaped: 0.0
-      tracking_contacts_shaped_force: 4.0
-      tracking_contacts_shaped_vel: 4.0
+      tracking_contacts_shaped_force: 0.5
+      tracking_contacts_shaped_vel: 0.5
       jump: 0.0
       energy: 0.0
       energy_expenditure: 0.0
@@ -702,6 +786,7 @@ Cfg:
       raibert_heuristic: 0.0
       dribbling_robot_ball_vel: 0.0
       dribbling_robot_ball_pos: 0.0
+      dribbling_backward_motion: 0.0
       dribbling_ball_vel: 0.0
       dribbling_robot_ball_yaw: 0.0
       dribbling_ball_vel_norm: 0.0
@@ -718,25 +803,30 @@ Cfg:
       shooting_ball_vel_angle: 1.5
       shooting_ball_out: 7.0
       shooting_robot_ball_pos: 0.0
-      shooting_robot_ball_behind: 0.5
-      shooting_robot_forward_cmd: 0.5
-      shooting_ball_in_front: 0.25
+      shooting_robot_ball_behind: 0.0
+      shooting_robot_forward_cmd: 0.0
+      shooting_ball_in_front: 0.0
       shooting_robot_approach_ball: 1.5
       shooting_excess_yaw: -0.1
-      shooting_launch: 50.0
-      shooting_success: 200.0
-      shooting_failure: -25.0
+      shooting_launch: 5.0
+      shooting_success: 25.0
+      shooting_failure: -2.0
       high_level_goal: 0.0
+      high_level_opponent_goal: 0.0
       high_level_accidental_termination: 0.0
       high_level_ball_goal_progress: 0.0
       high_level_possession: 0.0
       high_level_robot_spacing: 0.0
+      high_level_robot_collision: 0.0
       high_level_obstacle_clearance: 0.0
       high_level_pass: 0.0
       high_level_invalid_skill: 0.0
       high_level_approach_ball: 0.0
       high_level_walk_command_alignment: 0.0
+      high_level_face_ball_while_approaching: 0.0
+      high_level_face_goal_while_moving: 0.0
       high_level_dribble_ball_control: 0.0
+      high_level_shoot_setup: 0.0
       high_level_shoot_launch: 0.0
       shooting_ball_forward: 8.0
     normalization:
@@ -940,7 +1030,7 @@ _wandb:
     framework: torch
     is_jupyter_run: false
     is_kaggle_kernel: false
-    start_time: 1785912337.60743
+    start_time: 1789372456.639064
     t:
       1:
       - 1

@@ -1,0 +1,17 @@
+{
+  "checkpoint": 2800,
+  "fresh_buffer_items": 604,
+  "teacher_skill_counts": [
+    290,
+    219,
+    95
+  ],
+  "student_skill_modes_on_same_states": [
+    269,
+    189,
+    146
+  ],
+  "student_mean_shoot_probability_on_teacher_shoot_states": 0.7611138820648193,
+  "teacher_shoot_mean_speed": 3.324612617492676,
+  "teacher_shoot_below_1_5_fraction": 0.04210526496171951
+}

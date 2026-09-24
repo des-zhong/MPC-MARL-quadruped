@@ -44,6 +44,7 @@ class MPCObjective:
         config: MPCConfig,
         terminal_value: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         controlled_robot_count: Optional[int] = None,
+        reward_scales: Optional[Mapping[str, float]] = None,
     ):
         self.schema = schema
         self.action_adapter = action_adapter
@@ -61,6 +62,7 @@ class MPCObjective:
         self.analytical_reward = AnalyticalRewardReconstructor(
             schema, action_adapter, self.event_names, config,
             self.controlled_robot_count,
+            reward_scales=reward_scales,
         )
         needs_value = config.objective_mode in {
             "terminal_value_only",
@@ -212,11 +214,33 @@ class MPCObjective:
         }
         learned_return = (rewards * weights).sum(dim=-1)
         predicted_return = learned_return
-        invalid_mask = self.skill_resolver.affordances(
-            rollout["predicted_states"][..., :-1, :], action_sequences
-        )[0]
+        needs_invalid = (
+            self.config.invalid_skill_penalty != 0.0
+            or self.analytical_reward.reward_scales["invalid_skill"] != 0.0
+            or any(
+                self.analytical_reward.reward_scales[name] != 0.0
+                for name in (
+                    "walk_command_alignment",
+                    "face_ball_while_approaching",
+                    "face_goal_while_moving",
+                    "dribble_ball_control",
+                )
+            )
+        )
+        if needs_invalid:
+            invalid_mask = self.skill_resolver.affordances(
+                rollout["predicted_states"][..., :-1, :], action_sequences
+            )[0]
+        else:
+            skills, _ = self.action_adapter.unpack(action_sequences)
+            invalid_mask = torch.zeros_like(skills, dtype=torch.bool)
         invalid = invalid_mask[..., : self.controlled_robot_count].to(rewards.dtype).sum(-1)
         executed_actions = rollout.get("executed_actions", action_sequences)
+        if self.config.shooting_options:
+            requested_ids, _ = self.action_adapter.unpack(action_sequences)
+            timers = torch.cat([rollout["predicted_states"][..., :-1, self.schema.slice(f"robot_{r}.shoot_option_remaining")]
+                                for r in range(self.action_adapter.num_robots)], -1)
+            invalid_mask = invalid_mask & ~((requested_ids == 2) | (timers > 0))
         analytical_rewards, analytical_components = self.analytical_reward(
             rollout["predicted_states"],
             executed_actions,
@@ -277,13 +301,19 @@ class MPCObjective:
         components["invalid_skill_penalty"] = (
             -self.config.invalid_skill_penalty * (invalid * weights).sum(-1)
         )
-        switches, changes = self._action_costs(initial_states, action_sequences)
-        components["skill_switch_penalty"] = (
-            -self.config.skill_switch_penalty * (switches * weights).sum(-1)
-        )
-        components["command_change_penalty"] = (
-            -self.config.command_change_penalty * (changes * weights).sum(-1)
-        )
+        if (
+            self.config.skill_switch_penalty != 0.0
+            or self.config.command_change_penalty != 0.0
+        ):
+            switches, changes = self._action_costs(
+                initial_states, action_sequences
+            )
+            components["skill_switch_penalty"] = (
+                -self.config.skill_switch_penalty * (switches * weights).sum(-1)
+            )
+            components["command_change_penalty"] = (
+                -self.config.command_change_penalty * (changes * weights).sum(-1)
+            )
 
         terminal_state_value = torch.zeros_like(predicted_return)
         terminal_value_uncertainty = torch.zeros_like(predicted_return)

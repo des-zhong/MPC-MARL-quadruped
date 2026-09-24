@@ -1,9 +1,22 @@
 """AS2 high-level soccer training entry point."""
 
 import argparse
+import os
 import tempfile
 from pathlib import Path
 from typing import Mapping
+
+
+# Keep CPU library fan-out bounded without requiring every Bash launcher to
+# repeat the same environment setup.
+_CPU_THREADS = os.environ.get("DRIBBLEBOT_CPU_THREADS", "4")
+for _THREAD_ENV in (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_THREAD_ENV, _CPU_THREADS)
 
 
 DEFAULT_AS2_SKILL_RUNS = {
@@ -14,45 +27,84 @@ DEFAULT_AS2_SKILL_RUNS = {
 
 SKILL_NAMES = ("walk", "dribble", "shoot")
 
+
+def save_checkpoint_config(run, directory):
+    """Persist the execution contract even when W&B is offline."""
+    import yaml
+    root = Path(directory)
+    root.mkdir(parents=True, exist_ok=True)
+    temporary = root / "config.yaml.tmp"
+    temporary.write_text(yaml.safe_dump(dict(run.config), sort_keys=False))
+    temporary.replace(root / "config.yaml")
+
+
+def successful_training_exit():
+    """Avoid legacy Isaac Gym interpreter-teardown crashes after completion."""
+    import sys
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
+
 HIGH_LEVEL_REWARD_SCALES = {
-    # Reward scales are multiplied by the raw environment dt (0.02 s).  The
-    # dense terms deliberately cover every transition in the skill sequence so
-    # the coordinator cannot maximize return by collapsing to walk forever:
-    # approach -> controlled dribble -> aligned launch -> goal.
-    "high_level_goal": 500.0,
-    "high_level_accidental_termination": -200.0,
+    # Keep the task objective deliberately small: sparse match outcomes plus
+    # only the signed progress/affordance signals needed to make the sparse
+    # objective learnable. Retain one bounded collision safety cost. Match events (see
+    # Cfg.rewards.unscaled_reward_names), so these values are the actual
+    # one-event returns.  All other high-level reward implementations remain
+    # available for diagnostics/ablations but are inactive during training.
+    "high_level_goal": 75.0,
+    # Keep goals for and against symmetric. Conceded goals are excluded from
+    # the broader accidental-termination event in the match reset logic.
+    "high_level_opponent_goal": -75.0,
+    # Keep falling costly without letting frequent early-policy falls swamp
+    # the much rarer soccer outcomes. Team attribution in the raw environment
+    # ensures this is charged only for a learning-team failure.
+    "high_level_accidental_termination": -5.0,
     "high_level_ball_goal_progress": 2.0,
-    # A teammate that is not the closest attacker should spread and support,
-    # rather than receive the same implicit invitation to converge on the ball.
-    "high_level_robot_spacing": 0.75,
-    # Smooth near-contact cost. Keep this weaker than the offensive shaping:
-    # collision avoidance should not make yielding the ball the easiest policy.
-    "high_level_robot_collision": -2.0,
-    "high_level_pass": 2.0,
-    "high_level_invalid_skill": -3.0,
+    "high_level_goalward_ball_velocity": 0.75,
     "high_level_approach_ball": 1.0,
-    "high_level_walk_command_alignment": 0.5,
-    "high_level_face_ball_while_approaching": 0.5,
-    "high_level_face_goal_while_moving": 0.75,
-    "high_level_dribble_ball_control": 2.0,
-    # Emitted only when the policy transitions into a feasible, goal-directed
-    # shot, so it teaches shot selection without becoming a stationary reward.
-    "high_level_shoot_setup": 5.0,
-    # A launch is a short event rather than a reward emitted throughout the
-    # control interval, so it needs a larger nominal coefficient than the
-    # continuously evaluated approach and dribble terms.
-    "high_level_shoot_launch": 10.0,
+    # These terms provide credit before a full goal.  The previous run left
+    # all skill-specific terms at zero, so selecting dribble/shoot had no
+    # learnable signal until the very rare goal event.
+    "high_level_dribble_ball_control": 1.0,
+    "high_level_shoot_setup": 1.0,
+    "high_level_shoot_launch": 5.0,
+    # Keep a diagnostic penalty on invalid requests even though the default
+    # execution adapter replaces them with an affordance-safe skill.  This
+    # still teaches PPO the boundary without repeatedly invoking a frozen
+    # dribble/shoot policy far outside the state distribution it was trained on.
+    "high_level_invalid_skill": -2.0,
+    # The reward implementation is zero outside its clearance threshold and
+    # bounded at one, so this remains subordinate to ball and match outcomes.
+    "high_level_robot_collision": -2.0,
+    "high_level_support_lane": -0.5,
 }
 
-# These terms are assigned to individual shared-policy samples by
-# SharedPolicySelfPlayWrapper. Keeping them out of the raw team return avoids
-# reinforcing a stationary attacker for work performed by its teammate.
+# SharedPolicySelfPlayWrapper can add these terms to individual policy samples
+# after the cooperative environment reward is computed.  Zero every scale so
+# both robots receive the same cooperative match/safety objective.
 HIGH_LEVEL_LOCAL_ROLE_REWARD_SCALES = {
-    "attacker_ball_skill": 2.0,
-    "attacker_command_assist": -4.0,
-    "role_conflict": -3.0,
-    "support_ball_crowding": -3.0,
+    "attacker_ball_skill": 0.0,
+    "attacker_command_assist": 0.0,
+    "role_conflict": 0.0,
+    "support_ball_crowding": 0.0,
 }
+
+
+def resolved_high_level_reward_scales(args):
+    """Return the nominal (pre-dt) reward contract for training and MPC."""
+
+    scales = dict(HIGH_LEVEL_REWARD_SCALES)
+    scales["high_level_attack_position"] = float(getattr(args, "attack_position_reward", 0.))
+    if getattr(args, "shoot_setup_event_reward", 0.0) > 0:
+        scales["high_level_shoot_setup"] = args.shoot_setup_event_reward
+    scales["high_level_robot_collision"] = -abs(
+        float(getattr(args, "robot_collision_penalty", 2.0))
+    )
+    scales["high_level_invalid_skill"] = -abs(
+        float(getattr(args, "invalid_skill_penalty", 2.0))
+    )
+    return scales
 
 
 def set_training_seed(seed):
@@ -71,7 +123,9 @@ def set_training_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def resolve_high_level_checkpoint_dir(configured, wandb_run_dir):
+def resolve_high_level_checkpoint_dir(
+    configured, wandb_run_dir, subdirectory="high_level"
+):
     """Resolve an optional override or create the standard per-run W&B path."""
 
     if configured:
@@ -85,7 +139,7 @@ def resolve_high_level_checkpoint_dir(configured, wandb_run_dir):
             Path(wandb_run_dir).expanduser().resolve()
             / "tmp"
             / "legged_data"
-            / "high_level"
+            / str(subdirectory)
         )
     )
 
@@ -121,6 +175,10 @@ def high_level_checkpoint_contract(policy_record):
     team_size = self_play.get("team_size", env.get("num_team_robots"))
     return {
         "config_path": str(config_path),
+        "action_encoding": env.get("high_level_action_encoding", "hybrid"),
+        "discrete_command_fraction": env.get(
+            "high_level_discrete_command_fraction"
+        ),
         "team_size": team_size,
         "control_interval": env.get("high_level_control_interval"),
         "history_length": env.get("high_level_history_length"),
@@ -128,8 +186,12 @@ def high_level_checkpoint_contract(policy_record):
         "dribble_scale": env.get("high_level_dribble_command_scale"),
         "shoot_scale": env.get("high_level_shoot_command_scale"),
         "geometric_fallback": env.get("high_level_use_geometric_skill_fallback"),
+        "collision_avoidance": env.get("high_level_collision_avoidance", False),
+        "near_ball_reposition": env.get("high_level_allow_near_ball_reposition", False),
+        "shooting_options": env.get("high_level_shooting_options", False),
         "role_aware_fallback": env.get("high_level_role_aware_fallback"),
         "near_ball_probability": env.get("high_level_near_ball_init_probability"),
+        "near_ball_init_team": env.get("high_level_near_ball_init_team"),
         "boundary_walls": env.get("add_boundary_walls"),
         "attacker_switch_margin": rewards.get("high_level_attacker_switch_margin"),
         "support_command_deadband": rewards.get("high_level_support_command_deadband"),
@@ -143,6 +205,12 @@ def validate_high_level_evaluation_contract(policy_record, args):
     if contract is None:
         return
     actual = {
+        "action_encoding": (
+            "discrete_skill_direction"
+            if getattr(args, "discrete_skill_direction", False)
+            else "hybrid"
+        ),
+        "discrete_command_fraction": 0.5,
         "team_size": int(args.num_robots),
         "control_interval": int(args.control_interval),
         "history_length": int(args.high_level_history),
@@ -162,14 +230,24 @@ def validate_high_level_evaluation_contract(policy_record, args):
             0.0,
         ],
         "geometric_fallback": bool(args.use_geometric_skill_fallback),
+        "collision_avoidance": bool(getattr(args, "collision_avoidance", False)),
+        "near_ball_reposition": bool(getattr(args, "allow_near_ball_reposition", False)),
+        "shooting_options": bool(getattr(args, "shooting_options", False)),
         "role_aware_fallback": bool(getattr(args, "role_aware_fallback", True)),
         "near_ball_probability": float(args.near_ball_init_probability),
+        "near_ball_init_team": getattr(args, "near_ball_init_team", "balanced"),
         "boundary_walls": bool(getattr(args, "boundary_walls", True)),
-        "attacker_switch_margin": float(getattr(args, "attacker_switch_margin", 0.15)),
+        "attacker_switch_margin": float(getattr(args, "attacker_switch_margin", 0.0)),
         "support_command_deadband": float(getattr(args, "support_command_deadband", 0.08)),
     }
     mismatches = []
     for name, actual_value in actual.items():
+        if name in {"near_ball_probability", "near_ball_init_team"} and getattr(args, "random_learning_start", False):
+            # Explicit reset override; retain all execution-contract checks.
+            continue
+        if name == "near_ball_probability" and getattr(args, "random_init", False):
+            # Explicit evaluation reset override; keep all execution checks.
+            continue
         expected = contract.get(name)
         if expected is None:
             continue
@@ -282,6 +360,30 @@ def validate_high_level_training_args(args):
         raise ValueError("--action-mean-bound must be positive")
     if args.max_skill_action_clip <= 0.0:
         raise ValueError("--max-skill-action-clip must be positive")
+    if getattr(args, "attack_position_reward", 0.) < 0:
+        raise ValueError("--attack-position-reward must be non-negative")
+    if not 0.0 <= getattr(args, "joint_reset_noise", 0.0) <= 0.5:
+        raise ValueError("--joint-reset-noise must be between 0 and 0.5")
+    if getattr(args, "rollout_steps", 24) < 1:
+        raise ValueError("--rollout-steps must be positive")
+    if getattr(args, "shoot_setup_event_reward", 0.0) < 0:
+        raise ValueError("--shoot-setup-event-reward must be non-negative")
+    if getattr(args, "curriculum_min_episodes", 512) < 1:
+        raise ValueError("--curriculum-min-episodes must be positive")
+    if getattr(args, "curriculum_min_stage_updates", 300) < 1:
+        raise ValueError("--curriculum-min-stage-updates must be positive")
+    if not 0 <= getattr(args, "curriculum_normal_threshold", .10) <= 1:
+        raise ValueError("--curriculum-normal-threshold must be between 0 and 1")
+    for name in ("curriculum_success_threshold", "curriculum_opponent_threshold", "curriculum_max_failure_rate"):
+        if not 0 < getattr(args, name, 0.25) < 1:
+            raise ValueError(name + " must lie strictly between zero and one")
+    if getattr(args, "soccer_curriculum", False):
+        if args.num_robots not in (1, 2) or not getattr(args, "self_play", True):
+            raise ValueError("Soccer curriculum requires 1v1 or 2v2 self-play")
+        if args.field_length < 6 or args.field_width < 4:
+            raise ValueError("Soccer curriculum requires a field at least 6m by 4m")
+        if args.opponent_pool_size < 2:
+            raise ValueError("Soccer curriculum requires an opponent pool of at least 2 to preserve the anchor")
     if args.self_play_update_interval < 1:
         raise ValueError("--self-play-update-interval must be at least 1")
     if args.opponent_pool_size < 1:
@@ -290,6 +392,8 @@ def validate_high_level_training_args(args):
         raise ValueError("--opponent-latest-probability must be between 0 and 1")
     if args.robot_collision_penalty < 0.0:
         raise ValueError("--robot-collision-penalty must be non-negative")
+    if getattr(args, "invalid_skill_penalty", 2.0) < 0.0:
+        raise ValueError("--invalid-skill-penalty must be non-negative")
     if args.robot_collision_distance <= 0.0:
         raise ValueError("--robot-collision-distance must be positive")
     if getattr(args, "robot_collision_lookahead", 0.25) < 0.0:
@@ -319,6 +423,14 @@ def validate_high_level_training_args(args):
         )
     if getattr(args, "teacher_reward_coefficient", 0.0) < 0.0:
         raise ValueError("--teacher-reward-coefficient must be non-negative")
+    if (
+        getattr(args, "discrete_skill_direction", False)
+        and getattr(args, "world_model_checkpoint", None)
+    ):
+        raise ValueError(
+            "The MPC teacher uses the continuous high-level action adapter and "
+            "cannot be combined with --discrete-skill-direction."
+        )
 
 
 def add_skill_policy_source_args(parser):
@@ -327,7 +439,7 @@ def add_skill_policy_source_args(parser):
     parser.add_argument(
         "--skill-policy-source",
         choices=("wandb", "local"),
-        default="wandb",
+        default=None,
         help=(
             "Load every low-level skill from online W&B (downloaded to a process-local "
             "temporary directory) or directly from the three --*-policy-dir folders."
@@ -386,16 +498,26 @@ def configure_high_level_cfg(Cfg, args):
     Cfg.env.opponent_team_color = [0.85, 0.10, 0.10]
     Cfg.env.control_all_robots = True
     Cfg.env.high_level_control = True
+    Cfg.env.high_level_joint_reset_noise = float(getattr(args, "joint_reset_noise", 0.0))
     Cfg.env.high_level_control_interval = args.control_interval
     Cfg.env.high_level_history_length = args.high_level_history
+    discrete_skill_direction = bool(
+        getattr(args, "discrete_skill_direction", False)
+    )
+    Cfg.env.high_level_action_encoding = (
+        "discrete_skill_direction" if discrete_skill_direction else "hybrid"
+    )
+    Cfg.env.high_level_discrete_command_fraction = 0.5
     Cfg.env.high_level_num_observations = 25 * physical_robots + 6
-    Cfg.env.high_level_num_actions = 6 * physical_robots
+    Cfg.env.high_level_num_actions = (
+        (12 if discrete_skill_direction else 6) * physical_robots
+    )
     # High-level logits/raw command inputs and low-level actuator actions use
     # different numeric ranges.  Do not reuse normalization.clip_actions for
     # both: the latter is set from the loaded skill checkpoints below.
     Cfg.env.high_level_action_input_clip = 10.0
     Cfg.env.high_level_use_geometric_skill_fallback = bool(
-        getattr(args, "use_geometric_skill_fallback", False)
+        getattr(args, "use_geometric_skill_fallback", True)
     )
     Cfg.env.high_level_role_aware_fallback = bool(
         getattr(args, "role_aware_fallback", True)
@@ -460,7 +582,15 @@ def configure_high_level_cfg(Cfg, args):
     Cfg.env.opponent_init_x_range = [0.0, 0.5 * args.field_length - 0.6]
     Cfg.env.opponent_init_y_range = [-0.5 * args.field_width + 0.6, 0.5 * args.field_width - 0.6]
     Cfg.env.opponent_yaw_range = [-3.14159265, 3.14159265]
-    Cfg.env.ball_init_x_range = [-0.5 * args.field_length + 0.8, 0.5 * args.field_length - 1.2]
+    # Keep normal kickoffs reachable by the learning team. Robots initially
+    # occupy the -x half; sampling the ball up to +3 m created many starts
+    # where both teammates had to cross the centre before making contact,
+    # producing the observed collapse in normal-start goal rate. Near-ball and
+    # possession starts already provide transfer coverage around midfield.
+    Cfg.env.ball_init_x_range = [
+        -0.5 * args.field_length + 1.0,
+        0.0,
+    ]
     Cfg.env.ball_init_y_range = [-0.5 * args.field_width + 0.8, 0.5 * args.field_width - 0.8]
     Cfg.env.match_init_min_clearance = 0.75
     near_ball_probability = float(getattr(args, "near_ball_init_probability", 0.4))
@@ -477,6 +607,20 @@ def configure_high_level_cfg(Cfg, args):
             f"got [{near_ball_min_distance}, {near_ball_max_distance}]."
         )
     Cfg.env.high_level_near_ball_init_probability = near_ball_probability
+    # Sample the near-ball robot uniformly across both teams by default. This
+    # removes the old learner-half kickoff bias while keeping the useful
+    # contact-rich curriculum. Evaluation may restore an explicitly recorded
+    # legacy mode from a checkpoint.
+    near_ball_init_team = str(
+        getattr(args, "near_ball_init_team", None) or "balanced"
+    ).lower()
+    if near_ball_init_team not in ("balanced", "learning", "opponent"):
+        raise ValueError(
+            "near_ball_init_team must be 'balanced', 'learning', or 'opponent', "
+            f"got {near_ball_init_team!r}."
+        )
+    args.near_ball_init_team = near_ball_init_team
+    Cfg.env.high_level_near_ball_init_team = near_ball_init_team
     Cfg.env.high_level_near_ball_init_distance_range = [
         near_ball_min_distance,
         near_ball_max_distance,
@@ -579,19 +723,37 @@ def configure_high_level_cfg(Cfg, args):
     for key in list(vars(Cfg.reward_scales).keys()):
         if not key.startswith("_"):
             setattr(Cfg.reward_scales, key, 0.0)
-    for reward_name, scale in HIGH_LEVEL_REWARD_SCALES.items():
+    for reward_name, scale in resolved_high_level_reward_scales(args).items():
         setattr(Cfg.reward_scales, reward_name, scale)
-    Cfg.reward_scales.high_level_robot_collision = -abs(
-        float(getattr(args, "robot_collision_penalty", 2.0))
-    )
-    # A pass has no receiver and is identically zero in the single-robot task.
-    # Remove it from the active objective so the saved configuration accurately
-    # describes what can contribute to learning.
-    if num_robots == 1:
-        Cfg.reward_scales.high_level_pass = 0.0
-        Cfg.reward_scales.high_level_robot_spacing = 0.0
 
     Cfg.rewards.reward_container_name = "HighLevelRewards"
+    # Sparse match events are impulses.  Keep dense shaping dt-scaled while
+    # preserving the configured goal/opponent/termination values as the
+    # actual event returns.
+    Cfg.rewards.unscaled_reward_names = [
+        "high_level_goal",
+        "high_level_opponent_goal",
+        "high_level_accidental_termination",
+    ]
+    Cfg.rewards.high_level_shoot_setup_once_per_episode = getattr(args, "shoot_setup_event_reward", 0.0) > 0
+    if Cfg.rewards.high_level_shoot_setup_once_per_episode:
+        Cfg.rewards.unscaled_reward_names.append("high_level_shoot_setup")
+    Cfg.rewards.high_level_goalward_launch = bool(getattr(args, "goalward_launch_reward", False))
+    Cfg.env.high_level_shooting_options = bool(getattr(args, "shooting_options", False))
+    Cfg.rewards.high_level_launch_event = Cfg.env.high_level_shooting_options
+    if Cfg.env.high_level_shooting_options:
+        if int(args.control_interval) != 10:
+            raise ValueError("Shooting options require control-interval 10 (0.2 s).")
+        Cfg.rewards.unscaled_reward_names.append("high_level_shoot_launch")
+        Cfg.reward_scales.high_level_shoot_setup = 0.0
+    Cfg.env.centralized_critic = bool(getattr(args, "centralized_critic", False))
+    Cfg.env.attack_diagnostics = bool(getattr(args, "attack_diagnostics", False))
+    Cfg.env.high_level_allow_near_ball_reposition = getattr(args, "attack_position_reward", 0.) > 0.
+    Cfg.env.soccer_curriculum = bool(getattr(args, "soccer_curriculum", False))
+    for name, default in (("curriculum_min_episodes", 512), ("curriculum_success_threshold", .35),
+                          ("curriculum_opponent_threshold", .10), ("curriculum_max_failure_rate", .25),
+                          ("curriculum_min_stage_updates", 300), ("curriculum_normal_threshold", .10)):
+        setattr(Cfg.env, name, getattr(args, name, default))
     Cfg.rewards.only_positive_rewards = False
     Cfg.rewards.only_positive_rewards_ji22_style = False
     Cfg.rewards.use_terminal_body_height = True
@@ -662,6 +824,8 @@ def configure_high_level_cfg(Cfg, args):
     Cfg.rewards.high_level_shoot_alignment = 0.35
     Cfg.rewards.high_level_approach_walk_speed = 0.9
     Cfg.rewards.high_level_goal_facing_target_speed = 0.5
+    Cfg.rewards.high_level_face_ball_min_closing_speed = 0.05
+    Cfg.rewards.high_level_face_ball_target_closing_speed = 0.5
     Cfg.rewards.walking_command_scale = [
         walk_x_scale,
         walk_y_scale,
@@ -689,7 +853,17 @@ def configure_high_level_cfg(Cfg, args):
 
 
 def load_skill_policies(args):
-    source_kind = str(getattr(args, "skill_policy_source", "wandb"))
+    source_kind = getattr(args, "skill_policy_source", None)
+    if source_kind is None:
+        # Supplying all three local policy directories is sufficient to select
+        # local loading; callers that omit them retain the W&B default.
+        source_kind = (
+            "local"
+            if all(getattr(args, f"{skill}_policy_dir", None) for skill in SKILL_NAMES)
+            else "wandb"
+        )
+        args.skill_policy_source = source_kind
+    source_kind = str(source_kind)
     if source_kind not in ("wandb", "local"):
         raise ValueError(
             f"Unsupported skill_policy_source={source_kind!r}; expected 'wandb' or 'local'."
@@ -936,6 +1110,7 @@ def train_robot(args):
     # Resolved after wandb.init: by default each run owns its checkpoint
     # directory under wandb/run-<timestamp>-<id>/files/.
     RunnerArgs.checkpoint_dir = args.checkpoint_dir
+    RunnerArgs.num_steps_per_env = getattr(args, "rollout_steps", 24)
     RunnerArgs.self_play_update_interval = args.self_play_update_interval
     RunnerArgs.skill_entropy_initial_coef = args.skill_entropy_coef
     RunnerArgs.skill_entropy_final_coef = args.skill_entropy_final_coef
@@ -950,21 +1125,39 @@ def train_robot(args):
     PPO_Args.entropy_coef = args.entropy_coef
     PPO_Args.num_learning_epochs = args.ppo_epochs
     PPO_Args.skill_entropy_coef = args.skill_entropy_coef
-    PPO_Args.skill_action_stride = 6
-    PPO_Args.num_skill_logits = 3
+    discrete_skill_direction = bool(
+        getattr(args, "discrete_skill_direction", False)
+    )
+    PPO_Args.skill_action_stride = 12 if discrete_skill_direction else 6
+    PPO_Args.num_skill_logits = 4 if discrete_skill_direction else 3
+    PPO_Args.num_direction_logits = 8 if discrete_skill_direction else 0
+    PPO_Args.stop_skill_id = 3
     PPO_Args.stop_on_excessive_kl = True
     PPO_Args.max_kl_factor = args.max_kl_factor
     AC_Args.init_noise_std = args.init_noise_std
     AC_Args.max_action_std = args.max_noise_std
-    AC_Args.action_mean_bound = args.action_mean_bound
-    AC_Args.hybrid_skill_policy = True
-    AC_Args.skill_action_stride = 6
-    AC_Args.num_skill_logits = 3
+    # Categorical logits do not need a tanh range. Keeping them unbounded
+    # avoids imposing an artificial ceiling on attainable skill/direction
+    # probabilities; PPO's exact categorical KL remains the drift guard.
+    AC_Args.action_mean_bound = (
+        None if discrete_skill_direction else args.action_mean_bound
+    )
+    AC_Args.discrete_skill_direction_policy = discrete_skill_direction
+    AC_Args.hybrid_skill_policy = not discrete_skill_direction
+    AC_Args.skill_action_stride = 12 if discrete_skill_direction else 6
+    AC_Args.num_skill_logits = 4 if discrete_skill_direction else 3
+    AC_Args.num_direction_logits = 8 if discrete_skill_direction else 0
+    AC_Args.stop_skill_id = 3
     AC_Args.adaptation_labels = []
     AC_Args.adaptation_dims = []
 
     run = wandb.init(
-        project=args.project or "as2_high_level_soccer",
+        project=args.project
+        or (
+            "as2_discrete_high_level_soccer"
+            if discrete_skill_direction
+            else "as2_high_level_soccer"
+        ),
         config={
             "AC_Args": vars(AC_Args),
             "PPO_Args": vars(PPO_Args),
@@ -976,6 +1169,34 @@ def train_robot(args):
                 "shoot": args.shoot_wandb_run,
                 "checkpoint": args.skill_checkpoint,
             },
+            "high_level_action_encoding": (
+                "discrete_skill_direction"
+                if discrete_skill_direction
+                else "hybrid"
+            ),
+            "high_level_discrete_command_fraction": (
+                0.5 if discrete_skill_direction else None
+            ),
+            "high_level_discrete_action_space": (
+                {
+                    "skill_logits": ["Walk", "Dribble", "Shoot", "Stop"],
+                    "direction_logits": [
+                        "Up",
+                        "Up-Right",
+                        "Right",
+                        "Down-Right",
+                        "Down",
+                        "Down-Left",
+                        "Left",
+                        "Up-Left",
+                    ],
+                    "direction_for_stop": False,
+                    "planar_magnitude_fraction": 0.5,
+                    "yaw_command": 0.0,
+                }
+                if discrete_skill_direction
+                else None
+            ),
             "skill_policy_source": args.skill_policy_source,
             "skill_source_locations": {
                 skill: record["policy_metadata"]["source_location"]
@@ -992,7 +1213,8 @@ def train_robot(args):
                 "opponent_snapshot_interval": args.self_play_update_interval,
                 "opponent_pool_size": args.opponent_pool_size,
                 "opponent_latest_probability": args.opponent_latest_probability,
-                "local_observation_dim": 34,
+                "opponent_action_selection": "sample",
+                "local_observation_dim": (35 if discrete_skill_direction else 34) + int(getattr(args, "shooting_options", False)),
                 "local_role_reward_scales": dict(
                     HIGH_LEVEL_LOCAL_ROLE_REWARD_SCALES
                 ),
@@ -1012,13 +1234,18 @@ def train_robot(args):
         },
     )
     RunnerArgs.checkpoint_dir = resolve_high_level_checkpoint_dir(
-        args.checkpoint_dir, run.dir
+        args.checkpoint_dir,
+        run.dir,
+        subdirectory=(
+            "high_level_discrete" if discrete_skill_direction else "high_level"
+        ),
     )
     run.config.update(
         {"resolved_checkpoint_dir": RunnerArgs.checkpoint_dir},
         allow_val_change=True,
     )
     print(f"High-level checkpoint directory: {RunnerArgs.checkpoint_dir}")
+    save_checkpoint_config(run, RunnerArgs.checkpoint_dir)
 
     raw_env = TwoRobotVelocityTrackingEasyEnv(sim_device=args.device, headless=args.headless, cfg=Cfg)
     match_env = HighLevelSkillWrapper(raw_env, skill_policies)
@@ -1070,6 +1297,33 @@ def train_robot(args):
         mpc_config, mpc_payload = load_mpc_config(
             args.mpc_config, args.mpc_profile
         )
+        # MPC must imagine the same requested actions that the simulator
+        # executes. It must not add fallback/control costs that are absent
+        # from the deliberately minimal high-level reward.
+        mpc_config.apply_skill_fallback_in_rollout = bool(
+            args.use_geometric_skill_fallback
+        )
+        mpc_config.apply_collision_avoidance_in_rollout = bool(
+            args.collision_avoidance
+        )
+        mpc_config.invalid_skill_penalty = 0.0
+        mpc_config.skill_switch_penalty = 0.0
+        mpc_config.command_change_penalty = 0.0
+        mpc_config.reward_source = "analytical"
+        mpc_config.learned_reward_coefficient = 0.0
+        mpc_config.analytical_reward_coefficient = 1.0
+        mpc_config.analytical_robot_collision_distance_m = float(
+            args.robot_collision_distance
+        )
+        mpc_config.analytical_robot_collision_lookahead_s = float(
+            args.robot_collision_lookahead
+        )
+        # This lightweight teacher wrapper has no centralized terminal-value
+        # model attached. Rank with the aligned analytical horizon return.
+        mpc_config.objective_mode = "reward_only"
+        mpc_config.use_terminal_value = False
+        mpc_config.terminal_value_required = False
+        mpc_config.validate()
         state_adapter = FootballWorldModelStateAdapter(
             match_env,
             max_obstacles=0,
@@ -1090,6 +1344,7 @@ def train_robot(args):
             world_model.action_adapter,
             world_model.event_names,
             mpc_config,
+            reward_scales=resolved_high_level_reward_scales(args),
         )
         planner = HybridCEMMPC(
             world_model,
@@ -1118,17 +1373,20 @@ def build_arg_parser():
     parser.add_argument("--device", default="cuda:3")
     parser.add_argument("--policy-device", default="cpu")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--headless", action="store_true")
+    headless_group = parser.add_mutually_exclusive_group()
+    headless_group.add_argument("--headless", dest="headless", action="store_true")
+    headless_group.add_argument("--no-headless", dest="headless", action="store_false")
+    parser.set_defaults(headless=True)
     parser.add_argument(
         "--physx-num-threads",
         type=int,
-        default=10,
+        default=4,
         help="PhysX CPU worker threads used by this process.",
     )
     parser.add_argument(
         "--save-video-interval",
         type=int,
-        default=500,
+        default=0,
         help="PPO iterations between videos; zero disables the recording camera.",
     )
     parser.add_argument(
@@ -1179,7 +1437,10 @@ def build_arg_parser():
             "and starts a new critic at iteration zero."
         ),
     )
-    parser.add_argument("--num-envs", type=int, default=512)
+    # Keep the rollout size consistent across the standard MAPPO, discrete,
+    # and MPC-replay entry points.  MPC planning is more expensive than
+    # policy-only PPO, so 256 is a practical common baseline.
+    parser.add_argument("--num-envs", type=int, default=256)
     parser.add_argument(
         "--num-robots",
         type=int,
@@ -1189,7 +1450,7 @@ def build_arg_parser():
     parser.add_argument(
         "--self-play-update-interval",
         type=int,
-        default=2000,
+        default=400,
         help="PPO iterations between frozen opponent-policy snapshot updates.",
     )
     parser.add_argument(
@@ -1208,6 +1469,14 @@ def build_arg_parser():
     parser.add_argument("--episode-length", type=float, default=30.0)
     parser.add_argument("--control-interval", type=int, default=10)
     parser.add_argument("--high-level-history", type=int, default=4)
+    parser.add_argument(
+        "--discrete-skill-direction",
+        action="store_true",
+        help=(
+            "Use four categorical skills (Walk, Dribble, Shoot, Stop) and an "
+            "eight-way direction head with fixed half-max command magnitude."
+        ),
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--schedule", choices=("adaptive", "fixed"), default="adaptive")
     parser.add_argument("--desired-kl", type=float, default=0.01)
@@ -1217,19 +1486,19 @@ def build_arg_parser():
     parser.add_argument(
         "--skill-entropy-coef",
         type=float,
-        default=0.002,
+        default=0.005,
         help="Initial entropy bonus for the true categorical walk/dribble/shoot distribution.",
     )
     parser.add_argument(
         "--skill-entropy-final-coef",
         type=float,
-        default=0.0002,
+        default=0.001,
         help="Categorical entropy coefficient after linear annealing.",
     )
     parser.add_argument(
         "--skill-entropy-anneal-iterations",
         type=int,
-        default=4000,
+        default=20000,
         help="PPO iterations over which to anneal the categorical entropy coefficient.",
     )
     parser.add_argument(
@@ -1260,12 +1529,18 @@ def build_arg_parser():
         "--robot-collision-penalty",
         type=float,
         default=2.0,
-        help="Positive magnitude of the near-contact reward penalty (0 disables it).",
+        help="Positive magnitude of the bounded robot-collision penalty (0 disables it).",
+    )
+    parser.add_argument(
+        "--invalid-skill-penalty",
+        type=float,
+        default=2.0,
+        help="Penalty magnitude for executing an invalid dribble/shoot request.",
     )
     parser.add_argument(
         "--robot-collision-distance",
         type=float,
-        default=0.65,
+        default=0.70,
         help="Robot-centre distance in metres at which the smooth collision penalty begins.",
     )
     parser.add_argument(
@@ -1277,7 +1552,7 @@ def build_arg_parser():
     parser.add_argument(
         "--attacker-switch-margin",
         type=float,
-        default=0.15,
+        default=0.0,
         help="Metres by which a teammate must be closer before taking the attacker role.",
     )
     parser.add_argument(
@@ -1298,15 +1573,22 @@ def build_arg_parser():
         "--use-geometric-skill-fallback",
         dest="use_geometric_skill_fallback",
         action="store_true",
-        default=True,
-        help="Replace and penalize geometrically invalid dribble/shoot requests (default).",
+        help=(
+            "Replace geometrically invalid dribble/shoot requests. "
+            "This keeps low-level ball policies inside their training affordance "
+            "(default)."
+        ),
     )
     parser.add_argument(
         "--no-geometric-skill-fallback",
         dest="use_geometric_skill_fallback",
         action="store_false",
-        help="Execute every requested skill even when the ball is out of reach.",
+        help=(
+            "Execute every requested skill even when the ball is out of reach; "
+            "intended only for affordance ablations."
+        ),
     )
+    parser.set_defaults(use_geometric_skill_fallback=True)
     parser.add_argument(
         "--no-role-aware-fallback",
         dest="role_aware_fallback",
@@ -1330,9 +1612,37 @@ def build_arg_parser():
     parser.add_argument(
         "--near-ball-init-probability",
         type=float,
-        default=0.6,
+        default=0.5,
         help="Fraction of randomized resets initialized with the ball in front of one robot.",
     )
+    parser.add_argument(
+        "--near-ball-init-team",
+        choices=("balanced", "learning", "opponent"),
+        default="balanced",
+        help="Team used for near-ball kickoffs (balanced by default).",
+    )
+    parser.add_argument("--centralized-critic", action="store_true",
+                        help="Give the critic both teams' observations; actors remain decentralized.")
+    parser.add_argument("--attack-diagnostics", action="store_true")
+    parser.add_argument("--joint-reset-noise", type=float, default=0.0,
+                        help="Relative joint-angle reset noise for frozen skills (0: nominal pose; 0.5: legacy resets). Match positions and headings still randomize.")
+    parser.add_argument("--attack-position-reward", type=float, default=0.)
+    parser.add_argument("--goalward-launch-reward", action="store_true")
+    parser.add_argument("--shooting-options", action="store_true",
+                        help="Observable prepare/strike/abort execution; requires fresh actor and dynamics checkpoints.")
+    parser.add_argument("--soccer-curriculum", action="store_true",
+                        help="Use staged finishing/possession starts and gate opponent promotion by episode outcomes.")
+    parser.add_argument("--curriculum-min-episodes", type=int, default=512)
+    parser.add_argument("--curriculum-min-stage-updates", type=int, default=300,
+                        help="Minimum PPO updates at each curriculum stage before promotion.")
+    parser.add_argument("--curriculum-normal-threshold", type=float, default=.10,
+                        help="Required normal-start goal-rate lower confidence bound for promotion beyond stage 2.")
+    parser.add_argument("--curriculum-success-threshold", type=float, default=0.35)
+    parser.add_argument("--curriculum-opponent-threshold", type=float, default=0.10)
+    parser.add_argument("--curriculum-max-failure-rate", type=float, default=0.25)
+    parser.add_argument("--rollout-steps", type=int, default=24)
+    parser.add_argument("--shoot-setup-event-reward", type=float, default=0.0,
+                        help="Positive value enables an unscaled setup bonus, capped once per episode; zero retains legacy shaping.")
     parser.add_argument("--near-ball-init-min-distance", type=float, default=0.4)
     parser.add_argument("--near-ball-init-max-distance", type=float, default=0.95)
     parser.add_argument(

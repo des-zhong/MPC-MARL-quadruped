@@ -115,8 +115,18 @@ def high_level_match_reset_flags(
     ball_off_border,
     obstacle_contact,
     boundary_walls,
+    learning_team_failure=None,
+    opponent_team_failure=None,
 ):
-    """Compose match reset flags while making wall-mode border exits inert."""
+    """Compose match reset flags while making wall-mode border exits inert.
+
+    ``base_reset`` is a match-level flag: in the multi-robot environment it is
+    set when *any* robot falls.  The learner should not receive the accidental
+    termination penalty when only a frozen opponent fell, however.  The two
+    optional team-level flags let callers keep the match reset behaviour while
+    attributing that reward only to a failure on the learning team.  Omitting
+    them preserves the legacy single-team behaviour used by small fixtures.
+    """
 
     border_termination = ball_off_border
     if boundary_walls:
@@ -128,12 +138,36 @@ def high_level_match_reset_flags(
         | border_termination
         | obstacle_contact
     )
-    accidental = (
-        border_termination
-        | opponent_goal
-        | obstacle_contact
-        | (base_reset & ~time_out & ~goal)
-    )
+    if learning_team_failure is None or opponent_team_failure is None:
+        # Compatibility path for callers that do not expose team-level
+        # termination information.
+        accidental = (
+            border_termination
+            | obstacle_contact
+            | (base_reset & ~time_out & ~goal & ~opponent_goal)
+        )
+    else:
+        # A match reset caused solely by an opponent fall remains a reset, but
+        # is not a negative learning signal.  Preserve any other unattributed
+        # non-timeout reset (for example a legacy simulator failure) so this
+        # change does not make genuine learner failures disappear.
+        unattributed_failure = (
+            base_reset
+            & ~time_out
+            & ~goal
+            & ~opponent_goal
+            & ~opponent_team_failure
+            & ~learning_team_failure
+        )
+        learning_failure_event = (
+            learning_team_failure & ~time_out & ~goal & ~opponent_goal
+        )
+        accidental = (
+            border_termination
+            | obstacle_contact
+            | learning_failure_event
+            | unattributed_failure
+        )
     return reset, accidental
 
 
@@ -1239,10 +1273,23 @@ class TwoRobotLeggedRobot(LeggedRobot):
         self.prev_object_pos_world_frame = self.object_pos_world_frame.clone()
         self.prev_object_lin_vel = self.object_lin_vel.clone()
         self.high_level_goal_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        for skill in ("walk", "dribble", "shoot", "stop"):
+            for prefix in ("", "last_"):
+                setattr(self, f"{prefix}high_level_{skill}_height_failure_buf",
+                        torch.zeros(self.num_envs, dtype=torch.bool, device=self.device))
         self.high_level_opponent_goal_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.high_level_ball_off_border_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.high_level_obstacle_contact_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.high_level_accidental_termination_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.high_level_opponent_accidental_termination_buf = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self.high_level_learning_team_failure_buf = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self.high_level_opponent_team_failure_buf = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
         self.last_high_level_goal_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.last_high_level_opponent_goal_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.last_high_level_ball_off_border_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -1251,6 +1298,15 @@ class TwoRobotLeggedRobot(LeggedRobot):
             self.num_envs,
             dtype=torch.bool,
             device=self.device,
+        )
+        self.last_high_level_opponent_accidental_termination_buf = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self.last_high_level_learning_team_failure_buf = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self.last_high_level_opponent_team_failure_buf = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
         )
         self.high_level_skill_ids = torch.zeros(self.num_envs, self.num_robots, dtype=torch.long, device=self.device)
         self.high_level_requested_skill_ids = torch.zeros(
@@ -1342,17 +1398,26 @@ class TwoRobotLeggedRobot(LeggedRobot):
         return torch.norm(roots[:, :, :2] - ball_xy, dim=-1)
 
     def pre_physics_step(self):
+        for skill in ("walk", "dribble", "shoot", "stop"):
+            name = f"last_high_level_{skill}_height_failure_buf"
+            if hasattr(self, name):
+                getattr(self, name).zero_()
         if hasattr(self, "last_high_level_goal_buf"):
             self.last_high_level_goal_buf[:] = False
             self.last_high_level_opponent_goal_buf[:] = False
             self.last_high_level_ball_off_border_buf[:] = False
             self.last_high_level_obstacle_contact_buf[:] = False
             self.last_high_level_accidental_termination_buf[:] = False
+            self.last_high_level_opponent_accidental_termination_buf[:] = False
+            self.last_high_level_learning_team_failure_buf[:] = False
+            self.last_high_level_opponent_team_failure_buf[:] = False
         if self.cfg.env.add_balls and hasattr(self, "object_pos_world_frame"):
             self.prev_object_pos_world_frame = self.object_pos_world_frame.clone()
             self.prev_object_lin_vel = self.object_lin_vel.clone()
             if hasattr(self, "prev_high_level_robot_ball_distances"):
                 self.prev_high_level_robot_ball_distances = self._high_level_robot_ball_distances()
+        if getattr(self.cfg.reward_scales, "high_level_attack_position", 0.) != 0:
+            self.prev_high_level_robot_xy = self.root_states[self.robot_actor_idxs_all.reshape(-1), :2].view(self.num_envs, self.num_robots, 2).clone()
         super().pre_physics_step()
 
     def post_physics_step(self):
@@ -1381,9 +1446,31 @@ class TwoRobotLeggedRobot(LeggedRobot):
                 setattr(self, name, value)
 
     def check_termination(self):
+        # ``LeggedRobot.post_physics_step`` refreshes Isaac Gym's root-state
+        # tensor immediately before calling this method.  The indexed
+        # ``robot_root_states_all`` tensor is a copy rather than a live view,
+        # so refresh it here before comparing team-level failures.  Refreshing
+        # only at the end of ``post_physics_step`` made the base reset use the
+        # current state while attribution used the previous state, leaving
+        # some learner falls incorrectly classified as unattributed resets.
+        self._refresh_two_robot_views()
         super().check_termination()
+
+        # Keep the match-level reset semantics (one fallen robot ends the
+        # match), but retain the source of a robot failure so the high-level
+        # reward can be assigned to the team that actually failed.  Without
+        # this split, a frozen opponent falling generated a -30 reward for the
+        # learning team and taught it to avoid otherwise useful ball skills.
+        team_size = int(getattr(self.cfg.env, "num_team_robots", self.num_robots))
+        if team_size < 1 or team_size > self.num_robots:
+            team_size = self.num_robots
+        learning_team_failure = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        opponent_team_failure = torch.zeros_like(learning_team_failure)
+
         if int(self.termination_contact_indices.numel()) > 0:
-            any_robot_contact_reset = torch.any(
+            robot_contact_failure = torch.any(
                 torch.norm(
                     self.robot_contact_forces_all[
                         :, :, self.termination_contact_indices, :
@@ -1391,8 +1478,16 @@ class TwoRobotLeggedRobot(LeggedRobot):
                     dim=-1,
                 )
                 > 1.0,
-                dim=(1, 2),
+                dim=2,
             )
+            learning_team_failure |= torch.any(
+                robot_contact_failure[:, :team_size], dim=1
+            )
+            if team_size < self.num_robots:
+                opponent_team_failure |= torch.any(
+                    robot_contact_failure[:, team_size:], dim=1
+                )
+            any_robot_contact_reset = torch.any(robot_contact_failure, dim=1)
             self.reset_buf = torch.logical_or(
                 self.reset_buf, any_robot_contact_reset
             )
@@ -1401,18 +1496,31 @@ class TwoRobotLeggedRobot(LeggedRobot):
             if torch.is_tensor(self.measured_heights):
                 robot_heights = self.robot_root_states_all[:, :, 2]
                 terrain_height = torch.mean(self.measured_heights, dim=1, keepdim=True)
-                other_body_height = torch.any(
+                robot_body_height_failure = (
                     robot_heights - terrain_height
-                    < self.cfg.rewards.terminal_body_height,
-                    dim=1,
+                    < self.cfg.rewards.terminal_body_height
                 )
             else:
-                other_body_height = torch.any(
+                robot_body_height_failure = (
                     self.robot_root_states_all[:, :, 2]
-                    < self.cfg.rewards.terminal_body_height,
-                    dim=1,
+                    < self.cfg.rewards.terminal_body_height
                 )
+            learning_team_failure |= torch.any(
+                robot_body_height_failure[:, :team_size], dim=1
+            )
+            if team_size < self.num_robots:
+                opponent_team_failure |= torch.any(
+                    robot_body_height_failure[:, team_size:], dim=1
+                )
+            other_body_height = torch.any(robot_body_height_failure, dim=1)
             self.reset_buf = torch.logical_or(self.reset_buf, other_body_height)
+            if hasattr(self, "high_level_skill_ids"):
+                for skill_id, skill in enumerate(("walk", "dribble", "shoot", "stop")):
+                    failures = robot_body_height_failure[:, :team_size] & (
+                        self.high_level_skill_ids[:, :team_size] == skill_id
+                    )
+                    setattr(self, f"high_level_{skill}_height_failure_buf",
+                            failures.any(dim=1))
 
         if self.cfg.rewards.use_terminal_roll_pitch:
             other_projected_gravity = quat_rotate_inverse(
@@ -1421,10 +1529,18 @@ class TwoRobotLeggedRobot(LeggedRobot):
                 .expand(-1, self.num_robots, -1)
                 .reshape(-1, 3),
             ).view(self.num_envs, self.num_robots, 3)
-            other_body_ori = (
+            robot_body_ori_failure = (
                 torch.sum(torch.square(other_projected_gravity[:, :, :2]), dim=2)
                 > self.cfg.rewards.terminal_body_ori
-            ).any(dim=1)
+            )
+            learning_team_failure |= torch.any(
+                robot_body_ori_failure[:, :team_size], dim=1
+            )
+            if team_size < self.num_robots:
+                opponent_team_failure |= torch.any(
+                    robot_body_ori_failure[:, team_size:], dim=1
+                )
+            other_body_ori = torch.any(robot_body_ori_failure, dim=1)
             self.reset_buf = torch.logical_or(self.reset_buf, other_body_ori)
 
         self.high_level_goal_buf[:] = False
@@ -1432,6 +1548,9 @@ class TwoRobotLeggedRobot(LeggedRobot):
         self.high_level_ball_off_border_buf[:] = False
         self.high_level_obstacle_contact_buf[:] = False
         self.high_level_accidental_termination_buf[:] = False
+        self.high_level_learning_team_failure_buf[:] = learning_team_failure
+        self.high_level_opponent_team_failure_buf[:] = opponent_team_failure
+        self.high_level_opponent_accidental_termination_buf[:] = False
 
         if self.cfg.env.add_balls and getattr(self.cfg.rewards, "use_high_level_match_termination", False):
             field_xy = self.object_pos_world_frame[:, :2] - self.env_origins[:, :2]
@@ -1470,7 +1589,16 @@ class TwoRobotLeggedRobot(LeggedRobot):
                     self.high_level_ball_off_border_buf,
                     self.high_level_obstacle_contact_buf,
                     self.add_boundary_walls,
+                    learning_team_failure=learning_team_failure,
+                    opponent_team_failure=opponent_team_failure,
                 )
+            )
+            self.high_level_opponent_accidental_termination_buf[:] = (
+                opponent_team_failure
+                & ~learning_team_failure
+                & ~self.time_out_buf
+                & ~self.high_level_goal_buf
+                & ~self.high_level_opponent_goal_buf
             )
 
     def _ball_touches_static_opponent(self):
@@ -1498,12 +1626,26 @@ class TwoRobotLeggedRobot(LeggedRobot):
         return torch.any(touch, dim=1)
 
     def reset_idx(self, env_ids):
+        for skill in ("walk", "dribble", "shoot", "stop"):
+            name = f"high_level_{skill}_height_failure_buf"
+            if hasattr(self, "last_" + name):
+                getattr(self, "last_" + name)[env_ids] = getattr(self, name)[env_ids]
+                getattr(self, name)[env_ids] = False
         if len(env_ids) > 0 and hasattr(self, "last_high_level_goal_buf"):
             self.last_high_level_goal_buf[env_ids] = self.high_level_goal_buf[env_ids]
             self.last_high_level_opponent_goal_buf[env_ids] = self.high_level_opponent_goal_buf[env_ids]
             self.last_high_level_ball_off_border_buf[env_ids] = self.high_level_ball_off_border_buf[env_ids]
             self.last_high_level_obstacle_contact_buf[env_ids] = self.high_level_obstacle_contact_buf[env_ids]
             self.last_high_level_accidental_termination_buf[env_ids] = self.high_level_accidental_termination_buf[env_ids]
+            self.last_high_level_opponent_accidental_termination_buf[env_ids] = (
+                self.high_level_opponent_accidental_termination_buf[env_ids]
+            )
+            self.last_high_level_learning_team_failure_buf[env_ids] = (
+                self.high_level_learning_team_failure_buf[env_ids]
+            )
+            self.last_high_level_opponent_team_failure_buf[env_ids] = (
+                self.high_level_opponent_team_failure_buf[env_ids]
+            )
         super().reset_idx(env_ids)
         self._refresh_reset_state_views(env_ids)
         if len(env_ids) == 0 or not hasattr(self, "high_level_goal_buf"):
@@ -1514,6 +1656,9 @@ class TwoRobotLeggedRobot(LeggedRobot):
         self.high_level_ball_off_border_buf[env_ids] = False
         self.high_level_obstacle_contact_buf[env_ids] = False
         self.high_level_accidental_termination_buf[env_ids] = False
+        self.high_level_opponent_accidental_termination_buf[env_ids] = False
+        self.high_level_learning_team_failure_buf[env_ids] = False
+        self.high_level_opponent_team_failure_buf[env_ids] = False
         self.high_level_skill_ids[env_ids] = 0
         self.high_level_requested_skill_ids[env_ids] = 0
         self.high_level_invalid_skill_mask[env_ids] = False
@@ -1570,12 +1715,19 @@ class TwoRobotLeggedRobot(LeggedRobot):
             )
 
     def _reset_dofs(self, env_ids, cfg):
-        if bool(getattr(cfg.env, "deterministic_match_init", False)):
+        # Frozen soccer skills can enter a persistent shuffling gait after
+        # the locomotion trainer's independent 0.5--1.5 joint perturbations.
+        # Randomize match geometry independently of the initial joint pose.
+        noise = (float(getattr(cfg.env, "high_level_joint_reset_noise", 0.0))
+                 if bool(getattr(cfg.env, "high_level_control", False)) else 0.5)
+        if not 0.0 <= noise <= 0.5:
+            raise ValueError("high_level_joint_reset_noise must be between 0 and 0.5")
+        if bool(getattr(cfg.env, "deterministic_match_init", False)) or noise == 0:
             self.dof_pos[env_ids] = self.default_dof_pos
         else:
             self.dof_pos[env_ids] = self.default_dof_pos * torch_rand_float(
-                0.5,
-                1.5,
+                1.0 - noise,
+                1.0 + noise,
                 (len(env_ids), self.num_dof),
                 device=self.device,
             )
@@ -1673,58 +1825,92 @@ class TwoRobotLeggedRobot(LeggedRobot):
         num_envs = len(env_ids)
         robot_actor_ids = self.robot_actor_idxs_all[env_ids]
         robot_states = self.root_states[robot_actor_ids.reshape(-1)].view(num_envs, self.num_robots, 13)
-        attacker_slots = torch.randint(
-            0,
-            self.num_robots,
-            (num_envs,),
-            device=self.device,
-        )
-        row_ids = torch.arange(num_envs, device=self.device)
-        attacker_states = robot_states[row_ids, attacker_slots]
-        _, _, attacker_yaw = get_euler_xyz(attacker_states[:, 3:7])
-        sample_device = str(self.device)
-        relative_angle = torch_rand_float(
-            min_angle,
-            max_angle,
-            (num_envs, 1),
-            device=sample_device,
-        ).squeeze(1)
-        distance = torch_rand_float(
-            min_distance,
-            max_distance,
-            (num_envs, 1),
-            device=sample_device,
-        ).squeeze(1)
-        world_angle = attacker_yaw + relative_angle
-        candidate_ball_xy = attacker_states[:, :2] + distance.unsqueeze(1) * torch.stack(
-            (torch.cos(world_angle), torch.sin(world_angle)),
-            dim=1,
-        )
+        # A learner-only near-ball reset creates a hidden field advantage for
+        # the opponent: the ball starts in the learner's half, so an
+        # uncontrolled kick toward -x has a much shorter path to the opponent
+        # goal than a successful +x attack.  Default to a balanced kickoff in
+        # self-play, while retaining an explicit learner-only mode for legacy
+        # experiments and fixtures.
+        team_size = int(getattr(self.cfg.env, "num_team_robots", self.num_robots))
+        if team_size < 1 or team_size > self.num_robots:
+            team_size = self.num_robots
+        kickoff_mode = str(
+            getattr(self.cfg.env, "high_level_near_ball_init_team", "balanced")
+        ).lower()
+        if kickoff_mode == "learning":
+            slot_low, slot_high = 0, team_size
+        elif kickoff_mode == "opponent" and team_size < self.num_robots:
+            slot_low, slot_high = team_size, self.num_robots
+        elif kickoff_mode == "balanced":
+            slot_low, slot_high = 0, self.num_robots
+        else:
+            raise ValueError(
+                "high_level_near_ball_init_team must be one of 'balanced', "
+                f"'learning', or 'opponent', got {kickoff_mode!r}."
+            )
+        require_near = bool(getattr(self.cfg.env, "require_learning_near_ball_init", False))
+        remaining = torch.ones(num_envs, dtype=torch.bool, device=self.device)
+        result = default_ball_xy.clone()
+        for _ in range(256 if require_near else 1):
+            attacker_slots = torch.randint(
+                slot_low,
+                slot_high,
+                (num_envs,),
+                device=self.device,
+            )
+            row_ids = torch.arange(num_envs, device=self.device)
+            attacker_states = robot_states[row_ids, attacker_slots]
+            _, _, attacker_yaw = get_euler_xyz(attacker_states[:, 3:7])
+            sample_device = str(self.device)
+            relative_angle = torch_rand_float(
+                min_angle,
+                max_angle,
+                (num_envs, 1),
+                device=sample_device,
+            ).squeeze(1)
+            distance = torch_rand_float(
+                min_distance,
+                max_distance,
+                (num_envs, 1),
+                device=sample_device,
+            ).squeeze(1)
+            world_angle = attacker_yaw + relative_angle
+            candidate_ball_xy = attacker_states[:, :2] + distance.unsqueeze(1) * torch.stack(
+                (torch.cos(world_angle), torch.sin(world_angle)),
+                dim=1,
+            )
 
-        local_candidate = candidate_ball_xy - self.env_origins[env_ids, :2]
-        half_length = 0.5 * float(getattr(self.cfg.env, "field_length", 8.0))
-        half_width = 0.5 * float(getattr(self.cfg.env, "field_width", 5.0))
-        margin = float(getattr(self.cfg.env, "field_margin", 0.4))
-        inside_field = (
-            (torch.abs(local_candidate[:, 0]) <= half_length - margin)
-            & (torch.abs(local_candidate[:, 1]) <= half_width - margin)
-        )
+            local_candidate = candidate_ball_xy - self.env_origins[env_ids, :2]
+            half_length = 0.5 * float(getattr(self.cfg.env, "field_length", 8.0))
+            half_width = 0.5 * float(getattr(self.cfg.env, "field_width", 5.0))
+            margin = float(getattr(self.cfg.env, "field_margin", 0.4))
+            inside_field = (
+                (torch.abs(local_candidate[:, 0]) <= half_length - margin)
+                & (torch.abs(local_candidate[:, 1]) <= half_width - margin)
+            )
 
-        teammate_clearance = float(getattr(self.cfg.env, "match_init_min_clearance", 0.75))
-        robot_clearances = torch.norm(
-            candidate_ball_xy[:, None, :] - robot_states[:, :, :2], dim=2
-        )
-        non_attacker = torch.ones_like(robot_clearances, dtype=torch.bool)
-        non_attacker[row_ids, attacker_slots] = False
-        clear_of_teammate = (
-            (robot_clearances >= teammate_clearance) | ~non_attacker
-        ).all(dim=1)
-        use_near_init = (
-            (torch.rand(num_envs, device=self.device) < probability)
-            & inside_field
-            & clear_of_teammate
-        )
-        return torch.where(use_near_init.unsqueeze(1), candidate_ball_xy, default_ball_xy)
+            teammate_clearance = float(getattr(self.cfg.env, "match_init_min_clearance", 0.75))
+            robot_clearances = torch.norm(
+                candidate_ball_xy[:, None, :] - robot_states[:, :, :2], dim=2
+            )
+            non_attacker = torch.ones_like(robot_clearances, dtype=torch.bool)
+            non_attacker[row_ids, attacker_slots] = False
+            clear_of_teammate = (
+                (robot_clearances >= teammate_clearance) | ~non_attacker
+            ).all(dim=1)
+            use_near_init = (
+                (torch.rand(num_envs, device=self.device) < probability)
+                & inside_field
+                & clear_of_teammate
+            )
+            accepted = use_near_init & remaining
+            result = torch.where(accepted.unsqueeze(1), candidate_ball_xy, result)
+            remaining &= ~accepted
+            if not require_near or not bool(remaining.any()):
+                return result
+        raise RuntimeError("Could not sample a safe ball position near the learning team; "
+                           "check robot spawn ranges and near-ball distance/angle limits.")
+
 
     def _reset_static_opponent_states(self, env_ids, cfg):
         if self.num_static_opponents <= 0:
@@ -1884,6 +2070,8 @@ class TwoRobotLeggedRobot(LeggedRobot):
                     min_clearance,
                 )
                 ball_xy = self._apply_high_level_near_ball_init(env_ids, ball_xy)
+                from quadruped.envs.soccer_curriculum import apply_attacking_starts
+                ball_xy = apply_attacking_starts(self, env_ids, ball_xy)
                 self.root_states[object_env_ids, 0:2] = ball_xy
                 self.root_states[object_env_ids, 2] = self.env_origins[env_ids, 2] + self.object_init_state[2]
                 self.root_states[object_env_ids, 7:13] = 0.0
@@ -1896,6 +2084,18 @@ class TwoRobotLeggedRobot(LeggedRobot):
                         torch.rand(len(env_ids), 3, dtype=torch.float, device=self.device, requires_grad=False) - 0.5
                     ) * torch.tensor(cfg.ball.init_vel_range, device=self.device, requires_grad=False)
 
+        if getattr(cfg.env, "fair_match_init", False):
+            from quadruped.envs.fair_match_init import symmetric_kickoff_roots
+            robots, ball = symmetric_kickoff_roots(
+                self.root_states[robot_actor_ids].clone(),
+                self.root_states[object_env_ids].clone(),
+                self.env_origins[env_ids],
+            )
+            self.root_states[robot_actor_ids] = robots
+            self.root_states[object_env_ids] = ball
+
+        if hasattr(self, "high_level_shoot_setup_paid"):
+            self.high_level_shoot_setup_paid[env_ids] = False
         static_opponent_env_ids = self._reset_static_opponent_states(env_ids, cfg)
 
         all_subject_env_ids = robot_actor_ids.reshape(-1)

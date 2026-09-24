@@ -101,7 +101,7 @@ class StateSchema:
         return cls([Feature(**item) for item in payload["features"]], version=int(payload.get("version", 1)))
 
 
-def default_state_schema(max_obstacles: int = 2, num_robots: int = 2) -> StateSchema:
+def default_state_schema(max_obstacles: int = 2, num_robots: int = 2, shooting_options: bool = False) -> StateSchema:
     """Build the repository's compact multi-robot football state schema."""
 
     num_robots = int(num_robots)
@@ -129,6 +129,8 @@ def default_state_schema(max_obstacles: int = 2, num_robots: int = 2) -> StateSc
         add(f"{prefix}.skill_one_hot", 3, "controlled", "one-hot", group="skill")
         add(f"{prefix}.previous_command", 3, "controlled", "normalized [-1,1]", group="skill")
         add(f"{prefix}.parameter_mask", 3, "controlled", "bool", group="skill")
+        if shooting_options:
+            add(f"{prefix}.shoot_option_remaining", 1, "controlled", "seconds", group="skill")
         add(f"{prefix}.gait_phase_sin_cos", 2, "angle_pair", "unitless cycle encoding", group="phase")
     add("ball.position", 3, "continuous", "x/y field-half normalized; z m", group="ball_position")
     add("ball.linear_velocity", 3, "continuous", "m/s", group="ball_velocity")

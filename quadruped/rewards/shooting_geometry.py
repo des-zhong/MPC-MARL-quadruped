@@ -3,6 +3,21 @@
 import torch
 
 
+def shooting_travel_success(ball_xy, initial_ball_xy, base_xy, ball_velocity_xy,
+                            command_xy, launched, min_travel, min_separation,
+                            min_speed, speed_fraction, min_alignment):
+    """A kick must move the ball, not just increase separation by retreating."""
+    speed = command_xy.norm(dim=-1).clamp_min(1e-6)
+    direction = command_xy / speed[:, None]
+    forward_speed = (ball_velocity_xy * direction).sum(-1)
+    alignment = forward_speed / ball_velocity_xy.norm(dim=-1).clamp_min(1e-6)
+    travel = ((ball_xy-initial_ball_xy)*direction).sum(-1)
+    return (launched & (travel >= min_travel)
+            & ((ball_xy-base_xy).norm(dim=-1) >= min_separation)
+            & (forward_speed >= torch.clamp(speed*speed_fraction, min=min_speed))
+            & (alignment >= min_alignment))
+
+
 def shooting_setup_geometry(base_xy, ball_xy, command_xy, setup_distance):
     """Return command direction, desired behind-ball position, and position error."""
     command_norm = torch.norm(command_xy, dim=-1, keepdim=True).clamp_min(1e-6)

@@ -365,6 +365,9 @@ class SoccerRewards(Rewards):
         command_speed = torch.norm(command_world, dim=-1).clamp(min=1e-6)
         cmd_dir = command_world / command_speed.unsqueeze(-1)
         robot_to_ball = self.env.object_pos_world_frame[:, :2] - self.env.base_pos[:, :2]
+        require_travel = getattr(self.env.cfg.rewards, "shooting_require_ball_travel", False)
+        if require_travel:
+            robot_to_ball = self.env.object_pos_world_frame[:, :2] - self.env.shooting_initial_ball_xy
         ball_distance = torch.norm(robot_to_ball, dim=-1).clamp(min=1e-6)
         ball_dir_from_robot = robot_to_ball / ball_distance.unsqueeze(-1)
         position_alignment = torch.sum(ball_dir_from_robot * cmd_dir, dim=-1).clamp(min=0.0, max=1.0)
@@ -373,6 +376,8 @@ class SoccerRewards(Rewards):
         ).clamp(min=0.0)
         speed_scale = torch.norm(self._shooting_command_scale()).clamp(min=1e-6)
         setup_distance = getattr(self.env.cfg.rewards, "shooting_setup_distance", 0.45)
+        if require_travel:
+            setup_distance = 0.0
         separation = (ball_distance - setup_distance).clamp(min=0.0)
         return torch.tanh(2.0 * separation) * position_alignment * torch.tanh(speed_along_cmd / speed_scale) * self._post_kick_gate()
 

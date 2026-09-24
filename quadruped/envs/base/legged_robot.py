@@ -228,7 +228,8 @@ class LeggedRobot(BaseTask):
         speed_along_cmd = torch.sum(ball_vel * cmd_dir, dim=-1)
         velocity_alignment = (speed_along_cmd / ball_speed).clamp(min=-1.0, max=1.0)
 
-        launch_speed = self.cfg.rewards.shooting_launch_speed_fraction * target_speed
+        launch_speed = (self.cfg.rewards.shooting_launch_speed_fraction * target_speed).clamp_min(
+            float(getattr(self.cfg.rewards, "shooting_min_launch_speed", 0.0)))
         launched_now = active_command \
             & (speed_along_cmd > launch_speed) \
             & (velocity_alignment > self.cfg.rewards.shooting_launch_alignment)
@@ -245,6 +246,18 @@ class LeggedRobot(BaseTask):
             & (ball_forward_distance > self.cfg.rewards.shooting_success_distance) \
             & (speed_along_cmd > success_speed) \
             & (velocity_alignment > self.cfg.rewards.shooting_success_alignment)
+
+        if getattr(self.cfg.rewards, "shooting_require_ball_travel", False):
+            from quadruped.rewards.shooting_geometry import shooting_travel_success
+            world_command = body_xy_to_world_xy(cmd_xy, self.base_quat) if command_frame == "body" else cmd_xy
+            self.shooting_success_buf[:] = active_command & shooting_travel_success(
+                self.object_pos_world_frame[:, :2], self.shooting_initial_ball_xy,
+                self.base_pos[:, :2], self.object_lin_vel[:, :2], world_command,
+                self.shooting_launched_buf, self.cfg.rewards.shooting_min_ball_travel,
+                self.cfg.rewards.shooting_success_distance,
+                self.cfg.rewards.shooting_min_success_speed,
+                self.cfg.rewards.shooting_success_speed_fraction,
+                self.cfg.rewards.shooting_success_alignment)
 
         elapsed_s = self.episode_length_buf.float() * self.dt
         self.shooting_failure_buf[:] = active_command \
@@ -291,6 +304,16 @@ class LeggedRobot(BaseTask):
         if self.cfg.terrain.curriculum:
             self._update_terrain_curriculum(env_ids)
 
+        shooting_metrics = {}
+        if getattr(self.cfg.rewards, "use_shooting_phase_termination", False):
+            completed = env_ids[self.episode_length_buf[env_ids] > 0]
+            if len(completed):
+                shooting_metrics = {
+                    "shooting/success_rate": self.shooting_success_buf[completed].float().mean(),
+                    "shooting/launch_rate": self.shooting_launched_buf[completed].float().mean(),
+                    "shooting/attempt_timeout_rate": self.shooting_failure_buf[completed].float().mean(),
+                    "shooting/completed_episodes": float(len(completed)),
+                }
         # reset robot states
         if not getattr(self.cfg.env, "high_level_control", False):
             self._resample_commands(env_ids)
@@ -317,6 +340,8 @@ class LeggedRobot(BaseTask):
         self.reset_buf[env_ids] = 1
         
         self.extras = self.logger.populate_log(env_ids)
+        if shooting_metrics:
+            self.extras.setdefault("train/episode", {}).update(shooting_metrics)
 
         self.gait_indices[env_ids] = 0
 
@@ -653,6 +678,8 @@ class LeggedRobot(BaseTask):
             sample_interval = int(self.cfg.commands.resampling_time / self.dt)
             env_ids = (self.episode_length_buf % sample_interval == 0).nonzero(as_tuple=False).flatten()
             self._resample_commands(env_ids)
+        if getattr(self.cfg.env, "shooting_fixed_world_target", False) and hasattr(self, "shooting_world_command"):
+            self.commands[:, :2] = world_xy_to_body_xy(self.shooting_world_command, self.base_quat)
         self._step_contact_targets()
         
         if self.cfg.commands.heading_command:
@@ -1035,6 +1062,17 @@ class LeggedRobot(BaseTask):
                                                          requires_grad=False)-0.5)*torch.tensor([0, 0, cfg.terrain.yaw_init_range], device=self.device)
         self.root_states[robot_env_ids,3:7] = quat_from_euler_xyz(random_yaw_angle[:,0], random_yaw_angle[:,1], random_yaw_angle[:,2])
         if shooting_relative_reset and command_frame == "body":
+            if getattr(cfg.env, "shooting_option_training", False):
+                angle = torch_rand_float(-.45, .45, (len(env_ids), 1), device=self.device)
+                speed = torch_rand_float(1.5, 3., (len(env_ids), 1), device=self.device)
+                self.commands[env_ids, :2] = speed * torch.cat((angle.cos(), angle.sin()), -1)
+            if getattr(cfg.env, "shooting_fixed_world_target", False):
+                command = self.commands[env_ids, :2]
+                speed = command.norm(dim=-1, keepdim=True)
+                direction = command / speed.clamp_min(1e-6)
+                direction = torch.where(speed > 1e-6, direction, torch.tensor([1., 0.], device=self.device))
+                self.commands[env_ids, :2] = direction * speed.clamp(
+                    min=cfg.env.shooting_min_target_speed, max=cfg.env.shooting_max_target_speed)
             command_xy = body_xy_to_world_xy(
                 self.commands[env_ids, :2],
                 self.root_states[robot_env_ids, 3:7],
@@ -1110,6 +1148,12 @@ class LeggedRobot(BaseTask):
                     (len(env_ids), 1),
                     device=self.device,
                 )
+                deployment = torch.rand(len(env_ids), device=self.device) < float(
+                    getattr(cfg.env, "shooting_deployment_reset_fraction", 0.0))
+                front = body_xy_to_world_xy(
+                    torch.tensor([1., 0.], device=self.device).expand(len(env_ids), -1),
+                    self.root_states[robot_env_ids, 3:7])
+                shooting_cmd_dir = torch.where(deployment[:, None], front, shooting_cmd_dir)
                 shooting_cmd_left = torch.stack(
                     (-shooting_cmd_dir[:, 1], shooting_cmd_dir[:, 0]),
                     dim=-1,
@@ -1130,6 +1174,13 @@ class LeggedRobot(BaseTask):
                 self.base_quat[env_ids] = self.root_states[robot_env_ids, 3:7]
                                                      
 
+        if shooting_relative_reset and getattr(cfg.env, "shooting_fixed_world_target", False):
+            if not hasattr(self, "shooting_world_command"):
+                self.shooting_world_command = torch.zeros(self.num_envs, 2, device=self.device)
+                self.shooting_initial_ball_xy = torch.zeros_like(self.shooting_world_command)
+            self.shooting_world_command[env_ids] = body_xy_to_world_xy(
+                self.commands[env_ids, :2], self.root_states[robot_env_ids, 3:7])
+            self.shooting_initial_ball_xy[env_ids] = self.root_states[object_env_ids, :2]
         # apply reset states
         all_subject_env_ids = robot_env_ids
         if self.cfg.env.add_balls: 
@@ -1527,12 +1578,18 @@ class LeggedRobot(BaseTask):
         }
         self.reward_container = reward_containers[self.cfg.rewards.reward_container_name](self)
 
-        # remove zero scales + multiply non-zero ones by dt
+        # remove zero scales + multiply non-zero rate terms by dt.  Most
+        # rewards are rates sampled once per simulator step, but sparse event
+        # terms (goals, explicit match termination events, etc.) are impulses
+        # and must not be attenuated by the simulator timestep.
+        unscaled_reward_names = set(
+            getattr(self.cfg.rewards, "unscaled_reward_names", ()) or ()
+        )
         for key in list(self.reward_scales.keys()):
             scale = self.reward_scales[key]
             if scale == 0:
                 self.reward_scales.pop(key)
-            else:
+            elif key not in unscaled_reward_names:
                 self.reward_scales[key] *= self.dt
         # prepare list of functions
         self.reward_functions = []

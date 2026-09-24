@@ -14,11 +14,24 @@ high-level setup and are never modified.
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import sys
 from collections import deque
 from pathlib import Path
 from typing import Dict, Mapping, Optional
+
+
+# This module imports Torch before the shared high-level trainer, so establish
+# the same Python-owned CPU threading defaults here as well.
+_CPU_THREADS = os.environ.get("DRIBBLEBOT_CPU_THREADS", "4")
+for _THREAD_ENV in (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_THREAD_ENV, _CPU_THREADS)
 
 if "torch" in sys.modules:
     isaacgym = sys.modules.get("isaacgym")
@@ -48,6 +61,20 @@ from quadruped.world_model.normalizer import WorldModelNormalizer
 from quadruped.world_model.schema import EVENT_NAMES
 from quadruped.world_model.state_adapter import FootballWorldModelStateAdapter
 from quadruped.world_model.trainer import load_checkpoint, save_checkpoint
+
+
+def skill_fingerprint(skills):
+    """Content identity of the executable skill bundle, independent of paths."""
+    import hashlib
+    import json
+    hashes = {
+        name: {key: artifact.get("sha256") for key, artifact in
+               record.get("policy_metadata", {}).get("artifacts", {}).items()}
+        for name, record in skills.items()
+    }
+    if not hashes or any(not entries.get("body") for entries in hashes.values()):
+        raise ValueError("MPC requires hashed skill artifacts to identify its dynamics")
+    return hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()
 
 
 class WorldModelReplayBuffer:
@@ -216,8 +243,41 @@ class WorldModelReplayBuffer:
             rows.append(pool[index])
         return rows
 
-    def sample(self, count: int, device: Optional[torch.device] = None) -> Dict[str, torch.Tensor]:
-        rows = self._sample_rows(count)
+    def prune_teacher_targets(self, current_step, max_age):
+        """Remove expired/invalid targets before deciding whether to update."""
+        removed = 0
+        for opponent, bucket in list(self._buckets.items()):
+            retained = deque()
+            for sequence, item in bucket:
+                step, weight = item.get("teacher_step"), item.get("teacher_weight")
+                valid = (step is not None and weight is not None
+                         and bool(torch.isfinite(torch.as_tensor(step)).all())
+                         and bool(torch.isfinite(torch.as_tensor(weight)).all())
+                         and float(weight) > 0
+                         and 0 <= current_step - int(step) <= max_age)
+                if valid:
+                    retained.append((sequence, item))
+                else:
+                    removed += 1
+            if retained:
+                self._buckets[opponent] = retained
+            else:
+                del self._buckets[opponent]
+        self._size -= removed
+        return removed
+
+    def sample(self, count: int, device: Optional[torch.device] = None,
+               replacement: bool = True) -> Dict[str, torch.Tensor]:
+        if replacement:
+            rows = self._sample_rows(count)
+        else:
+            # Teacher updates use distinct eligible examples. Dynamics replay
+            # retains its existing opponent-stratified sampling by default.
+            if count > len(self):
+                raise ValueError("Not enough distinct replay rows for this batch")
+            ordered = self.items()
+            indices = torch.randperm(len(ordered), generator=self._generator)[:count]
+            rows = [ordered[int(index)] for index in indices]
         keys = rows[0].keys()
         result = {}
         for key in keys:
@@ -240,7 +300,7 @@ class OnlineWorldModelTrainer:
     def __init__(self, model, replay: WorldModelReplayBuffer, device="cuda",
                  learning_rate=3e-4, weight_decay=1e-5, batch_size=1024,
                  updates_per_interval=8, gradient_clip_norm=10.0,
-                 optimizer_states=None, loss_config=None):
+                 optimizer_states=None, loss_config=None, pretrained=False):
         self.model = model
         self.replay = replay
         requested = str(device)
@@ -261,12 +321,16 @@ class OnlineWorldModelTrainer:
         self.loss_config = dict(loss_config or {})
         self.update_bursts = 0
         self.gradient_updates = 0
-        self.ready = False
+        self.pretrained = bool(pretrained)
+        self.ready = self.pretrained
         self.feature_weights = feature_group_weights(
             self.model.schema, self.loss_config, self.device
         )
 
     def update(self) -> Dict[str, float]:
+        if getattr(self, "frozen", False):
+            self.model.eval()
+            return {"world_model/frozen": 1.0, "world_model/gradient_updates_total": 0.0}
         if len(self.replay) < max(2, self.batch_size):
             return {
                 "world_model/update_skipped": 1.0,
@@ -315,6 +379,7 @@ class OnlineWorldModelTrainer:
             self.update_bursts += 1
             self.ready = True
         self.model.eval()
+        averaged_keys = set(totals)
         totals["world_model/replay_size"] = float(len(self.replay))
         totals["world_model/updates"] = float(updates)
         totals["world_model/ready"] = float(self.ready)
@@ -323,7 +388,7 @@ class OnlineWorldModelTrainer:
         return {
             key: (
                 value / max(updates, 1)
-                if key not in {"world_model/replay_size", "world_model/updates"}
+                if key in averaged_keys
                 else value
             )
             for key, value in totals.items()
@@ -354,6 +419,36 @@ class OnlineTerminalValueTrainer:
         self.ready = self.pretrained if self.enabled else True
         self.update_bursts = 0
         self.gradient_updates = 0
+        # Online Monte Carlo returns are non-stationary as the curriculum and
+        # opponent pool change. Keep target scaling fitted to the data actually
+        # seen by this trainer; the previous fixed (0, 1) scale made sparse
+        # goal returns unnecessarily difficult to regress.
+        initial_mean = float(self.model.return_normalizer.mean)
+        initial_std = float(self.model.return_normalizer.std)
+        self._return_count = 1 if (self.pretrained and initial_std > 1.0) else 0
+        self._return_mean = initial_mean
+        self._return_m2 = initial_std * initial_std if self._return_count else 0.0
+
+    def _update_return_normalizer(self, values):
+        values = values.detach().float().reshape(-1)
+        if not values.numel():
+            return
+        count = int(values.numel())
+        mean = float(values.mean())
+        m2 = float(((values - mean) ** 2).sum())
+        if self._return_count == 0:
+            total, combined_mean, combined_m2 = count, mean, m2
+        else:
+            total = self._return_count + count
+            delta = mean - self._return_mean
+            combined_mean = self._return_mean + delta * count / total
+            combined_m2 = (self._return_m2 + m2
+                           + delta * delta * self._return_count * count / total)
+        self._return_count = total
+        self._return_mean = combined_mean
+        self._return_m2 = combined_m2
+        std = max((combined_m2 / max(total, 1)) ** .5, 1.0)
+        self.model.rescale_returns(combined_mean, std)
 
     def update(self) -> Dict[str, float]:
         if not self.enabled:
@@ -372,8 +467,10 @@ class OnlineTerminalValueTrainer:
             if len(self.replay) < self.batch_size:
                 break
             batch = self.replay.sample(self.batch_size, self.device)
+            raw_target = batch["return_to_go"].float().reshape(-1)
+            self._update_return_normalizer(raw_target)
             target = self.model.return_normalizer.normalize(
-                batch["return_to_go"].float().reshape(-1)
+                raw_target
             )
             predictions = self.model.forward_members(batch["state"].float())
             loss = predictions.new_zeros(())
@@ -399,6 +496,10 @@ class OnlineTerminalValueTrainer:
             "terminal_value/ready": float(self.ready),
             "terminal_value/update_bursts": float(self.update_bursts),
             "terminal_value/gradient_updates_total": float(self.gradient_updates),
+            "terminal_value/return_mean": float(self._return_mean),
+            "terminal_value/return_std": float(max(
+                (self._return_m2 / max(self._return_count, 1)) ** .5, 1.0)),
+            "terminal_value/return_samples": float(self._return_count),
         }
 
 
@@ -527,6 +628,9 @@ class OnlineMPCSelfPlayExtension:
         self.runner = None
         self._pending = None
         self._planner_state = None
+        self._last_plan_high_level_step = -1
+        self._plans_computed = 0
+        self._planning_seconds = 0.0
         self._metrics: Dict[str, float] = {}
         self._distill_optimizer = None
         self._high_level_steps = 0
@@ -538,6 +642,7 @@ class OnlineMPCSelfPlayExtension:
         # this extension is constructed.
         self.capture = getattr(args, "terminal_state_capture", None)
         self._load_online_replay()
+        self._model_refresh_start_updates = self.world_model_trainer.gradient_updates
 
     def _load_online_replay(self):
         checkpoint = getattr(self.args, "online_replay_checkpoint", None)
@@ -564,6 +669,9 @@ class OnlineMPCSelfPlayExtension:
             payload = torch.load(path, map_location="cpu")
         if payload.get("format") != "dribblebot_online_replay_v1":
             raise ValueError(f"Unsupported online replay checkpoint format: {path}")
+        if not self._replay_skills_match(payload):
+            print(f"Discarding dynamics/value replay with changed or unknown skills: {path}")
+            return
         self.replay.load_state_dict(payload.get("dynamics", {}))
         self.value_replay.load_state_dict(payload.get("value", {}))
         counters = payload.get("trainer_counters", {})
@@ -574,7 +682,8 @@ class OnlineMPCSelfPlayExtension:
             counters.get("world_model_gradient_updates", 0)
         )
         self.world_model_trainer.ready = (
-            self.world_model_trainer.gradient_updates > 0
+            bool(getattr(self.world_model_trainer, "pretrained", False))
+            or self.world_model_trainer.gradient_updates > 0
         )
         self.terminal_trainer.update_bursts = int(
             counters.get("terminal_value_update_bursts", 0)
@@ -587,10 +696,26 @@ class OnlineMPCSelfPlayExtension:
             or self.terminal_trainer.gradient_updates > 0
         )
         self._high_level_steps = int(payload.get("high_level_steps", 0))
+        self._plans_computed = int(counters.get("mpc_plans_computed", 0))
+        self._planning_seconds = float(
+            counters.get("mpc_planning_seconds", 0.0)
+        )
         print(
             f"Loaded {len(self.replay)} dynamics and {len(self.value_replay)} "
             f"value transitions from {path}"
         )
+
+    def _replay_skills_match(self, payload):
+        expected = getattr(self.args, "skill_fingerprint", None)
+        if getattr(self.args, "shooting_options", False) and payload.get("execution_contract") != "shooting_option_v1":
+            return False
+        return expected is None or payload.get("skill_fingerprint") == expected
+
+    def _model_refresh_complete(self):
+        return (not getattr(self.args, "mpc_require_model_refresh", False)
+                or self.world_model_trainer.gradient_updates
+                - getattr(self, "_model_refresh_start_updates", 0)
+                >= int(getattr(self.args, "mpc_min_world_model_updates", 1)))
 
     def _planner_ready(self):
         """Require useful replay/model updates before trusting MPC labels."""
@@ -599,11 +724,29 @@ class OnlineMPCSelfPlayExtension:
             return False
         if len(self.replay) < int(getattr(self.args, "mpc_min_replay_size", 1)):
             return False
-        if self.world_model_trainer.gradient_updates < int(
-            getattr(self.args, "mpc_min_world_model_updates", 1)
+        if (
+            (not bool(getattr(self.world_model_trainer, "pretrained", False))
+             or bool(getattr(self.args, "mpc_require_model_refresh", False)))
+            and (self.world_model_trainer.gradient_updates
+                 - (getattr(self, "_model_refresh_start_updates", 0)
+                    if getattr(self.args, "mpc_require_model_refresh", False) else 0))
+            < int(getattr(self.args, "mpc_min_world_model_updates", 1))
         ):
             return False
         if self.planner.config.use_terminal_value:
+            if getattr(self.args, "mpc_value_fallback", False):
+                value_ready = (getattr(self, "_value_quality_ready", False)
+                               and self.terminal_trainer.ready
+                               and self.terminal_trainer.gradient_updates >= int(
+                                   getattr(self.args, "mpc_min_terminal_value_updates", 1)))
+                # Keep training V, but do not let an unreliable V block useful
+                # short-horizon reward planning or contaminate its objective.
+                self.planner.config.objective_mode = (
+                    "reward_plus_terminal_value" if value_ready else "reward_only")
+                self._metrics["mpc/terminal_value_active"] = float(value_ready)
+                return True
+            if getattr(self.args, "shooting_options", False) and not getattr(self, "_value_quality_ready", False):
+                return False
             if not self.terminal_trainer.ready:
                 return False
             if (
@@ -625,6 +768,12 @@ class OnlineMPCSelfPlayExtension:
             "mpc/world_model_gradient_updates": float(
                 self.world_model_trainer.gradient_updates
             ),
+            "mpc/world_model_pretrained": float(
+                bool(getattr(self.world_model_trainer, "pretrained", False))
+            ),
+            "mpc/model_refresh_required": float(getattr(self.args, "mpc_require_model_refresh", False)),
+            "mpc/model_updates_since_start": float(
+                self.world_model_trainer.gradient_updates - self._model_refresh_start_updates),
             "mpc/terminal_value_update_bursts": float(
                 self.terminal_trainer.update_bursts
             ),
@@ -634,6 +783,14 @@ class OnlineMPCSelfPlayExtension:
             "mpc/replay_size": float(len(self.replay)),
             "mpc/min_replay_size": float(
                 getattr(self.args, "mpc_min_replay_size", 1)
+            ),
+            "mpc/replan_interval": float(
+                getattr(self.args, "mpc_replan_interval", 1)
+            ),
+            "mpc/plans_computed_total": float(self._plans_computed),
+            "mpc/planning_seconds_total": float(self._planning_seconds),
+            "mpc/planning_seconds_per_call": float(
+                self._planning_seconds / max(self._plans_computed, 1)
             ),
             "world_model/replay_opponent_count": float(len(opponent_counts)),
         }
@@ -699,13 +856,52 @@ class OnlineMPCSelfPlayExtension:
                 returns = returns[:keep]
         return returns
 
+    def _observe_value_quality(self, states, returns):
+        """Score newly completed trajectories before adding them to training."""
+        with torch.no_grad():
+            target = torch.as_tensor(returns, device=self.terminal_trainer.device, dtype=torch.float)
+            prediction = self.terminal_trainer.model.predict(torch.stack(states).to(target.device)).reshape(-1)
+            measurements = {"mse": (prediction-target).square().mean().item(),
+                            "mean": target.mean().item(), "second": target.square().mean().item()}
+            quality = getattr(self, "_value_quality", measurements.copy())
+            for key, value in measurements.items():
+                quality[key] = .95 * quality[key] + .05 * value
+            self._value_quality = quality
+            self._value_quality_samples = getattr(self, "_value_quality_samples", 0) + len(returns)
+            variance = max(quality["second"] - quality["mean"]**2, 1e-6)
+            self._value_quality_ready = self._value_quality_samples >= 2048 and quality["mse"] < .9 * variance
+            self._metrics.update({"terminal_value/prequential_mse": quality["mse"],
+                                  "terminal_value/prequential_variance": variance,
+                                  "terminal_value/validation_ready": float(self._value_quality_ready)})
+
     def before_env_step(self, iteration, obs_before, actions):
         batch = self.train_matches
         state = self.state_adapter.extract_state(self.match_env)["tensor"][:batch]
         if self.capture is not None:
             self.capture.clear()
         plan = None
-        if self._planner_ready():
+        replan_interval = max(
+            1, int(getattr(self.args, "mpc_replan_interval", 1))
+        )
+        quality_gate = (not bool(getattr(self.args, "mpc_quality_filter", False))
+                        or (getattr(self, "_quality_samples", 0) >= 512
+                            and getattr(self, "_ball_prediction_error", float('inf'))
+                            <= float(getattr(self.args, "mpc_max_ball_error", .25))))
+        should_plan = (
+            self._planner_ready() and quality_gate
+            and self._high_level_steps % replan_interval == 0
+        )
+        if bool(getattr(self.args, "mpc_quality_filter", False)):
+            self._metrics["mpc_quality/model_gate_open"] = float(quality_gate)
+        plan_indices = torch.arange(batch, device=state.device)
+        query_budget = int(getattr(self.args, "mpc_query_budget", 0))
+        if should_plan and 0 < query_budget < batch:
+            # Round-robin coverage prevents permanently ignoring difficult states.
+            start = (self._plans_computed * query_budget) % batch
+            plan_indices = (torch.arange(query_budget, device=state.device) + start) % batch
+            self._planner_state = None
+        teacher_agent_mask = torch.ones(batch, self.env.team_size, dtype=torch.bool, device=state.device)
+        if should_plan:
             opponent_wrapper = self.env.preview_opponent_actions()[:batch]
             opponent_action = _wrapper_actions_to_canonical(
                 opponent_wrapper, self.match_env, self.action_adapter
@@ -720,18 +916,56 @@ class OnlineMPCSelfPlayExtension:
             )
             fixed_mask = torch.zeros(self.action_adapter.num_robots, dtype=torch.bool, device=state.device)
             fixed_mask[self.env.team_size:] = True
-            plan = self.planner.plan(
-                state, planner_state=self._planner_state,
-                fixed_action_sequence=fixed, fixed_robot_mask=fixed_mask,
+            planner_kwargs = {}
+            role_fixed = (
+                bool(getattr(self.match_env.cfg.env, "high_level_role_aware_fallback", True))
+                and bool(getattr(self.match_env.cfg.env, "high_level_use_geometric_skill_fallback", True))
             )
-            self._planner_state = plan.planner_state
+            # Keep support behavior deterministic for every MPC plan. If the
+            # planner is allowed to optimize both teammates, it can assign a
+            # farther robot to approach while the nearer robot remains in a
+            # support role. The coordinator's nearest-attacker arbitration is
+            # the execution contract, so only the selected attacker is free.
+            if role_fixed:
+                    attackers = self.match_env._attacker_mask(self.match_env._skill_affordances())[:batch]
+                    teacher_agent_mask = attackers[:, :self.env.team_size]
+                    supports = ~teacher_agent_mask
+                    support_commands = self.match_env._walk_support_commands(attacker_mask=self.match_env._attacker_mask(self.match_env._skill_affordances()))[:batch, :self.env.team_size]
+                    own_fixed = torch.cat((torch.zeros_like(support_commands[..., :1]), support_commands), dim=-1)
+                    fixed_view = fixed.view(batch, horizon, self.action_adapter.num_robots, 4)
+                    fixed_view[:, :, :self.env.team_size] = own_fixed[:, None]
+                    fixed_mask = fixed_mask[None].expand(batch, -1).clone()
+                    fixed_mask[:, :self.env.team_size] = supports
+            if bool(getattr(self.args, "mpc_quality_filter", False)):
+                own_reference = _wrapper_actions_to_canonical(actions.reshape(batch, self.env.team_size, 6), self.match_env, self.action_adapter)
+                reference = fixed.clone()
+                reference[:, :, :4*self.env.team_size] = own_reference[:, None]
+                planner_kwargs["reference_action_sequence"] = reference[plan_indices]
+            plan = self.planner.plan(
+                state[plan_indices], planner_state=self._planner_state,
+                fixed_action_sequence=fixed[plan_indices], fixed_robot_mask=(fixed_mask[plan_indices] if fixed_mask.ndim == 2 else fixed_mask),
+                **planner_kwargs,
+            )
+            self._planner_state = plan.planner_state if len(plan_indices) == batch else None
+            self._last_plan_high_level_step = self._high_level_steps
+            self._plans_computed += 1
+            self._planning_seconds += float(plan.planning_time_seconds)
+        elif self._planner_ready() and replan_interval > 1:
+            # The warm-start distribution advances one horizon slot per plan.
+            # It is stale after a deliberately skipped decision, so do not
+            # feed it back into the next CEM call.
+            self._planner_state = None
         self._pending = {
             "iteration": int(iteration), "state": state.detach(),
             "obs_before": {key: value.detach().clone() for key, value in obs_before.items()},
             "opponent_observation": self.env._team_observations(1)[:batch].detach().clone(),
             "opponent_obs_history": self.env._history[:batch, 1].detach().clone(),
             "actions": actions.detach().clone(), "plan": plan,
+            "plan_indices": plan_indices,
+            "teacher_agent_mask": teacher_agent_mask,
         }
+        if getattr(self.args, "shooting_options", False):
+            self._pending["teacher_agent_mask"] = teacher_agent_mask & (self.match_env.shoot_option_remaining[:batch, :self.env.team_size] <= 0)
 
     def process_env_step(self, iteration, obs, actions, rewards, dones, infos):
         if self._pending is None:
@@ -760,20 +994,56 @@ class OnlineMPCSelfPlayExtension:
         executed = self.action_adapter.pack(skills, commands)
         self.action_adapter.assert_within_bounds(executed, atol=1e-4)
         plan = pending["plan"]
+        plan_indices = pending.get("plan_indices", torch.arange(batch, device=executed.device))
+        # Evaluate one-step dynamics before this transition enters replay.
+        if bool(getattr(self.args, "mpc_quality_filter", False)) and self._high_level_steps % 8 == 0:
+            with torch.no_grad():
+                predicted = self.world_model.predict_next(pending["state"], executed, deterministic=True)[0]
+                schema = self.world_model.schema
+                scale = pending["state"][:, schema.slice("field.geometry")][:, :2].abs()
+                ball_slice = schema.slice("ball.position")
+                error = ((predicted[:, ball_slice][:, :2]-next_state[:, ball_slice][:, :2])*scale).norm(dim=-1)
+                # Compare only complete macro-transitions, not early terminal resets.
+                live = ~dones[:batch*team].reshape(batch, team).any(-1).bool()
+                from quadruped.mpc.prediction_metrics import robot_position_errors
+                robot_ema = getattr(self, '_robot_position_error_ema', {})
+                for key, value in robot_position_errors(schema, predicted, next_state, live).items():
+                    # Match the ball-error EMA and evaluate before replay insertion.
+                    robot_ema[key] = .95 * robot_ema.get(key, value) + .05 * value
+                    self._metrics[key] = robot_ema[key]
+                self._robot_position_error_ema = robot_ema
+                shot_rows = live & (skills[:, :team] == 2).any(-1)
+                if shot_rows.any():
+                    velocity_slice = schema.slice("ball.linear_velocity")
+                    velocity_error = (predicted[:, velocity_slice][:, :2] - next_state[:, velocity_slice][:, :2]).norm(dim=-1)
+                    for name, value in (("_shot_ball_error", error[shot_rows].mean()),
+                                        ("_shot_velocity_error", velocity_error[shot_rows].mean())):
+                        numeric = float(value)
+                        setattr(self, name, .95 * getattr(self, name, numeric) + .05 * numeric)
+                    self._shot_quality_samples = getattr(self, "_shot_quality_samples", 0) + int(shot_rows.sum())
+                    self._metrics.update({"mpc_quality/shot_ball_error_m": self._shot_ball_error,
+                                          "mpc_quality/shot_velocity_error_mps": self._shot_velocity_error,
+                                          "mpc_quality/shot_samples": self._shot_quality_samples})
+                if live.any():
+                    value = float(error[live].mean())
+                    previous = getattr(self, "_ball_prediction_error", value)
+                    self._ball_prediction_error = .95*previous + .05*value
+                    self._quality_samples = getattr(self, "_quality_samples", 0) + int(live.sum())
+                    self._metrics["mpc_quality/ball_error_m"] = self._ball_prediction_error
+                    self._metrics["mpc_quality/prequential_samples"] = self._quality_samples
         guidance_coefficient = float(
             getattr(self.args, "mpc_guidance_reward_coefficient", 0.0)
         )
         if plan is not None and guidance_coefficient > 0.0:
             guidance, disagreement = mpc_action_agreement_reward(
-                executed,
+                executed[plan_indices],
                 plan.first_joint_action,
                 self.action_adapter,
                 team,
                 guidance_coefficient,
             )
-            rewards[: batch * team].add_(
-                guidance.reshape(-1).to(rewards.device)
-            )
+            reward_rows = (plan_indices[:, None]*team + torch.arange(team, device=plan_indices.device)).flatten()
+            rewards[reward_rows] += guidance.reshape(-1).to(rewards.device)
             infos["mpc_guidance_reward"] = guidance.reshape(-1).detach()
             infos["mpc_guidance_disagreement"] = disagreement.reshape(
                 -1
@@ -807,7 +1077,7 @@ class OnlineMPCSelfPlayExtension:
         ).reshape(-1)[:batch]
         event_info = {}
         for key in (
-            "high_level_goal", "high_level_ball_off_border",
+            "high_level_goal", "high_level_opponent_goal", "high_level_ball_off_border",
             "high_level_obstacle_contact", "high_level_skill_ids",
             "shooting_success", "shooting_failure",
         ):
@@ -870,6 +1140,8 @@ class OnlineMPCSelfPlayExtension:
                     if len(returns) < len(states):
                         states = states[: len(returns)]
                     if len(returns):
+                        if getattr(self.args, "shooting_options", False):
+                            self._observe_value_quality(states, returns)
                         self.value_replay.add_batch({
                             "state": torch.stack(states),
                             "return_to_go": torch.tensor(
@@ -890,16 +1162,83 @@ class OnlineMPCSelfPlayExtension:
         # retain teacher labels when no distillation update can consume them.
         if plan is not None and float(self.args.mpc_kl_coefficient) > 0.0:
             targets = _mpc_distribution_to_policy_targets(plan, self.action_adapter, team)
+            teacher_weight = torch.ones(len(plan_indices), device=executed.device)
+            quality_valid = torch.ones(len(plan_indices), dtype=torch.bool, device=executed.device)
+            if bool(getattr(self.args, "mpc_quality_filter", False)):
+                from quadruped.mpc.teacher_quality import improvement_mask, selected_action_targets
+                # Compare the chosen teacher action against the sampled student
+                # action with identical future actions and opponent forecasts.
+                reference = plan.best_action_sequence.clone()
+                own_view = reference[:, 0, :4*team].reshape(-1, team, 4)
+                own_view[:] = torch.where(pending["teacher_agent_mask"][plan_indices, :, None],
+                                          requested[plan_indices, :4*team].reshape(-1, team, 4), own_view)
+                pair = torch.stack((plan.best_action_sequence, reference), dim=1)
+                with torch.no_grad():
+                    # Distillation executes only the first macro-action; the
+                    # student's feedback policy supplies later actions.  Use
+                    # a one-step score for label quality so an open-loop
+                    # continuation cannot make an otherwise bad first action
+                    # look attractive.
+                    quality_horizon = 1 if bool(getattr(
+                        self.args, "mpc_quality_first_action", True)) else pair.shape[2]
+                    quality_pair = pair[:, :, :quality_horizon]
+                    imagined = self.world_model.rollout(
+                        pending["state"][plan_indices], quality_pair, deterministic=True,
+                        stop_on_done=False, action_transform=self.planner.objective.resolve_imagined_action)
+                    score = self.planner.objective.evaluate(
+                        pending["state"][plan_indices], quality_pair, imagined)
+                quality_valid, teacher_weight, advantage = improvement_mask(
+                    score.total[:, 0], score.total[:, 1], score.valid.all(-1),
+                    float(getattr(self.args, "mpc_advantage_margin", .1)))
+                model_ready = (getattr(self, "_quality_samples", 0) >= 512
+                               and getattr(self, "_ball_prediction_error", float('inf'))
+                               <= float(getattr(self.args, "mpc_max_ball_error", .25)))
+                quality_valid &= model_ready
+                if getattr(self.args, "shooting_options", False):
+                    chosen_ids, _ = self.action_adapter.unpack(plan.first_joint_action)
+                    shooting_candidate = (chosen_ids[:, :team] == 2).any(-1)
+                    shot_model_ready = (getattr(self, "_shot_quality_samples", 0) >= 256
+                                        and getattr(self, "_shot_ball_error", float('inf')) < .1
+                                        and getattr(self, "_shot_velocity_error", float('inf')) < .5)
+                    quality_valid &= ~shooting_candidate | shot_model_ready
+                    self._metrics["mpc_quality/shot_model_ready"] = float(shot_model_ready)
+                targets = selected_action_targets(plan, self.action_adapter, team)
+                if getattr(self.args, "shooting_options", False):
+                    # The shooting option chooses its own goal-directed command.
+                    targets[3][2] = 0
+                finite = torch.isfinite(advantage)
+                self._metrics["mpc_quality/predicted_advantage"] = float(advantage[finite].mean()) if finite.any() else 0.
+                self._metrics["mpc_quality/score_horizon"] = float(quality_horizon)
+                self._metrics["mpc_quality/accepted_fraction"] = float(quality_valid.float().mean())
+                self._metrics["mpc_quality/model_ready"] = float(model_ready)
+                self._metrics["mpc_quality/query_matches"] = len(plan_indices)
             self._distill_records = getattr(self, "_distill_records", [])
+            # Rows for which CEM had to relax the world-model OOD filter are
+            # finite, but are not trustworthy teacher labels.  Keep the
+            # policy on its on-policy PPO signal for those rows instead of
+            # replaying an arbitrary extrapolation from the learned model.
+            fallback = plan.uncertainty.get("ood_fallback_used")
+            if fallback is None:
+                teacher_valid = torch.ones(
+                    len(plan_indices), dtype=torch.bool, device=obs_before["obs_history"].device
+                )
+            else:
+                teacher_valid = ~fallback.to(
+                    device=obs_before["obs_history"].device, dtype=torch.bool
+                )
+            teacher_valid &= quality_valid.to(teacher_valid.device)
             self._distill_records.append({
-                "obs_history": obs_before["obs_history"].reshape(batch * team, -1).detach().cpu(),
+                "teacher_weight": teacher_weight.repeat_interleave(team).detach().cpu(),
+                "teacher_step": torch.full((len(plan_indices)*team,), self._high_level_steps, dtype=torch.long),
+                "obs_history": obs_before["obs_history"].reshape(batch, team, -1)[plan_indices].reshape(-1, self.env.num_obs_history).detach().cpu(),
                 "target_command_mean": targets[0].detach().cpu(),
                 "target_std": targets[1].detach().cpu(),
                 "target_probs": targets[2].detach().cpu(),
-                "target_masks": targets[3].detach().cpu()[None].expand(batch * team, -1, -1),
-                "opponent_snapshot_iteration": selected_opponent_iterations.repeat_interleave(
+                "target_masks": targets[3].detach().cpu()[None].expand(len(plan_indices) * team, -1, -1),
+                "opponent_snapshot_iteration": selected_opponent_iterations[plan_indices.cpu()].repeat_interleave(
                     team
                 ).detach().cpu(),
+                "teacher_valid": (teacher_valid[:, None] & pending["teacher_agent_mask"][plan_indices]).flatten().detach().cpu(),
             })
         if self._planner_state is not None and bool(match_done.any()):
             self._planner_state.reset(match_done.nonzero(as_tuple=False).flatten())
@@ -928,6 +1267,19 @@ class OnlineMPCSelfPlayExtension:
         # replay without duplicating another large ring buffer.
         merged = {key: torch.cat([record[key] for record in records], dim=0) for key in records[0]}
         self._distill_records = []
+        valid = merged.pop("teacher_valid", None)
+        if valid is not None:
+            valid = valid.to(dtype=torch.bool).reshape(-1)
+            if valid.numel() != merged["obs_history"].shape[0]:
+                return {
+                    "mpc_distillation/update_skipped_invalid_teacher_mask": 1.0,
+                }
+            if not bool(valid.all()):
+                merged = {key: value[valid] for key, value in merged.items()}
+        if not merged["obs_history"].shape[0]:
+            return {
+                "mpc_distillation/update_skipped_no_valid_teacher_targets": 1.0,
+            }
         count = min(int(self.args.mpc_distillation_batch_size), merged["obs_history"].shape[0])
         indices = torch.randperm(merged["obs_history"].shape[0])[:count]
         device = self.runner.device
@@ -982,10 +1334,19 @@ class OnlineMPCSelfPlayExtension:
             ) / (2.0 * policy_command_std[:, None].square())
             - 0.5
         )
-        conditional_kl = (command_kl * target_masks).sum(dim=-1) / target_masks.sum(
-            dim=-1
-        ).clamp(min=1.0)
-        continuous = (target_probs * conditional_kl).sum(dim=-1).mean()
+        # The policy owns one shared command Gaussian, while CEM stores one
+        # conditional command distribution per skill. Fitting all three at
+        # once pulls that shared head toward mutually incompatible commands.
+        # Distill only the most likely teacher skill; retain the full soft
+        # distribution for the categorical KL above.
+        teacher_skill = target_probs.argmax(dim=-1)
+        rows = torch.arange(target_probs.shape[0], device=target_probs.device)
+        selected_command_kl = command_kl[rows, teacher_skill]
+        selected_mask = target_masks[rows, teacher_skill]
+        continuous = (
+            (selected_command_kl * selected_mask).sum(dim=-1)
+            / selected_mask.sum(dim=-1).clamp(min=1.0)
+        ).mean()
         loss = coefficient * (categorical + continuous)
         if not bool(torch.isfinite(loss)):
             return {
@@ -1025,7 +1386,6 @@ class OnlineMPCSelfPlayExtension:
 
     def after_rollout(self, iteration):
         if (int(iteration) + 1) % int(self.args.world_model_update_interval) == 0:
-            self._metrics = {}
             self._metrics.update(self.world_model_trainer.update())
             self._metrics.update(self.terminal_trainer.update())
             self._metrics["terminal_value/replay_size"] = float(len(self.value_replay))
@@ -1053,6 +1413,8 @@ class OnlineMPCSelfPlayExtension:
             iteration,
             {},
             {
+                "skill_fingerprint": (getattr(self.args, "skill_fingerprint", None)
+                                      if self._model_refresh_complete() else None),
                 "online": {
                     "enabled": True,
                     "replay_capacity": self.replay.capacity,
@@ -1068,6 +1430,8 @@ class OnlineMPCSelfPlayExtension:
             },
             0,
         )
+        if getattr(self.args, "freeze_world_model", False):
+            shutil.copy2(self.args.world_model_checkpoint, world_path)
         world_latest = output / "world_model_online_latest.pt"
         shutil.copy2(world_path, world_latest)
         saved = [str(world_path), str(world_latest)]
@@ -1087,6 +1451,8 @@ class OnlineMPCSelfPlayExtension:
         if bool(getattr(self.args, "save_online_replay", True)):
             replay_payload = {
                 "format": "dribblebot_online_replay_v1",
+                "execution_contract": "shooting_option_v1" if getattr(self.args, "shooting_options", False) else "legacy",
+                "skill_fingerprint": getattr(self.args, "skill_fingerprint", None),
                 "high_level_steps": self._high_level_steps,
                 "dynamics": self.replay.state_dict(),
                 "value": self.value_replay.state_dict(),
@@ -1095,6 +1461,8 @@ class OnlineMPCSelfPlayExtension:
                     "world_model_gradient_updates": self.world_model_trainer.gradient_updates,
                     "terminal_value_update_bursts": self.terminal_trainer.update_bursts,
                     "terminal_value_gradient_updates": self.terminal_trainer.gradient_updates,
+                    "mpc_plans_computed": self._plans_computed,
+                    "mpc_planning_seconds": self._planning_seconds,
                 },
             }
             replay_path = output / f"online_replay_{iteration}.pt"
@@ -1149,14 +1517,46 @@ def _build_terminal_value(checkpoint_path, world_model, device):
 
 
 def configure_online_mpc_objective(mpc_config, args):
-    """Apply the controlled reward-only/value ablation to one MPC config."""
+    """Make imagined execution and rewards match the real training contract."""
 
     terminal_enabled = (
         getattr(args, "mpc_terminal_value", "enabled") == "enabled"
     )
-    mpc_config.reward_source = "learned"
-    mpc_config.learned_reward_coefficient = 1.0
-    mpc_config.analytical_reward_coefficient = 0.0
+    if getattr(args, "mpc_uncertainty", "enabled") == "disabled":
+        # Remove every uncertainty-dependent planning decision while keeping
+        # the same ensemble and its training/diagnostics for matched ablations.
+        mpc_config.uncertainty_penalty = 0.0
+        mpc_config.return_uncertainty_penalty = 0.0
+        mpc_config.max_state_uncertainty = None
+        mpc_config.max_return_uncertainty = None
+        mpc_config.terminal_value_uncertainty_gating = False
+        mpc_config.terminal_value_max_uncertainty = None
+    mpc_config.reward_source = "analytical"
+    mpc_config.shooting_options = bool(getattr(args, "shooting_options", False))
+    if mpc_config.shooting_options:
+        mpc_config.terminal_value_coefficient = 1.0
+    mpc_config.learned_reward_coefficient = 0.0
+    mpc_config.analytical_reward_coefficient = 1.0
+    mpc_config.apply_skill_fallback_in_rollout = bool(
+        getattr(args, "use_geometric_skill_fallback", True)
+    )
+    mpc_config.apply_collision_avoidance_in_rollout = bool(
+        getattr(args, "collision_avoidance", False)
+    )
+    # The aligned analytical reward already contains the configured invalid
+    # skill penalty. Do not add the objective-level copy, which would charge
+    # the same false selection twice. The real and imagined execution paths
+    # both apply the configured geometric fallback; the environment's request
+    # diagnostic still teaches PPO the affordance boundary.
+    mpc_config.invalid_skill_penalty = 0.0
+    mpc_config.skill_switch_penalty = 0.0
+    mpc_config.command_change_penalty = 0.0
+    mpc_config.analytical_robot_collision_distance_m = float(
+        getattr(args, "robot_collision_distance", 0.70)
+    )
+    mpc_config.analytical_robot_collision_lookahead_s = float(
+        getattr(args, "robot_collision_lookahead", 0.25)
+    )
     mpc_config.seed = int(getattr(args, "seed", 42))
     mpc_config.terminal_value_checkpoint = None
     if terminal_enabled:
@@ -1177,8 +1577,24 @@ def build_arg_parser():
     from scripts.train_high_level import build_arg_parser as base_parser
     parser = base_parser()
     parser.description = "Online high-level self-play with replay-trained world-model MPC."
-    parser.add_argument("--world-model-checkpoint", default=None)
+    parser.add_argument(
+        "--world-model-checkpoint",
+        default="checkpoints/reproduction/world_model/best.pt",
+        help=(
+            "Pretrained dynamics initialization. Set to an empty value only "
+            "for a deliberate from-scratch world-model ablation."
+        ),
+    )
+    parser.add_argument("--freeze-world-model", action="store_true",
+                        help="Require a compatible pretrained model and disable all dynamics updates.")
     parser.add_argument("--world-model-config", default="configs/world_model_as2.yaml")
+    parser.add_argument("--mpc-query-budget", type=int, default=0,
+                        help="Maximum matches queried per plan; zero queries all matches.")
+    parser.add_argument("--mpc-quality-filter", action="store_true")
+    parser.add_argument("--mpc-value-fallback", action="store_true",
+                        help="Plan on rewards alone until terminal value passes validation.")
+    parser.add_argument("--mpc-advantage-margin", type=float, default=.1)
+    parser.add_argument("--mpc-max-ball-error", type=float, default=.25)
     parser.add_argument("--mpc-config", default="configs/mpc_joint_teams.yaml")
     parser.add_argument("--mpc-profile", default="teacher_training")
     parser.add_argument("--terminal-value-checkpoint", default=None)
@@ -1188,7 +1604,7 @@ def build_arg_parser():
         help="Subdirectory under the W&B run used for online policy/model checkpoints.",
     )
     parser.add_argument(
-        "--world-model-update-interval", type=int, default=25,
+        "--world-model-update-interval", type=int, default=50,
         help="PPO iterations between online world-model/value update bursts.",
     )
     parser.add_argument(
@@ -1198,24 +1614,50 @@ def build_arg_parser():
     parser.add_argument("--world-model-replay-recent-fraction", type=float, default=0.5)
     parser.add_argument("--world-model-replay-recent-window", type=int, default=10000)
     parser.add_argument("--world-model-update-batch-size", type=int, default=1024)
-    parser.add_argument("--world-model-updates-per-interval", type=int, default=8)
+    parser.add_argument("--world-model-updates-per-interval", type=int, default=4)
     parser.add_argument(
-        "--mpc-horizon", type=int, default=None,
+        "--mpc-horizon", type=int, default=2,
         help="Number of high-level skill intervals imagined by MPC.",
     )
     parser.add_argument(
         "--mpc-num-samples", "--mpc-num-candidates",
-        dest="mpc_num_samples", type=int, default=None,
+        dest="mpc_num_samples", type=int, default=128,
         help="Hybrid action sequences sampled per CEM iteration.",
     )
     parser.add_argument(
-        "--mpc-num-iterations", type=int, default=None,
+        "--mpc-num-iterations", type=int, default=3,
         help="CEM refinement iterations per MPC call.",
+    )
+    parser.add_argument(
+        "--mpc-replan-interval",
+        type=int,
+        default=2,
+        help=(
+            "Run CEM every N high-level decisions. The default N=2 halves "
+            "planner cost while PPO acts on skipped decisions."
+        ),
     )
     parser.add_argument(
         "--mpc-kl-coefficient", "--mpc-kl-coef", type=float, default=0.05,
         help="Coefficient on forward KL(MPC || high-level policy); zero disables distillation.",
     )
+    quality_score_group = parser.add_mutually_exclusive_group()
+    quality_score_group.add_argument(
+        "--mpc-quality-first-action",
+        dest="mpc_quality_first_action",
+        action="store_true",
+        help=(
+            "Score teacher labels using the first macro-action only. This "
+            "matches execution, where the student supplies continuation actions."
+        ),
+    )
+    quality_score_group.add_argument(
+        "--no-mpc-quality-first-action",
+        dest="mpc_quality_first_action",
+        action="store_false",
+        help="Score teacher labels over the full imagined MPC horizon.",
+    )
+    parser.set_defaults(mpc_quality_first_action=True)
     parser.add_argument(
         "--mpc-guidance-reward-coefficient",
         type=float,
@@ -1226,10 +1668,18 @@ def build_arg_parser():
         ),
     )
     parser.add_argument(
+        "--mpc-uncertainty", choices=("enabled", "disabled"), default="enabled",
+        help=("Use configured uncertainty penalties and gates, or disable all "
+              "uncertainty-dependent planning decisions for an ablation."),
+    )
+    parser.add_argument(
         "--mpc-terminal-value",
         choices=("enabled", "disabled"),
-        default="enabled",
-        help="Enable or remove the terminal continuation value from MPC ranking.",
+        default="disabled",
+        help=(
+            "Enable the learned terminal continuation value. Disabled by "
+            "default because online training has no pretrained value model."
+        ),
     )
     parser.add_argument(
         "--mpc-warmup-steps", "--mpc-warmup", type=int, default=2400,
@@ -1292,7 +1742,7 @@ def build_arg_parser():
         action="store_false",
         help="Start dynamics/value replay and readiness counters from scratch.",
     )
-    parser.set_defaults(auto_resume_online_replay=True)
+    parser.set_defaults(auto_resume_online_replay=False)
     replay_save_group = parser.add_mutually_exclusive_group()
     replay_save_group.add_argument(
         "--save-online-replay", dest="save_online_replay", action="store_true"
@@ -1304,7 +1754,9 @@ def build_arg_parser():
     parser.add_argument("--mpc-distillation-batch-size", type=int, default=1024)
     # Online CEM is substantially more expensive than policy-only PPO.
     parser.set_defaults(
-        num_envs=32,
+        # Match the standard MAPPO/discrete trainers so comparisons use the
+        # same number of parallel simulator environments by default.
+        num_envs=256,
         project="as2_high_level_online_mpc",
         self_play_update_interval=400,
     )
@@ -1312,6 +1764,10 @@ def build_arg_parser():
 
 
 def validate_online_args(args):
+    if getattr(args, "mpc_query_budget", 0) < 0:
+        raise ValueError("--mpc-query-budget cannot be negative")
+    if getattr(args, "mpc_max_ball_error", .25) <= 0 or getattr(args, "mpc_advantage_margin", .1) < 0:
+        raise ValueError("MPC error threshold must be positive and advantage margin non-negative")
     if args.world_model_update_interval < 1:
         raise ValueError("--world-model-update-interval must be positive")
     if args.world_model_replay_buffer_size < 1:
@@ -1338,7 +1794,12 @@ def validate_online_args(args):
         )
     if int(args.terminal_timeout_tail_exclusion) < 0:
         raise ValueError("--terminal-timeout-tail-exclusion cannot be negative")
-    for name in ("mpc_horizon", "mpc_num_samples", "mpc_num_iterations"):
+    for name in (
+        "mpc_horizon",
+        "mpc_num_samples",
+        "mpc_num_iterations",
+        "mpc_replan_interval",
+    ):
         value = getattr(args, name)
         if value is not None and value < 1:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
@@ -1357,7 +1818,11 @@ def train_robot(args):
     validate_high_level_training_args(args)
     validate_online_args(args)
     set_training_seed(getattr(args, "seed", 42))
-    from scripts.train_high_level import configure_high_level_cfg, load_skill_policies
+    from scripts.train_high_level import (
+        configure_high_level_cfg,
+        load_skill_policies,
+        resolved_high_level_reward_scales,
+    )
     from quadruped.envs.base.legged_robot_config import Cfg
     from quadruped.envs.as2.two_robot_velocity_tracking import TwoRobotVelocityTrackingEasyEnv
     from quadruped.envs.wrappers.high_level_skill_wrapper import HighLevelSkillWrapper
@@ -1377,6 +1842,7 @@ def train_robot(args):
 
     configure_high_level_cfg(Cfg, args)
     skills = load_skill_policies(args)
+    args.skill_fingerprint = skill_fingerprint(skills)
     if args.validate_skill_policies_only:
         print("Validated all AS2 low-level skill policies; training was not started.")
         return
@@ -1386,6 +1852,7 @@ def train_robot(args):
     RunnerArgs.resume_checkpoint = args.resume_checkpoint
     RunnerArgs.save_video_interval = args.save_video_interval
     RunnerArgs.checkpoint_dir = args.checkpoint_dir
+    RunnerArgs.num_steps_per_env = getattr(args, "rollout_steps", 24)
     RunnerArgs.self_play_update_interval = args.self_play_update_interval
     RunnerArgs.skill_entropy_initial_coef = args.skill_entropy_coef
     RunnerArgs.skill_entropy_final_coef = args.skill_entropy_final_coef
@@ -1427,6 +1894,7 @@ def train_robot(args):
             "opponent_snapshot_interval": args.self_play_update_interval,
             "opponent_pool_size": args.opponent_pool_size,
             "opponent_latest_probability": args.opponent_latest_probability,
+            "opponent_action_selection": "sample",
         },
         "skill_policy_metadata": {
             skill: record.get("policy_metadata", {})
@@ -1446,17 +1914,45 @@ def train_robot(args):
     capture = TerminalStateCapture(match_env, state_adapter)
     args.terminal_state_capture = capture
     config = __import__("quadruped.world_model.config", fromlist=["load_config"]).load_config(args.world_model_config)
+    if not getattr(args, "freeze_world_model", False) and getattr(args, "shooting_options", False) and args.world_model_checkpoint == "checkpoints/reproduction/world_model/best.pt":
+        print("Shooting option state changed: fitting a fresh dynamics model from this run.")
+        args.world_model_checkpoint = None
+    if getattr(args, "freeze_world_model", False) and not args.world_model_checkpoint:
+        raise ValueError("--freeze-world-model requires --world-model-checkpoint")
     world_model, world_checkpoint = _build_world_model(args.world_model_checkpoint, state_adapter, config, args.device)
+    args.mpc_require_model_refresh = (
+        world_checkpoint.get("training_config", {}).get("skill_fingerprint")
+        != args.skill_fingerprint
+    )
+    if getattr(args, "freeze_world_model", False):
+        if args.mpc_require_model_refresh:
+            raise ValueError("Frozen world model must have matching skill provenance; recollect and retrain with the current skills")
+        trained_steps = world_checkpoint.get("training_config", {}).get("world_model", {}).get("macro_action_steps")
+        if trained_steps != int(match_env.control_interval):
+            raise ValueError("Frozen world model macro-action interval does not match the environment")
+        world_model.requires_grad_(False)
+        world_model.eval()
+    if args.mpc_require_model_refresh:
+        print("MPC model has changed/unknown skill provenance; requiring fresh online updates before teaching.")
     mpc_config, mpc_payload = load_mpc_config(args.mpc_config, args.mpc_profile)
     if args.mpc_horizon is not None:
         mpc_config.horizon = args.mpc_horizon
     if args.mpc_num_samples is not None:
         mpc_config.num_candidates = args.mpc_num_samples
+        target_elites = max(1, mpc_config.num_candidates // 8)
         mpc_config.num_elites = max(
-            1, min(mpc_config.num_elites, mpc_config.num_candidates - 1)
+            1,
+            min(
+                mpc_config.num_elites,
+                target_elites,
+                mpc_config.num_candidates - 1,
+            ),
         )
     if args.mpc_num_iterations is not None:
         mpc_config.num_iterations = args.mpc_num_iterations
+    if bool(getattr(args, "mpc_quality_filter", False)):
+        mpc_config.apply_skill_fallback_in_rollout = bool(args.use_geometric_skill_fallback)
+        mpc_config.apply_collision_avoidance_in_rollout = bool(args.collision_avoidance)
     configured_terminal_path = mpc_config.terminal_value_checkpoint
     terminal_enabled = configure_online_mpc_objective(mpc_config, args)
     terminal_path = None
@@ -1479,6 +1975,7 @@ def train_robot(args):
             else None
         ),
         controlled_robot_count=args.num_robots,
+        reward_scales=resolved_high_level_reward_scales(args),
     )
     planner = HybridCEMMPC(world_model, state_adapter, world_model.action_adapter, objective, mpc_config)
     replay = WorldModelReplayBuffer(
@@ -1499,9 +1996,11 @@ def train_robot(args):
         weight_decay=float(config.get("training", {}).get("weight_decay", 1e-5)),
         batch_size=args.world_model_update_batch_size,
         updates_per_interval=args.world_model_updates_per_interval,
-        optimizer_states=world_checkpoint.get("optimizer_states"),
+        optimizer_states=(None if args.mpc_require_model_refresh or getattr(args, "freeze_world_model", False) else world_checkpoint.get("optimizer_states")),
         loss_config=config.get("loss", {}),
+        pretrained=bool(args.world_model_checkpoint),
     )
+    wm_trainer.frozen = bool(getattr(args, "freeze_world_model", False))
     value_trainer = OnlineTerminalValueTrainer(
         terminal_model, value_replay, args.device,
         batch_size=args.world_model_update_batch_size,
@@ -1522,6 +2021,8 @@ def train_robot(args):
     )
     # Match the base trainer's high-level actor initialization even though
     # constructing the world and terminal-value networks consumed RNG state.
+    from scripts.train_high_level import save_checkpoint_config
+    save_checkpoint_config(run, RunnerArgs.checkpoint_dir)
     set_training_seed(getattr(args, "seed", 42))
     runner = Runner(env, device=args.device, training_extension=extension)
     try:
@@ -1537,3 +2038,5 @@ def parse_args():
 
 if __name__ == "__main__":
     train_robot(parse_args())
+    from scripts.train_high_level import successful_training_exit
+    successful_training_exit()

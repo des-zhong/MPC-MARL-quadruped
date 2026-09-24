@@ -1,34 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-cd "${PROJECT_ROOT}"
+cd "$(dirname -- "${BASH_SOURCE[0]}")"
 PYTHON_BIN="${DRIBBLEBOT_PYTHON:-/home/zhz/anaconda3/envs/legged_env/bin/python}"
-export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-${TMPDIR:-/tmp}/dribblebot_torch_extensions}"
-export MPLCONFIGDIR="${MPLCONFIGDIR:-${TMPDIR:-/tmp}/dribblebot_matplotlib}"
 
-if [[ $# -lt 3 ]]; then
-  echo "Usage: $0 MAPPO_FSP_DIR NO_TERMINAL_DIR OURS_DIR [evaluation options]" >&2
-  echo "" >&2
-  echo "Each directory must contain numbered ac_weights_*.pt, body_*.jit," >&2
-  echo "adaptation_module_*.jit, and the training config.yaml." >&2
-  exit 2
+PURE_MAPPO_DIR="${1:-wandb/run-20260920_145323-1s2mw9rb/files/tmp/legged_data/high_level}"
+MPC_REPLAY_DIR="${2:-wandb/run-20260920_145324-clcesqb3/files/tmp/legged_data/high_level_mpc_replay}"
+MAX_OPPONENT_ITERATION="${3:-3200}"
+METRIC="${METRIC:-goal-rate}"
+SKILL_ARGS=()
+if [[ -n "${SHOOT_POLICY_DIR:-}" ]]; then
+  SKILL_ARGS+=(--shoot-policy-dir "${SHOOT_POLICY_DIR}")
 fi
 
-MAPPO_FSP_DIR="$1"
-NO_TERMINAL_DIR="$2"
-OURS_DIR="$3"
-shift 3
-
 exec "${PYTHON_BIN}" scripts/compare_high_level_learning_curves.py \
-  --method "MAPPO-FSP=${MAPPO_FSP_DIR}" \
-  --method "Ours w/o Terminal Value=${NO_TERMINAL_DIR}" \
-  --method "Ours=${OURS_DIR}" \
-  --opponent-dir "${MAPPO_FSP_DIR}" \
-  --opponent-checkpoints auto \
-  --seeds 0 \
-  --steps 300 \
-  --eval-num-envs 4 \
-  --policy-device cuda:5 \
-  --overwrite
-  "$@"
+  --method "Pure MAPPO=${PURE_MAPPO_DIR}" \
+  --method "MPC replay=${MPC_REPLAY_DIR}" \
+  --opponent-method "Pure MAPPO=${PURE_MAPPO_DIR}" \
+  --opponent-method "MPC replay=${MPC_REPLAY_DIR}" \
+  --opponent-max-iteration "${MAX_OPPONENT_ITERATION}" \
+  --candidate-max-iteration "${MAX_OPPONENT_ITERATION}" \
+  --opponent-stride 400 \
+  --episodes-per-opponent 10 \
+  --steps "${MAX_EVAL_STEPS:-1000}" \
+  --metric "${METRIC}" \
+  --x-axis environment-steps \
+  --incremental-plot \
+  --no-overwrite \
+  --output-dir "${OUTPUT_DIR:-outputs/learning_curve_comparison}" \
+  --num-robots 2 \
+  --device "${DEVICE:-cuda:4}" \
+  --policy-device "${POLICY_DEVICE:-cuda:4}" \
+  "${SKILL_ARGS[@]}"

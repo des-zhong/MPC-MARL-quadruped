@@ -752,3 +752,52 @@ def save_video_or_frames(
             "Could not encode the requested MPC MP4. Install an imageio "
             "FFmpeg backend; no frame directory or fallback files were written."
         ) from exc
+
+
+def plot_action_selection(schema, plan, executed_action, env_index=0):
+    """Show actual CEM refinement, sampled endpoints, and requested/executed actions."""
+    figure, axes = plt.subplots(2, 2, figsize=(10, 8))
+    convergence = {key: _numpy(value[env_index]) for key, value in plan.convergence.items()}
+    iterations = np.arange(1, len(convergence["best_objective"]) + 1)
+    axes[0, 0].plot(iterations, convergence["best_objective"], "o-", label="iteration best")
+    axes[0, 0].plot(iterations, convergence["mean_elite_objective"], "s--", label="elite mean")
+    axes[0, 0].set(title="1. Score and refine candidates", xlabel="CEM iteration", ylabel="objective")
+    axes[0, 0].legend(fontsize=8)
+    probabilities = convergence["first_step_skill_probabilities"]
+    for robot in range(probabilities.shape[1]):
+        for skill in range(probabilities.shape[2]):
+            label = (*SKILL_LABELS, "stop")[skill]
+            axes[0, 1].plot(iterations, probabilities[:, robot, skill],
+                            label=f"r{robot} {label}")
+    axes[0, 1].set(title="2. First-action skill probabilities", xlabel="CEM iteration", ylim=(0, 1))
+    axes[0, 1].legend(fontsize=6, ncol=2)
+    candidates = plan.candidate_diagnostics
+    if candidates:
+        scores = _numpy(candidates["objectives"][env_index])
+        valid = _numpy(candidates["valid"][env_index]).astype(bool) & np.isfinite(scores)
+        _, _, ball = _field_coordinates(candidates["final_states"][env_index], schema)
+        if valid.any():
+            scatter = axes[1, 0].scatter(ball[valid, 0], ball[valid, 1], c=scores[valid], s=18)
+            figure.colorbar(scatter, ax=axes[1, 0], label="objective", shrink=0.65)
+        if (~valid).any():
+            axes[1, 0].scatter(ball[~valid, 0], ball[~valid, 1], c="gray", marker="x", label="rejected")
+    _, _, selected_ball = _field_coordinates(plan.predicted_states[env_index, -1], schema)
+    axes[1, 0].scatter(*selected_ball, color="red", marker="*", s=140, label="selected plan")
+    axes[1, 0].set(title="3. Final-iteration sampled ball endpoints", xlabel="x (m)", ylabel="y (m)")
+    axes[1, 0].legend(fontsize=7)
+    axes[1, 0].set_aspect("equal", adjustable="datalim")
+    requested = _numpy(plan.best_action_sequence[env_index, 0]).reshape(-1, 4)
+    executed = _numpy(executed_action[env_index]).reshape(-1, 4)
+    lines = ["4. Execute first action; replan next step", "", "             skill       command (x, y, yaw)"]
+    for robot, (before, after) in enumerate(zip(requested, executed)):
+        for label, action in (("plan", before), ("run ", after)):
+            skill = (*SKILL_LABELS, "stop")[int(action[0])]
+            lines.append(f"r{robot} {label}: {skill:10s} ({action[1]:+.2f}, {action[2]:+.2f}, {action[3]:+.2f})")
+    lines.extend(["", f"Selected objective: {float(plan.best_objective[env_index]):.3f}",
+                  "Endpoints are a diagnostic subset of the final population."])
+    axes[1, 1].axis("off")
+    axes[1, 1].text(0, 1, "\n".join(lines), va="top", fontsize=8, family="monospace")
+    for axis in axes.flat[:3]:
+        axis.grid(alpha=0.2)
+    figure.tight_layout()
+    return figure

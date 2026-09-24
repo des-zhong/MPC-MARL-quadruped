@@ -198,6 +198,7 @@ class Runner:
         )
         self.tot_time = 0
         self.current_learning_iteration = resume_iteration
+        self.last_opponent_update_iteration = resume_iteration
         self.last_recording_it = -RunnerArgs.save_video_interval
 
         self.env.reset()
@@ -323,13 +324,75 @@ class Runner:
                 (1.0 - entropy_progress) * RunnerArgs.skill_entropy_initial_coef
                 + entropy_progress * RunnerArgs.skill_entropy_final_coef
             )
-            high_level_executed_counts = torch.zeros(3, dtype=torch.float64)
-            high_level_requested_counts = torch.zeros(3, dtype=torch.float64)
+            discrete_skill_direction = bool(
+                self.alg.actor_critic.discrete_skill_direction_policy
+            )
+            high_level_skill_names = (
+                ("walk", "dribble", "shoot", "stop")
+                if discrete_skill_direction
+                else ("walk", "dribble", "shoot")
+            )
+            high_level_executed_counts = torch.zeros(
+                len(high_level_skill_names), dtype=torch.float64
+            )
+            high_level_requested_counts = torch.zeros(
+                len(high_level_skill_names), dtype=torch.float64
+            )
+            high_level_direction_names = (
+                "up",
+                "up_right",
+                "right",
+                "down_right",
+                "down",
+                "down_left",
+                "left",
+                "up_left",
+            )
+            high_level_direction_counts = torch.zeros(8, dtype=torch.float64)
+            high_level_direction_count = 0
             high_level_invalid_count = 0.0
             high_level_avoidance_count = 0.0
             high_level_selection_count = 0
             high_level_distance_sums = torch.zeros(2, dtype=torch.float64)
             high_level_distance_count = 0
+            local_role_reward_names = (
+                "attacker_ball_skill",
+                "attacker_command_assist",
+                "role_conflict",
+                "support_ball_crowding",
+            )
+            high_level_local_role_sums = {
+                name: 0.0 for name in local_role_reward_names
+            }
+            high_level_local_role_count = 0
+            high_level_skill_clip_sums = torch.zeros(3, dtype=torch.float64)
+            high_level_skill_clip_counts = torch.zeros(3, dtype=torch.float64)
+            high_level_event_names = (
+                "high_level_walk_height_failure",
+                "high_level_dribble_height_failure",
+                "high_level_shoot_height_failure",
+                "high_level_stop_height_failure",
+                "high_level_goal",
+                "high_level_opponent_goal",
+                "high_level_accidental_termination",
+                "high_level_opponent_accidental_termination",
+                "high_level_learning_team_failure",
+                "high_level_opponent_team_failure",
+            )
+            high_level_event_counts = {
+                name: 0.0 for name in high_level_event_names
+            }
+            high_level_event_match_steps = 0
+            # These counters are deliberately episode based.  The existing
+            # event-rate metrics below describe events per simulator step;
+            # keep a separate denominator for the training goal/termination
+            # rates requested by the learning-curve recorder.
+            high_level_completed_episodes = 0
+            high_level_training_goals = 0
+            high_level_training_accidental_terminations = 0
+            attack_diagnostic_counts = {}
+            high_level_near_ball_control_count = 0.0
+            high_level_near_ball_control_total = 0
             # Rollout
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
@@ -383,6 +446,67 @@ class Runner:
                     if 'curriculum/distribution' in infos:
                         distribution = infos['curriculum/distribution']
 
+                    for name, values in infos.get("attack_diagnostics", {}).items():
+                        attack_diagnostic_counts[name] = attack_diagnostic_counts.get(name, 0.) + float(torch.as_tensor(values).sum())
+                    if "high_level_goal" in infos:
+                        def match_flags(value):
+                            # Logging mixes GPU match events and CPU timeout
+                            # flags; aggregate them on one device.
+                            flags = torch.as_tensor(value).detach().cpu().bool().reshape(-1)
+                            match_count = torch.as_tensor(
+                                infos["high_level_goal"]
+                            ).numel()
+                            if flags.numel() == match_count:
+                                return flags
+                            if flags.numel() % match_count == 0:
+                                return flags.reshape(match_count, -1).any(dim=1)
+                            return flags[:match_count]
+
+                        goal_events = match_flags(infos["high_level_goal"])
+                        high_level_event_match_steps += int(goal_events.numel())
+                        for event_name in high_level_event_names:
+                            if event_name in infos:
+                                high_level_event_counts[event_name] += float(
+                                    match_flags(infos[event_name]).sum().item()
+                                )
+                        opponent_goal_events = match_flags(
+                            infos.get(
+                                "high_level_opponent_goal",
+                                torch.zeros_like(goal_events),
+                            )
+                        )
+                        accidental_events = match_flags(
+                            infos.get(
+                                "high_level_accidental_termination",
+                                torch.zeros_like(goal_events),
+                            )
+                        )
+                        opponent_accidental_events = match_flags(
+                            infos.get(
+                                "high_level_opponent_accidental_termination",
+                                torch.zeros_like(goal_events),
+                            )
+                        )
+                        timeout_events = match_flags(
+                            infos.get(
+                                "time_outs", torch.zeros_like(goal_events)
+                            )
+                        )
+                        terminal_events = (
+                            goal_events
+                            | opponent_goal_events
+                            | accidental_events
+                            | opponent_accidental_events
+                            | timeout_events
+                        )
+                        high_level_completed_episodes += int(
+                            terminal_events.sum().item()
+                        )
+                        high_level_training_goals += int(goal_events.sum().item())
+                        high_level_training_accidental_terminations += int(
+                            accidental_events.sum().item()
+                        )
+
                     if 'high_level_skill_ids' in infos:
                         executed = torch.as_tensor(infos['high_level_skill_ids']).long()
                         requested = torch.as_tensor(
@@ -414,15 +538,78 @@ class Runner:
                             avoidance = avoidance[:num_train_envs]
                         high_level_executed_counts += torch.bincount(
                             executed.reshape(-1).cpu(),
-                            minlength=3,
-                        )[:3]
+                            minlength=len(high_level_skill_names),
+                        )[: len(high_level_skill_names)]
                         high_level_requested_counts += torch.bincount(
                             requested.reshape(-1).cpu(),
-                            minlength=3,
-                        )[:3]
+                            minlength=len(high_level_skill_names),
+                        )[: len(high_level_skill_names)]
                         high_level_invalid_count += float(invalid.sum().item())
                         high_level_avoidance_count += float(avoidance.sum().item())
                         high_level_selection_count += int(executed.numel())
+
+                        if "high_level_requested_direction_ids" in infos:
+                            directions = torch.as_tensor(
+                                infos["high_level_requested_direction_ids"]
+                            ).long()
+                            if directions.ndim == 2 and team_size is not None:
+                                directions = directions[:, : int(team_size)]
+                            else:
+                                directions = directions[:num_train_envs]
+                            active_directions = directions[directions >= 0]
+                            if active_directions.numel() > 0:
+                                high_level_direction_counts += torch.bincount(
+                                    active_directions.reshape(-1).cpu(),
+                                    minlength=8,
+                                )[:8]
+                                high_level_direction_count += int(
+                                    active_directions.numel()
+                                )
+
+                        # SharedPolicySelfPlayWrapper adds these local terms
+                        # after the cooperative match reward. Keep them
+                        # visible in W&B so the actual PPO objective is
+                        # auditable rather than inferred from raw episode sums.
+                        for name in local_role_reward_names:
+                            key = f"high_level_local_{name}_rewards"
+                            if key not in infos:
+                                continue
+                            component = torch.as_tensor(infos[key]).float()
+                            if component.ndim == 2 and team_size is not None:
+                                component = component[:num_train_envs, : int(team_size)]
+                            else:
+                                component = component[:num_train_envs]
+                            high_level_local_role_sums[name] += float(component.sum().item())
+                        if "high_level_local_role_rewards" in infos:
+                            local = torch.as_tensor(
+                                infos["high_level_local_role_rewards"]
+                            ).float()
+                            if local.ndim == 2 and team_size is not None:
+                                local = local[:num_train_envs, : int(team_size)]
+                            else:
+                                local = local[:num_train_envs]
+                            high_level_local_role_count += int(local.numel())
+
+                        if "low_level_action_clip_fraction" in infos:
+                            clip = torch.as_tensor(
+                                infos["low_level_action_clip_fraction"]
+                            ).float()
+                            if clip.ndim == 2 and team_size is not None:
+                                clip = clip[:num_train_envs, : int(team_size)]
+                            else:
+                                clip = clip[:num_train_envs]
+                            executed_for_clip = executed
+                            if executed_for_clip.ndim == 1:
+                                executed_for_clip = executed_for_clip.unsqueeze(-1)
+                            for skill_id in range(3):
+                                skill_mask = executed_for_clip == skill_id
+                                if clip.shape == skill_mask.shape and bool(skill_mask.any()):
+                                    high_level_skill_clip_sums[skill_id] += float(
+                                        clip[skill_mask].sum().item()
+                                    )
+                                    high_level_skill_clip_counts[skill_id] += float(
+                                        skill_mask.sum().item()
+                                    )
 
                     if 'high_level_robot_ball_distances' in infos:
                         distances = torch.as_tensor(
@@ -434,6 +621,27 @@ class Runner:
                                 distances[:, :logged_robots].double().sum(dim=0).cpu()
                             )
                             high_level_distance_count += int(distances.shape[0])
+                            learning_team_size = min(
+                                int(getattr(self.env, "team_size", logged_robots)),
+                                int(distances.shape[1]),
+                            )
+                            control_distance = float(
+                                getattr(
+                                    self.env.cfg.rewards,
+                                    "high_level_dribble_control_distance",
+                                    0.8,
+                                )
+                            )
+                            near_control = (
+                                distances[:, :learning_team_size].amin(dim=1)
+                                <= control_distance
+                            )
+                            high_level_near_ball_control_count += float(
+                                near_control.sum().item()
+                            )
+                            high_level_near_ball_control_total += int(
+                                near_control.numel()
+                            )
 
                 self.alg.compute_returns(obs_history[:num_train_envs], privileged_obs[:num_train_envs])
 
@@ -445,12 +653,17 @@ class Runner:
                 extension_metrics = dict(
                     self.training_extension.after_policy_update(it) or {}
                 )
+            if hasattr(self.env, "update_training_curriculum"):
+                extension_metrics.update(self.env.update_training_curriculum())
             if (
                 RunnerArgs.self_play_update_interval > 0
                 and hasattr(self.env, "update_opponent_policy")
-                and (it + 1) % RunnerArgs.self_play_update_interval == 0
+                and (it + 1 - self.last_opponent_update_iteration) >= RunnerArgs.self_play_update_interval
+                and (not hasattr(self.env, "opponent_update_ready")
+                     or self.env.opponent_update_ready())
             ):
                 self.env.update_opponent_policy(self.alg.actor_critic, iteration=it + 1)
+                self.last_opponent_update_iteration = it + 1
             stop = time.time()
             learn_time = stop - start
 
@@ -458,11 +671,19 @@ class Runner:
             action_clip_fraction = (
                 self.env.actions.abs() >= clip_actions - 1e-6
             ).float().mean().item()
-            policy_std = self.alg.actor_critic.std.detach().clamp(
-                min=AC_Args.min_action_std,
-                max=AC_Args.max_action_std,
-            )
-            if self.alg.actor_critic.hybrid_skill_policy:
+            if self.alg.actor_critic.discrete_skill_direction_policy:
+                # This policy has no Gaussian coordinates; keep the historic
+                # metric keys present while reporting their actual value.
+                policy_std = self.alg.actor_critic.std.detach().new_zeros(1)
+            else:
+                policy_std = self.alg.actor_critic.std.detach().clamp(
+                    min=AC_Args.min_action_std,
+                    max=AC_Args.max_action_std,
+                )
+            if (
+                self.alg.actor_critic.hybrid_skill_policy
+                and not self.alg.actor_critic.discrete_skill_direction_policy
+            ):
                 grouped_std = policy_std.reshape(
                     -1, self.alg.actor_critic.skill_action_stride
                 )
@@ -489,12 +710,17 @@ class Runner:
                 "policy/action_std_max": policy_std.max().item(),
                 "policy/action_mean_abs": self.alg.last_action_mean_abs,
                 "policy/action_abs_max": self.alg.last_action_abs_max,
+                # This reads the frozen low-level actuator actions exposed by
+                # the environment, not PPO's high-level hybrid action. Keep
+                # the legacy key for existing dashboards and add an explicit
+                # namespace for new runs.
                 "policy/action_clip_fraction": action_clip_fraction,
+                "low_level/action_clip_fraction_last_step": action_clip_fraction,
             }
             training_metrics.update(extension_metrics)
+            training_metrics.update(attack_diagnostic_counts)
             if high_level_selection_count > 0:
-                skill_names = ("walk", "dribble", "shoot")
-                for skill_id, skill_name in enumerate(skill_names):
+                for skill_id, skill_name in enumerate(high_level_skill_names):
                     training_metrics[
                         f"high_level/executed_{skill_name}_fraction"
                     ] = float(high_level_executed_counts[skill_id] / high_level_selection_count)
@@ -507,12 +733,60 @@ class Runner:
                 training_metrics["high_level/collision_avoidance_override_fraction"] = (
                     high_level_avoidance_count / high_level_selection_count
                 )
+            if high_level_direction_count > 0:
+                for direction_id, direction_name in enumerate(
+                    high_level_direction_names
+                ):
+                    training_metrics[
+                        f"high_level/requested_direction_{direction_name}_fraction"
+                    ] = float(
+                        high_level_direction_counts[direction_id]
+                        / high_level_direction_count
+                    )
             if high_level_distance_count > 0:
                 logged_robots = min(2, int(getattr(self.env, "num_robots", 1)))
                 for robot_idx in range(logged_robots):
                     training_metrics[f"high_level/robot{robot_idx}_ball_distance"] = float(
                         high_level_distance_sums[robot_idx] / high_level_distance_count
                     )
+            if high_level_local_role_count > 0:
+                for name, total in high_level_local_role_sums.items():
+                    training_metrics[f"high_level/local_{name}_mean"] = (
+                        total / high_level_local_role_count
+                    )
+            for skill_id, skill_name in enumerate(("walk", "dribble", "shoot")):
+                count = high_level_skill_clip_counts[skill_id].item()
+                if count > 0:
+                    training_metrics[
+                        f"high_level/{skill_name}_low_level_action_clip_fraction"
+                    ] = high_level_skill_clip_sums[skill_id].item() / count
+            if high_level_event_match_steps > 0:
+                for event_name, count in high_level_event_counts.items():
+                    metric_name = event_name[len("high_level_") :]
+                    training_metrics[f"high_level/{metric_name}_event_rate"] = (
+                        count / high_level_event_match_steps
+                    )
+                    training_metrics[f"high_level/{metric_name}_event_count"] = count
+            if high_level_completed_episodes > 0:
+                training_metrics["training/goal_rate"] = (
+                    high_level_training_goals / high_level_completed_episodes
+                )
+                training_metrics["training/termination_rate"] = (
+                    high_level_training_accidental_terminations
+                    / high_level_completed_episodes
+                )
+            training_metrics["training/completed_episodes"] = (
+                high_level_completed_episodes
+            )
+            training_metrics["training/goals"] = high_level_training_goals
+            training_metrics["training/accidental_terminations"] = (
+                high_level_training_accidental_terminations
+            )
+            if high_level_near_ball_control_total > 0:
+                training_metrics["high_level/near_ball_control_fraction"] = (
+                    high_level_near_ball_control_count
+                    / high_level_near_ball_control_total
+                )
             snapshot_iteration = int(
                 getattr(self.env, "opponent_snapshot_iteration", -1)
             )

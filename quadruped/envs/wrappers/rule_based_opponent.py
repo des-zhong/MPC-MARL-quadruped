@@ -129,7 +129,34 @@ class RuleBasedOpponent:
         return body_3d[..., :2]
 
     def _encode(self, skills, commands):
-        """Encode skill IDs/commands as the wrapper's six raw action values."""
+        """Encode decisions in the wrapped hybrid or discrete action layout."""
+
+        if self.wrapper.num_actions == 12:
+            skill_one_hot = torch.nn.functional.one_hot(
+                skills, num_classes=4
+            ).to(commands.dtype)
+            planar = commands[..., :2]
+            direction_vectors = commands.new_tensor(
+                [
+                    [1.0, 0.0],
+                    [2.0**-0.5, -(2.0**-0.5)],
+                    [0.0, -1.0],
+                    [-(2.0**-0.5), -(2.0**-0.5)],
+                    [-1.0, 0.0],
+                    [-(2.0**-0.5), 2.0**-0.5],
+                    [0.0, 1.0],
+                    [2.0**-0.5, 2.0**-0.5],
+                ]
+            )
+            normalized = self._normalize(planar, [1.0, 0.0])
+            direction_ids = torch.argmax(
+                (normalized.unsqueeze(-2) * direction_vectors).sum(dim=-1),
+                dim=-1,
+            )
+            direction_one_hot = torch.nn.functional.one_hot(
+                direction_ids, num_classes=8
+            ).to(commands.dtype)
+            return torch.cat((skill_one_hot, direction_one_hot), dim=-1)
 
         scales = self._command_scales()[skills]
         normalized = torch.where(
@@ -146,7 +173,7 @@ class RuleBasedOpponent:
 
     @torch.no_grad()
     def wrapper_actions(self):
-        """Return ``(matches, team_size, 6)`` executable opponent actions."""
+        """Return executable opponent actions in the configured layout."""
 
         roots = self.wrapper._roots()
         positions = roots[:, :, :2]

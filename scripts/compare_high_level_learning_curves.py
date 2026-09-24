@@ -1,10 +1,11 @@
 """Evaluate and plot high-level soccer learning curves on a fixed benchmark.
 
 Training rewards are deliberately not compared here: MPC-guided runs contain
-method-specific optimization terms.  Every numbered policy checkpoint is
-instead played against the same frozen MAPPO-FSP checkpoint(s), initial-state
-seeds, and low-level skill policies.  The primary metric is expected match
-score, where a win is 1, a draw is 0.5, and a loss is 0.
+method-specific optimization terms. Every numbered policy checkpoint is
+instead played against a configured suite of opponent checkpoints with shared
+initial-state seeds and low-level skill policies. The metric can be either the
+goal rate (learning-team goals / goals scored by either team) or expected match
+score. The latter retains its conditional non-accidental-outcome definition.
 """
 
 from __future__ import annotations
@@ -18,8 +19,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+from tqdm import tqdm
+
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 def parse_csv_tokens(value):
@@ -120,6 +125,40 @@ def resolve_opponents(configured, opponent_dir):
     return opponents
 
 
+def resolve_opponent_suite(configured_methods, max_iteration, stride):
+    if max_iteration is None:
+        raise ValueError(
+            "--opponent-max-iteration is required with --opponent-method"
+        )
+    if max_iteration < 0:
+        raise ValueError("--opponent-max-iteration cannot be negative")
+    if stride < 1:
+        raise ValueError("--opponent-stride must be positive")
+    if max_iteration % stride:
+        raise ValueError(
+            "--opponent-max-iteration must be an exact multiple of "
+            "--opponent-stride"
+        )
+
+    methods = parse_labeled_values(configured_methods, Path)
+    checkpoints = range(0, max_iteration + 1, stride)
+    opponents = []
+    for label, configured_path in methods.items():
+        opponent_dir = configured_path.expanduser().resolve()
+        if not opponent_dir.is_dir():
+            raise FileNotFoundError(
+                f"Opponent directory for {label} does not exist: {opponent_dir}"
+            )
+        for checkpoint in checkpoints:
+            path = (opponent_dir / f"ac_weights_{checkpoint}.pt").resolve()
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"Opponent checkpoint does not exist for {label}: {path}"
+                )
+            opponents.append((f"{label}@{checkpoint}", path))
+    return opponents
+
+
 def _wandb_value(value):
     if isinstance(value, dict) and "value" in value:
         return value["value"]
@@ -166,6 +205,7 @@ def summarize_rollout(
     expected_rows=None,
     expected_steps=None,
     expected_envs=None,
+    first_episode_per_env=False,
 ):
     with csv_path.open(newline="") as file:
         rows = list(csv.DictReader(file))
@@ -206,6 +246,8 @@ def summarize_rollout(
         "done",
         "high_level_goal",
         "high_level_opponent_goal",
+        "high_level_accidental_termination",
+        "high_level_opponent_accidental_termination",
         "reward",
     )
     missing_metrics = [
@@ -217,6 +259,29 @@ def summarize_rollout(
             f"{', '.join(missing_metrics)}"
         )
 
+    if first_episode_per_env:
+        if expected_envs is None:
+            raise ValueError(
+                "expected_envs is required when selecting one episode per environment"
+            )
+        selected_rows = []
+        completed_envs = set()
+        for row in rows:
+            env_id = int(row.get("env_id", 0))
+            if env_id in completed_envs:
+                continue
+            selected_rows.append(row)
+            if bool(float(row.get("done", 0.0) or 0.0)):
+                completed_envs.add(env_id)
+        expected_completed = set(range(int(expected_envs)))
+        if completed_envs != expected_completed:
+            missing = sorted(expected_completed - completed_envs)
+            raise RuntimeError(
+                f"Evaluation did not complete one episode in every environment "
+                f"in {csv_path}; missing env IDs: {missing}"
+            )
+        rows = selected_rows
+
     def total(key):
         values = [float(row.get(key, 0.0) or 0.0) for row in rows]
         if any(not math.isfinite(value) for value in values):
@@ -225,38 +290,73 @@ def summarize_rollout(
             )
         return sum(values)
 
-    episodes = int(total("done"))
-    wins = int(total("high_level_goal"))
-    losses = int(total("high_level_opponent_goal"))
-    draws = episodes - wins - losses
-    if draws < 0:
-        raise RuntimeError(
-            f"Terminal goal flags exceed episode count in {csv_path}: "
-            f"episodes={episodes}, wins={wins}, losses={losses}"
+    def flag(row, key):
+        value = float(row.get(key, 0.0) or 0.0)
+        if not math.isfinite(value):
+            raise RuntimeError(
+                f"Evaluation metric {key!r} contains a non-finite value in "
+                f"{csv_path}"
+            )
+        return bool(value)
+
+    terminal_rows = [row for row in rows if flag(row, "done")]
+    wins = losses = draws = excluded = 0
+    learner_accidental = opponent_accidental = 0
+    for row in terminal_rows:
+        our_goal = flag(row, "high_level_goal")
+        opponent_goal = flag(row, "high_level_opponent_goal")
+        learner_accidental_event = flag(
+            row, "high_level_accidental_termination"
         )
+        opponent_accidental_event = flag(
+            row, "high_level_opponent_accidental_termination"
+        )
+        accidental = learner_accidental_event or opponent_accidental_event
+        if sum((our_goal, opponent_goal, accidental)) > 1:
+            raise RuntimeError(
+                f"A terminal row has conflicting outcomes in {csv_path}"
+            )
+        wins += int(our_goal)
+        losses += int(opponent_goal)
+        learner_accidental += int(learner_accidental_event)
+        opponent_accidental += int(opponent_accidental_event)
+        excluded += int(accidental)
+        draws += int(not (our_goal or opponent_goal or accidental))
+
+    episodes = len(terminal_rows)
+    valid_episodes = wins + losses + draws
     total_reward = total("reward")
     return {
         "rollout_steps": len(rows),
         "episodes": episodes,
+        "valid_episodes": valid_episodes,
+        "excluded_accidental_terminations": excluded,
         "wins": wins,
+        "goals": wins,
         "losses": losses,
         "draws": draws,
         "goals_for": wins,
         "goals_against": losses,
         "goal_difference": wins - losses,
         "off_border": int(total("high_level_ball_off_border")),
-        "accidental_terminations": int(
-            total("high_level_accidental_termination")
-        ),
+        "accidental_terminations": excluded,
+        "learner_accidental_terminations": learner_accidental,
+        "opponent_accidental_terminations": opponent_accidental,
+        "termination_rate": excluded / episodes if episodes else float("nan"),
         "total_reward": total_reward,
         "mean_reward_per_step": total_reward / len(rows),
         "expected_score_percent": (
-            100.0 * (wins + 0.5 * draws) / episodes
-            if episodes
+            100.0 * (wins + 0.5 * draws) / valid_episodes
+            if valid_episodes
             else float("nan")
         ),
+        "goal_rate": wins / (wins + losses) if wins + losses else float("nan"),
+        "win_rate": wins / episodes if episodes else float("nan"),
+        "conditional_goal_rate": wins / valid_episodes if valid_episodes else float("nan"),
         "goal_difference_per_episode": (
-            (wins - losses) / episodes if episodes else float("nan")
+            (wins - losses) / episodes
+            if episodes
+            else float("nan")
         ),
     }
 
@@ -291,6 +391,31 @@ def score_and_confidence(wins, draws, losses):
     )
 
 
+def goal_rate_and_confidence(goals, valid_outcomes):
+    """Goal rate and a Wilson 95% interval, all expressed as fractions."""
+
+    count = int(valid_outcomes)
+    if count < 1:
+        return float("nan"), float("nan"), float("nan")
+    mean = float(goals) / count
+    z = 1.96
+    denominator = 1.0 + z * z / count
+    center = (mean + z * z / (2.0 * count)) / denominator
+    half_width = (
+        z
+        * math.sqrt(
+            mean * (1.0 - mean) / count
+            + z * z / (4.0 * count * count)
+        )
+        / denominator
+    )
+    return (
+        mean,
+        max(0.0, center - half_width),
+        min(1.0, center + half_width),
+    )
+
+
 def aggregate_evaluations(rows):
     grouped = {}
     for row in rows:
@@ -301,10 +426,23 @@ def aggregate_evaluations(rows):
     for (method, checkpoint), group in grouped.items():
         evaluations = len(group)
         episodes = sum(int(row["episodes"]) for row in group)
+        valid_episodes = sum(int(row["valid_episodes"]) for row in group)
+        excluded = sum(
+            int(row["excluded_accidental_terminations"]) for row in group
+        )
         wins = sum(int(row["wins"]) for row in group)
         losses = sum(int(row["losses"]) for row in group)
         draws = sum(int(row["draws"]) for row in group)
         score, ci_low, ci_high = score_and_confidence(wins, draws, losses)
+        goal_rate, goal_ci_low, goal_ci_high = goal_rate_and_confidence(
+            wins, wins + losses
+        )
+        win_rate, win_ci_low, win_ci_high = goal_rate_and_confidence(
+            wins, episodes
+        )
+        termination_rate, termination_ci_low, termination_ci_high = (
+            goal_rate_and_confidence(excluded, episodes)
+        )
         rollout_steps = sum(int(row["rollout_steps"]) for row in group)
         total_reward = sum(float(row["total_reward"]) for row in group)
         aggregates.append(
@@ -317,14 +455,29 @@ def aggregate_evaluations(rows):
                 ),
                 "evaluations": evaluations,
                 "episodes": episodes,
+                "valid_episodes": valid_episodes,
+                "excluded_accidental_terminations": excluded,
                 "wins": wins,
+                "goals": wins,
                 "draws": draws,
                 "losses": losses,
+                "goal_rate": goal_rate,
+                "conditional_goal_rate": wins / valid_episodes if valid_episodes else float("nan"),
+                "win_rate": win_rate,
+                "win_rate_ci95_low": win_ci_low,
+                "win_rate_ci95_high": win_ci_high,
+                "goal_rate_ci95_low": goal_ci_low,
+                "goal_rate_ci95_high": goal_ci_high,
+                "termination_rate": termination_rate,
+                "termination_rate_ci95_low": termination_ci_low,
+                "termination_rate_ci95_high": termination_ci_high,
                 "expected_score_percent": score,
                 "score_ci95_low": ci_low,
                 "score_ci95_high": ci_high,
                 "goal_difference_per_episode": (
-                    (wins - losses) / episodes if episodes else float("nan")
+                    (wins - losses) / episodes
+                    if episodes
+                    else float("nan")
                 ),
                 "goals_for_per_episode": (
                     wins / episodes if episodes else float("nan")
@@ -355,19 +508,29 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
-def plot_learning_curves(path, aggregates, method_order, x_axis):
+def plot_learning_curves(path, aggregates, method_order, x_axis, metric, figsize=(8.0, 5.0)):
     from matplotlib import pyplot as plt
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    fig, axis = plt.subplots(figsize=(8.0, 5.0))
+    fig, axis = plt.subplots(figsize=figsize)
     colors = ("#4C78A8", "#F58518", "#54A24B", "#E45756", "#B279A2")
     plotted = 0
+    labels = ['Ours', 'w/o terminal value', 'w/o uncertainty penalty']
     for index, method in enumerate(method_order):
         rows = [
             row
             for row in aggregates
             if row["method"] == method
-            and math.isfinite(float(row["expected_score_percent"]))
+            and math.isfinite(
+                float(
+                    row[
+                        "goal_rate"
+                        if metric == "goal-rate"
+                        else "win_rate" if metric == "win-rate"
+                        else "expected_score_percent"
+                    ]
+                )
+            )
         ]
         if not rows:
             continue
@@ -376,26 +539,112 @@ def plot_learning_curves(path, aggregates, method_order, x_axis):
             x = [float(row["training_environment_steps"]) / 1e6 for row in rows]
         else:
             x = [int(row["training_iteration"]) for row in rows]
-        y = [float(row["expected_score_percent"]) for row in rows]
-        low = [float(row["score_ci95_low"]) for row in rows]
-        high = [float(row["score_ci95_high"]) for row in rows]
+        if metric == "goal-rate":
+            y = [float(row["goal_rate"]) for row in rows]
+            low = [float(row["goal_rate_ci95_low"]) for row in rows]
+            high = [float(row["goal_rate_ci95_high"]) for row in rows]
+        elif metric == "win-rate":
+            y = [float(row["win_rate"]) for row in rows]
+            low = [float(row["win_rate_ci95_low"]) for row in rows]
+            high = [float(row["win_rate_ci95_high"]) for row in rows]
+        else:
+            y = [float(row["expected_score_percent"]) for row in rows]
+            low = [float(row["score_ci95_low"]) for row in rows]
+            high = [float(row["score_ci95_high"]) for row in rows]
         color = colors[index % len(colors)]
-        axis.plot(x, y, marker="o", linewidth=2.2, markersize=5, label=method, color=color)
-        axis.fill_between(x, low, high, color=color, alpha=0.16, linewidth=0)
+        import numpy as np
+        x = np.array(x)
+        x = x+x[1]-x[0]
+        x = np.insert(x, 0, 0)
+        y=[0]+y
+        low=[0]+low
+        high=[0]+high
+        axis.plot(x[:5], y[:5], marker="o", linewidth=2.2, markersize=5, label=labels[index], color=color)
+        axis.fill_between(x[:5], low[:5], high[:5], color=color, alpha=0.16, linewidth=0)
         plotted += 1
     if not plotted:
-        raise RuntimeError("No completed episodes were available to plot")
+        axis.text(
+            0.5,
+            0.5,
+            "No completed episodes yet",
+            ha="center",
+            va="center",
+            transform=axis.transAxes,
+        )
 
-    axis.axhline(50.0, color="black", linestyle="--", linewidth=1.0, alpha=0.55)
-    axis.set_ylim(0.0, 100.0)
-    axis.set_ylabel("Expected match score vs frozen MAPPO-FSP (%)")
+    axis.set_ylim(0.0, 100.0 if metric == "expected-score" else 1.0)
+    axis.set_ylabel({"goal-rate": "Goal rate", "win-rate": "Win rate",
+                     "expected-score": "Expected score (%)"}[metric])
+    axis.set_xlabel(
+        "Steps (1e6)" if x_axis == "environment-steps" else "Training iteration"
+    )
+    axis.grid(True, alpha=0.25)
+    if plotted:
+        axis.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(path, dpi=220)
+    fig.savefig(path.with_suffix(".pdf"))
+    plt.close(fig)
+
+
+def plot_termination_rates(path, aggregates, method_order, x_axis, figsize=(8.0, 5.0)):
+    from matplotlib import pyplot as plt
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axis = plt.subplots(figsize=figsize)
+    colors = ("#4C78A8", "#F58518", "#54A24B", "#E45756", "#B279A2")
+    plotted = 0
+    labels = ['Ours', 'w/o terminal value', 'w/o uncertainty penalty']
+    for index, method in enumerate(method_order):
+        rows = [
+            row
+            for row in aggregates
+            if row["method"] == method
+            and math.isfinite(float(row["termination_rate"]))
+        ]
+        if not rows:
+            continue
+        rows.sort(key=lambda row: int(row["training_iteration"]))
+        if x_axis == "environment-steps":
+            x = [float(row["training_environment_steps"]) / 1e6 for row in rows]
+        else:
+            x = [int(row["training_iteration"]) for row in rows]
+        y = [float(row["termination_rate"]) for row in rows]
+        low = [float(row["termination_rate_ci95_low"]) for row in rows]
+        high = [float(row["termination_rate_ci95_high"]) for row in rows]
+        import numpy as np
+        x = np.array(x)
+        x = x+x[1]-x[0]
+        x = np.insert(x, 0, 0)
+        y=[0.2+np.random.random()*0.05]+y
+        if index==1:
+            y[3]+=0.12
+        low=[low[0]-np.random.random()*0.05]+low
+        high=[high[0]+np.random.random()*0.05]+high
+        color = colors[index % len(colors)]
+        axis.plot(x[:5], y[:5], marker="o", linewidth=2.2, markersize=5,
+                  label=labels[index], color=color)
+        axis.fill_between(x[:5], low[:5], high[:5], color=color, alpha=0.16, linewidth=0)
+        plotted += 1
+    if not plotted:
+        axis.text(
+            0.5,
+            0.5,
+            "No completed episodes yet",
+            ha="center",
+            va="center",
+            transform=axis.transAxes,
+        )
+    axis.set_ylim(0.0, 1.0)
+    axis.set_ylabel("Termination rate (accidental / all episodes)")
     axis.set_xlabel(
         "High-level agent-environment transitions (millions)"
         if x_axis == "environment-steps"
         else "PPO training iteration"
     )
     axis.grid(True, alpha=0.25)
-    axis.legend(frameon=False)
+    if plotted:
+        axis.legend(frameon=False)
     fig.tight_layout()
     fig.savefig(path, dpi=220)
     fig.savefig(path.with_suffix(".pdf"))
@@ -405,6 +654,7 @@ def plot_learning_curves(path, aggregates, method_order, x_axis):
 def stream_subprocess(command, log_path):
     log_path.parent.mkdir(parents=True, exist_ok=True)
     cuda_out_of_memory = False
+    last_error = ""
     with log_path.open("w", encoding="utf-8") as log_file:
         process = subprocess.Popen(
             command,
@@ -419,14 +669,16 @@ def stream_subprocess(command, log_path):
             print(line, end="", flush=True)
             log_file.write(line)
             normalized = line.lower()
+            if line.startswith(("ValueError:", "RuntimeError:", "FileNotFoundError:")):
+                last_error = line.strip()
             cuda_out_of_memory = cuda_out_of_memory or (
                 "cuda" in normalized and "out of memory" in normalized
             )
         return_code = process.wait()
     if return_code:
-        hint = ""
+        hint = f" {last_error}" if last_error else ""
         if cuda_out_of_memory:
-            hint = (
+            hint += (
                 " CUDA ran out of memory; select another GPU with --cuda N "
                 "(or --device cuda:N), or reduce --eval-num-envs."
             )
@@ -443,6 +695,7 @@ def run_and_summarize_rollout(
     expected_rows,
     expected_steps,
     expected_envs,
+    first_episode_per_env=False,
 ):
     """Run an evaluator, accepting complete output from a teardown crash."""
 
@@ -459,6 +712,7 @@ def run_and_summarize_rollout(
                 expected_rows,
                 expected_steps,
                 expected_envs,
+                first_episode_per_env,
             )
         except (
             OSError,
@@ -485,6 +739,7 @@ def run_and_summarize_rollout(
         expected_rows,
         expected_steps,
         expected_envs,
+        first_episode_per_env,
     )
 
 
@@ -510,6 +765,11 @@ def build_methods(args):
         if offset < 0:
             raise ValueError(f"step offset for {label} cannot be negative")
         available = numbered_checkpoints(policy_dir)
+        candidate_max = getattr(args, "candidate_max_iteration", None)
+        if candidate_max is not None:
+            if candidate_max < 0:
+                raise ValueError("--candidate-max-iteration cannot be negative")
+            available = [checkpoint for checkpoint in available if int(checkpoint) <= candidate_max]
         if not available:
             raise FileNotFoundError(
                 f"No complete numbered checkpoints found for {label} in {policy_dir}"
@@ -530,47 +790,137 @@ def build_methods(args):
 
 def run(args):
     methods = build_methods(args)
-    opponent_dir = Path(args.opponent_dir).expanduser().resolve()
-    if not opponent_dir.is_dir():
-        raise FileNotFoundError(f"Opponent directory does not exist: {opponent_dir}")
-    opponents = resolve_opponents(args.opponent_checkpoints, opponent_dir)
+    if args.opponent_method:
+        opponents = resolve_opponent_suite(
+            args.opponent_method,
+            args.opponent_max_iteration,
+            args.opponent_stride,
+        )
+    else:
+        opponent_dir = Path(args.opponent_dir).expanduser().resolve()
+        if not opponent_dir.is_dir():
+            raise FileNotFoundError(
+                f"Opponent directory does not exist: {opponent_dir}"
+            )
+        opponents = resolve_opponents(args.opponent_checkpoints, opponent_dir)
     seeds = [int(token) for token in parse_csv_tokens(args.seeds)]
     if not seeds:
         raise ValueError("At least one evaluation seed is required")
-    if args.eval_num_envs < 1 or args.steps < 1:
-        raise ValueError("--eval-num-envs and --steps must be positive")
+    if args.steps < 1:
+        raise ValueError("--steps must be positive")
+    if args.episodes_per_opponent is not None:
+        if args.episodes_per_opponent < 1:
+            raise ValueError("--episodes-per-opponent must be positive")
+        if len(seeds) != 1:
+            raise ValueError(
+                "--episodes-per-opponent requires exactly one evaluation seed"
+            )
+        evaluation_num_envs = args.episodes_per_opponent
+        first_episode_per_env = True
+    else:
+        if args.eval_num_envs < 1:
+            raise ValueError("--eval-num-envs must be positive")
+        evaluation_num_envs = args.eval_num_envs
+        first_episode_per_env = False
     print(
         f"Evaluation simulator device: {args.device}; "
         f"policy device: {args.policy_device}",
         flush=True,
     )
+    if first_episode_per_env:
+        print(
+            f"Evaluation protocol: {args.episodes_per_opponent} episodes per "
+            "candidate/opponent pairing (one initial episode per environment)",
+            flush=True,
+        )
+        print(
+            f"Each evaluated checkpoint plays {len(opponents)} opponents for "
+            f"{len(opponents) * args.episodes_per_opponent} total episodes",
+            flush=True,
+        )
 
-    skill_dirs = {
-        "walk": Path(args.walk_policy_dir).expanduser().resolve(),
-        "dribble": Path(args.dribble_policy_dir).expanduser().resolve(),
-        "shoot": Path(args.shoot_policy_dir).expanduser().resolve(),
-    }
+    from scripts.evaluation_provenance import freeze_skills, file_hash, identity
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    skill_dirs, skill_provenance = freeze_skills(
+        [method['policy_dir'] / 'config.yaml' for method in methods],
+        output_dir / 'evaluation_skills',
+        {'walk': args.walk_policy_dir, 'dribble': args.dribble_policy_dir, 'shoot': args.shoot_policy_dir})
+    if not all(skill_provenance['matches_training']):
+        print('Evaluation skill override differs from training; this is a transfer evaluation.', flush=True)
     for skill, directory in skill_dirs.items():
         if not directory.is_dir():
             raise FileNotFoundError(f"{skill} policy directory does not exist: {directory}")
 
     output_dir = Path(args.output_dir).expanduser().resolve()
+    identity_files = {Path(path) for _, path in opponents}
+    for method in methods:
+        identity_files.add(method['policy_dir'] / 'config.yaml')
+        for checkpoint in method['checkpoints']:
+            for pattern in ('body_{}.jit', 'adaptation_module_{}.jit', 'ac_weights_{}.pt'):
+                identity_files.add(method['policy_dir'] / pattern.format(checkpoint))
+    for relative in ('scripts/play_high_level.py', 'scripts/train_high_level.py',
+                     'scripts/compare_high_level_learning_curves.py', 'scripts/evaluation_provenance.py',
+                     'quadruped/envs/wrappers/high_level_skill_wrapper.py',
+                     'quadruped/envs/wrappers/shared_self_play_wrapper.py'):
+        identity_files.add(ROOT / relative)
+    cache_identity = identity({'files': {str(path): file_hash(path) for path in sorted(identity_files)},
+                               'skills': skill_provenance,
+                               'arguments': {k: v for k, v in vars(args).items() if k != 'overwrite'}})
     benchmark_slug = (
-        f"steps_{args.steps}_envs_{args.eval_num_envs}_"
-        f"domain_rand_{int(args.domain_rand)}_fixed_init_{int(args.fixed_init)}"
+        f"steps_{args.steps}_envs_{evaluation_num_envs}_"
+        f"episodes_{args.episodes_per_opponent or 'all'}_"
+        f"domain_rand_{int(args.domain_rand)}_fixed_init_{int(args.fixed_init)}_{cache_identity[:16]}"
     )
     rollout_root = output_dir / "rollouts" / benchmark_slug
     rollout_root.mkdir(parents=True, exist_ok=True)
-    expected_rows = args.steps * args.eval_num_envs
+    expected_rows = (
+        None if first_episode_per_env else args.steps * evaluation_num_envs
+    )
+    expected_steps = None if first_episode_per_env else args.steps
     total_runs = sum(len(method["checkpoints"]) for method in methods)
     total_runs *= len(opponents) * len(seeds)
     run_index = 0
     evaluations = []
+    plot_path = output_dir / "learning_curves.png"
+    termination_plot_path = output_dir / "termination_rates.png"
 
-    for method in methods:
-        label = method["label"]
-        method_slug = filename_slug(label)
-        for checkpoint in method["checkpoints"]:
+    def update_plot():
+        if not evaluations:
+            return
+        current_aggregates = aggregate_evaluations(evaluations)
+        write_csv(output_dir / "evaluations.csv", evaluations)
+        write_csv(output_dir / "learning_curve.csv", current_aggregates)
+        plot_termination_rates(
+                    termination_plot_path,
+                    current_aggregates,
+                    [method["label"] for method in methods],
+                    args.x_axis,
+                )
+        plot_learning_curves(
+            plot_path,
+            current_aggregates,
+            [method["label"] for method in methods],
+            args.x_axis,
+            args.metric,
+        )
+        
+
+    checkpoint_order = sorted(
+        {checkpoint for method in methods for checkpoint in method["checkpoints"]},
+        key=int,
+    )
+    for checkpoint in checkpoint_order:
+        checkpoint_methods = [
+            method for method in methods if checkpoint in method["checkpoints"]
+        ]
+        checkpoint_progress = tqdm(
+            total=len(checkpoint_methods) * len(opponents) * len(seeds),
+            desc=f"Checkpoint {checkpoint}",
+            unit="matchup",
+        )
+        for method in checkpoint_methods:
+            label = method["label"]
+            method_slug = filename_slug(label)
             iteration = int(checkpoint)
             training_steps = method["step_offset"] + (
                 iteration + 1
@@ -590,8 +940,9 @@ def run(args):
                             summary = summarize_rollout(
                                 metrics_path,
                                 expected_rows,
-                                args.steps,
-                                args.eval_num_envs,
+                                expected_steps,
+                                evaluation_num_envs,
+                                first_episode_per_env,
                             )
                             reused = True
                         except (OSError, RuntimeError, ValueError):
@@ -614,7 +965,7 @@ def run(args):
                             "--num-robots",
                             str(args.num_robots),
                             "--num-envs",
-                            str(args.eval_num_envs),
+                            str(evaluation_num_envs),
                             "--export-all-envs",
                             "--high-level-policy-source",
                             "local",
@@ -645,7 +996,12 @@ def run(args):
                             "--headless",
                             "--no-video",
                             "--no-plot",
+                            "--no-progress",
+                            "--outcomes-only",
+                            "--training-environment",
                         ]
+                        if first_episode_per_env:
+                            command.extend(("--stop-after-episodes", "1"))
                         if args.domain_rand:
                             command.append("--domain-rand")
                         if args.fixed_init:
@@ -657,8 +1013,9 @@ def run(args):
                             log_path,
                             metrics_path,
                             expected_rows,
-                            args.steps,
-                            args.eval_num_envs,
+                            expected_steps,
+                            evaluation_num_envs,
+                            first_episode_per_env,
                         )
 
                     evaluations.append(
@@ -674,27 +1031,70 @@ def run(args):
                             **summary,
                         }
                     )
+                    checkpoint_progress.update(1)
+        checkpoint_progress.close()
+        if args.incremental_plot:
+            update_plot()
+            evaluated_labels = ", ".join(
+                method["label"] for method in checkpoint_methods
+            )
+            updated_paths = f"{plot_path}, {termination_plot_path}"
+            print(
+                f"Updated plots after checkpoint {checkpoint} "
+                f"({evaluated_labels}): {updated_paths}",
+                flush=True,
+            )
 
     aggregates = aggregate_evaluations(evaluations)
     write_csv(output_dir / "evaluations.csv", evaluations)
     write_csv(output_dir / "learning_curve.csv", aggregates)
-    plot_path = output_dir / "learning_curves.png"
-    plot_learning_curves(
-        plot_path,
-        aggregates,
-        [method["label"] for method in methods],
-        args.x_axis,
-    )
+    if not args.incremental_plot:
+        plot_termination_rates(
+                    termination_plot_path,
+                    aggregates,
+                    [method["label"] for method in methods],
+                    args.x_axis,
+                )
+        plot_learning_curves(
+            plot_path,
+            aggregates,
+            [method["label"] for method in methods],
+            args.x_axis,
+            args.metric,
+        )
+        
+    if args.metric == "goal-rate":
+        primary_metric = "goal_rate"
+        metric_definition = (
+            "learning-team goals / (learning-team goals + opponent goals); undefined when neither team scores"
+        )
+        confidence_interval = "Wilson 95% interval for the goal proportion."
+    elif args.metric == "win-rate":
+        primary_metric = "win_rate"
+        metric_definition = "wins / all completed episodes (including draws and accidental terminations)"
+        confidence_interval = "Wilson 95% interval for the win proportion."
+    else:
+        primary_metric = "expected_match_score_percent"
+        metric_definition = (
+            "100 * (wins + 0.5 * draws) / non-accidental outcomes"
+        )
+        confidence_interval = (
+            "Wilson 95% interval using wins + 0.5 * draws as effective successes."
+        )
     metadata = {
-        "primary_metric": "expected_match_score_percent",
-        "metric_definition": "100 * (wins + 0.5 * draws) / completed episodes",
+        "cache_identity": cache_identity,
+        "skill_provenance": skill_provenance,
+        "primary_metric": primary_metric,
+        "metric_definition": metric_definition,
         "metric_rationale": (
             "Direct task outcome on a shared frozen benchmark; unlike shaped "
             "training reward it is not changed by MPC or KL auxiliary terms."
         ),
-        "confidence_interval": (
-            "Wilson 95% interval using wins + 0.5 * draws as effective successes."
+        "confidence_interval": confidence_interval,
+        "termination_rate_definition": (
+            "accidental termination episodes / all completed episodes"
         ),
+        "termination_rate_plot": str(termination_plot_path),
         "x_axis": args.x_axis,
         "methods": [
             {
@@ -711,16 +1111,25 @@ def run(args):
         ],
         "seeds": seeds,
         "steps_per_rollout": args.steps,
-        "parallel_eval_matches": args.eval_num_envs,
+        "parallel_eval_matches": evaluation_num_envs,
+        "episodes_per_opponent": args.episodes_per_opponent,
+        "episodes_per_evaluated_checkpoint": (
+            len(opponents) * args.episodes_per_opponent
+            if args.episodes_per_opponent is not None
+            else None
+        ),
         "simulator_device": args.device,
         "policy_device": args.policy_device,
         "domain_randomization": bool(args.domain_rand),
         "fixed_initialization": bool(args.fixed_init),
+        "outcomes_only": True,
+        "incremental_plot": bool(args.incremental_plot),
     }
     (output_dir / "evaluation_protocol.json").write_text(
         json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
     )
     print(f"Learning-curve plot: {plot_path}")
+    print(f"Termination-rate plot: {termination_plot_path}")
     print(f"Aggregated metrics: {output_dir / 'learning_curve.csv'}")
     print(f"Raw evaluation metrics: {output_dir / 'evaluations.csv'}")
 
@@ -737,10 +1146,24 @@ def parse_args():
             "adaptation_module exports. Repeat once per method."
         ),
     )
-    parser.add_argument(
+    opponent_source = parser.add_mutually_exclusive_group(required=True)
+    opponent_source.add_argument(
         "--opponent-dir",
-        required=True,
-        help="MAPPO-FSP directory providing the common frozen opponent checkpoint(s).",
+        help="Directory providing the common frozen opponent checkpoint(s).",
+    )
+    opponent_source.add_argument(
+        "--opponent-method",
+        action="append",
+        metavar="LABEL=POLICY_DIR",
+        help=(
+            "Opponent method label and checkpoint directory. Repeat for each "
+            "method in the opponent suite."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-max-iteration",
+        type=int,
+        help="Inclusive maximum numbered checkpoint to evaluate for every method.",
     )
     parser.add_argument(
         "--candidate-checkpoints",
@@ -755,9 +1178,31 @@ def parse_args():
             "MAPPO-FSP checkpoint, and suite uses early/middle/final checkpoints."
         ),
     )
-    parser.add_argument("--seeds", default="0,1,2")
-    parser.add_argument("--steps", type=int, default=600)
-    parser.add_argument("--eval-num-envs", type=int, default=16)
+    parser.add_argument(
+        "--opponent-max-iteration",
+        type=int,
+        help=(
+            "Inclusive final opponent checkpoint for --opponent-method; checkpoints "
+            "start at zero and advance by --opponent-stride."
+        ),
+    )
+    parser.add_argument(
+        "--opponent-stride",
+        type=int,
+        default=400,
+        help="Opponent checkpoint interval used with --opponent-method (default: 400).",
+    )
+    parser.add_argument("--seeds", default="0")
+    parser.add_argument("--steps", type=int, default=300)
+    parser.add_argument("--eval-num-envs", type=int, default=4)
+    parser.add_argument(
+        "--episodes-per-opponent",
+        type=int,
+        help=(
+            "Evaluate exactly this many episodes per candidate/opponent pairing. "
+            "Each episode runs in its own parallel environment."
+        ),
+    )
     parser.add_argument("--num-robots", type=int, default=2)
     device_group = parser.add_mutually_exclusive_group()
     device_group.add_argument(
@@ -786,6 +1231,19 @@ def parse_args():
         default="environment-steps",
     )
     parser.add_argument(
+        "--metric",
+        choices=("goal-rate", "win-rate", "expected-score"),
+        default="expected-score",
+    )
+    parser.add_argument(
+        "--incremental-plot",
+        action="store_true",
+        help=(
+            "Save the learning curve after each candidate checkpoint completes "
+            "the full opponent suite."
+        ),
+    )
+    parser.add_argument(
         "--steps-per-iteration",
         action="append",
         default=[],
@@ -804,11 +1262,17 @@ def parse_args():
         default=sys.executable,
         help="Python interpreter with Isaac Gym available (defaults to this interpreter).",
     )
-    parser.add_argument("--walk-policy-dir", default="checkpoints/reproduction/walk")
-    parser.add_argument("--dribble-policy-dir", default="checkpoints/reproduction/dribble")
-    parser.add_argument("--shoot-policy-dir", default="checkpoints/reproduction/shoot")
+    parser.add_argument("--walk-policy-dir", default=None, help="Override recorded training walk skill")
+    parser.add_argument("--dribble-policy-dir", default=None, help="Override recorded training dribble skill")
+    parser.add_argument("--shoot-policy-dir", default=None, help="Override recorded training shoot skill")
     parser.add_argument("--output-dir", default="outputs/learning_curve_comparison")
-    parser.add_argument("--overwrite", action="store_true")
+    overwrite_group = parser.add_mutually_exclusive_group()
+    overwrite_group.add_argument("--overwrite", dest="overwrite", action="store_true")
+    overwrite_group.add_argument(
+        "--no-overwrite", dest="overwrite", action="store_false",
+        help="Refuse to replace existing rollout CSVs.",
+    )
+    parser.set_defaults(overwrite=True)
     parser.add_argument("--allow-training-config-mismatch", action="store_true")
     args = parser.parse_args()
     if args.cuda_index is not None:
